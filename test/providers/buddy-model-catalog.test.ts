@@ -52,6 +52,13 @@ describe("live Buddy CLI models on the shared roster", () => {
     }
   });
 
+  test("deepseek-v4.1-flash accepts images on both international sites", () => {
+    for (const rows of [CODEBUDDY_MODELS, WORKBUDDY_MODELS]) {
+      const row = rows.find((model) => model.modelId === "deepseek-v4.1-flash");
+      expect(row?.modalities.input).toContain("image");
+    }
+  });
+
   test("omits the backend-selected aliases and kimi-k3.1", () => {
     // These ids are not models a client should be offered: the four aliases
     // resolve server-side, and kimi-k3.1 is not served. `auto` stays, and is

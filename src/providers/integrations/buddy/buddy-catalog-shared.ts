@@ -218,7 +218,7 @@ export const BUDDY_SHARED_RAW: readonly BuddyRawEntry[] = [
   ["claude-opus-4.6", "Claude Opus 4.6", true, true, 200_000, 64_000],
   ["claude-opus-4.7-1m", "Claude Opus 4.7 1M", true, true, 1_000_000, 64_000],
   ["claude-sonnet-4.6", "Claude Sonnet 4.6", true, true, 200_000, 32_000],
-  ["deepseek-v4.1-flash", "DeepSeek V4.1 Flash", true, false, 1_000_000, 384_000],
+  ["deepseek-v4.1-flash", "DeepSeek V4.1 Flash", true, true, 1_000_000, 384_000],
   ["deepseek-v4.1-flash-sg", "DeepSeek V4.1 Flash SG", true, false, 1_000_000, 128_000],
   ["deepseek-v4.1-pro", "DeepSeek V4.1 Pro", true, false, 1_000_000, 384_000],
   ["gemini-2.5-flash-image", "Gemini 2.5 Flash Image", true, true, 1_000_000, 64_000],

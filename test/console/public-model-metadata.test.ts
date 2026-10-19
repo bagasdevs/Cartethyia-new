@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  architectureFields,
   advertisedMetadata,
   resolveTargetIds,
   type ModelMetadata,
@@ -104,5 +105,12 @@ describe("public model metadata resolution", () => {
       ["b", "a"],
     ]);
     expect(resolveTargetIds("a", aliases, new Map())).toEqual([]);
+  });
+
+  test("architecture repeats the normalized modality lists under OpenRouter names", () => {
+    expect(architectureFields({ input: ["text", "image"], output: ["text"] })).toEqual({
+      architecture: { input_modalities: ["text", "image"], output_modalities: ["text"] },
+    });
+    expect(architectureFields(undefined)).toEqual({});
   });
 });

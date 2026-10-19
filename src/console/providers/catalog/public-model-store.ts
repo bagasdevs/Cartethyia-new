@@ -24,6 +24,7 @@ export interface AllowedModelEntry {
   context_length?: number;
   max_completion_tokens?: number;
   capabilities?: unknown;
+  architecture?: { input_modalities?: string[]; output_modalities?: string[] };
   reasoning?: boolean;
   tool_call?: boolean;
   cost?: unknown;
@@ -78,6 +79,18 @@ function normalizeModalities(value: unknown): { input?: string[]; output?: strin
   return {
     ...(input.length > 0 ? { input } : {}),
     ...(output.length > 0 ? { output } : {}),
+  };
+}
+
+export function architectureFields(
+  capabilities: { input?: string[]; output?: string[] } | undefined,
+): { architecture: { input_modalities?: string[]; output_modalities?: string[] } } | Record<string, never> {
+  if (capabilities === undefined) return {};
+  return {
+    architecture: {
+      ...(capabilities.input ? { input_modalities: capabilities.input } : {}),
+      ...(capabilities.output ? { output_modalities: capabilities.output } : {}),
+    },
   };
 }
 
@@ -466,6 +479,7 @@ export class PublicModelCatalogStore {
         ...(row.contextLimit != null ? { context_length: row.contextLimit } : {}),
         ...(row.outputLimit != null ? { max_completion_tokens: row.outputLimit } : {}),
         ...(capabilities ? { capabilities } : {}),
+        ...architectureFields(capabilities),
         ...(row.reasoning ? { reasoning: true } : {}),
         ...(row.toolCall ? { tool_call: true } : {}),
         ...(row.cost != null ? { cost: row.cost } : {}),
@@ -514,6 +528,7 @@ export class PublicModelCatalogStore {
           context_length: target.contextLimit ?? DEFAULT_CONTEXT_LIMIT,
           max_completion_tokens: target.outputLimit ?? DEFAULT_OUTPUT_LIMIT,
           ...(capabilities ? { capabilities } : {}),
+          ...architectureFields(capabilities),
           ...(target.reasoning ? { reasoning: true } : {}),
           ...(target.toolCall ? { tool_call: true } : {}),
           ...(target.cost != null ? { cost: target.cost } : {}),
@@ -532,6 +547,7 @@ export class PublicModelCatalogStore {
           context_length: target.contextLimit ?? DEFAULT_CONTEXT_LIMIT,
           max_completion_tokens: target.outputLimit ?? DEFAULT_OUTPUT_LIMIT,
           ...(capabilities ? { capabilities } : {}),
+          ...architectureFields(capabilities),
           ...(target.reasoning ? { reasoning: true } : {}),
           ...(target.toolCall ? { tool_call: true } : {}),
           ...(target.cost != null ? { cost: target.cost } : {}),
@@ -694,6 +710,7 @@ export class PublicModelCatalogStore {
           ...(row.contextLimit != null ? { context_length: row.contextLimit } : {}),
           ...(row.outputLimit != null ? { max_completion_tokens: row.outputLimit } : {}),
           ...(capabilities ? { capabilities } : {}),
+          ...architectureFields(capabilities),
           ...(row.reasoning ? { reasoning: true } : {}),
           ...(row.toolCall ? { tool_call: true } : {}),
           ...(row.cost != null ? { cost: row.cost } : {}),
