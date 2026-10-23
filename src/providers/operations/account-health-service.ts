@@ -1,6 +1,6 @@
 import { healthEventBuffer } from "../../persistence/health-event-flush";
 // Account health: error classification, failure/success recording, recovery and cooldown sweeps.
-import { and, desc, eq, inArray, isNotNull, lte, or, sql } from "drizzle-orm";
+import { and, count, desc, eq, inArray, isNotNull, lte, or, sql } from "drizzle-orm";
 import { affectedRows, pruneExpiredCooldowns } from "../../persistence/dialect";
 import type { CartethyiaDatabase } from "../../persistence/db-handle";
 import { isRecord } from "../../protocol/codecs";
@@ -515,6 +515,15 @@ export function classifyAccountError(
       lower.includes("free-usage") ||
       lower.includes("free usage") ||
       lower.includes("exceeded your current quota") ||
+      // Trae answers an exhausted quota with **HTTP 502** and the body `Your
+      // requests have exceeded the quota.` The status is what misled the
+      // classifier: 502 read as a gateway failure, so this fell through to
+      // `server_error` — a 30s cooldown that does not mutate the account, so
+      // the account stayed in rotation and every other model on it kept being
+      // invoked inside a window the provider had already closed. The body is
+      // the verdict; the 502 is incidental. Matched on the phrase, not on the
+      // status, which is why this sits in `quotaSignal` ahead of the 5xx arm.
+      lower.includes("have exceeded the quota") ||
       lower.includes("balance exhausted") ||
       lower.includes("insufficient balance") ||
       lower.includes("out of credits") ||
@@ -1477,4 +1486,38 @@ export async function listAccountHealthEvents(
   } catch {
     return [];
   }
+}
+
+/** Every stored row across accounts and pools — the size the purge offers to delete. */
+export async function countAllHealthEvents(db: CartethyiaDatabase): Promise<number> {
+  try {
+    const rows = await db.select({ total: count() }).from(healthEvents);
+    return rows[0]?.total ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Deletes stored health & error rows.
+ *
+ * Unlike the read above, a failed delete surfaces: an operator who purged
+ * believes the trail is gone, so "it failed" must not read as "it succeeded
+ * with zero rows". Callers own the flush-buffer barrier (`drain`) so a queued
+ * write cannot land after these rows are gone.
+ */
+export async function deleteAccountHealthEvents(
+  db: CartethyiaDatabase,
+  accountId: string,
+): Promise<number> {
+  const rows = await db
+    .delete(healthEvents)
+    .where(and(eq(healthEvents.entityKind, "account"), eq(healthEvents.accountId, accountId)))
+    .returning({ id: healthEvents.id });
+  return rows.length;
+}
+
+export async function deleteAllHealthEvents(db: CartethyiaDatabase): Promise<number> {
+  const rows = await db.delete(healthEvents).returning({ id: healthEvents.id });
+  return rows.length;
 }

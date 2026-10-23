@@ -148,7 +148,62 @@ export const CONFIG_SPEC = {
    */
   CARTETHYIA_DISABLED_TASKS: { kind: "list" },
 
+  /**
+   * How long a day's telemetry is kept, in days.
+   *
+   * The retention unit is the whole day: a day's event file and its index are
+   * deleted together, and the current day is never touched. Past this age an
+   * individual request no longer exists anywhere, so its detail is gone —
+   * totals, breakdowns and spend are unaffected, because the index keeps
+   * running sums rather than the rows.
+   *
+   * This is the knob that decides how long the request list, per-request
+   * filters, and the detail drawer stay complete.
+   */
   CARTETHYIA_TELEMETRY_RETENTION_DAYS: { kind: "int", default: 30, min: 3, max: 365 },
+  /**
+   * Age at which a request's detail is described as no longer stored.
+   *
+   * Retention itself is `CARTETHYIA_TELEMETRY_RETENTION_DAYS`; this only words
+   * the message shown when a request that old is asked for. Kept because the
+   * message is operator-facing and was written against this knob.
+   */
+  CARTETHYIA_TELEMETRY_COMPACT_AFTER_DAYS: { kind: "int", default: 7, min: 1, max: 365 },
+  /**
+   * How often each day's index is brought up to date, in minutes.
+   *
+   * Bringing an index up to date means folding the bytes appended since the
+   * last pass — not re-reading the day. Reads fold before they answer too, so
+   * raising this does not make the numbers stale; it only leaves the on-disk
+   * index further behind, and the next read pays for the remainder.
+   */
+  CARTETHYIA_TELEMETRY_COMPACT_INTERVAL_MINUTES: {
+    kind: "int",
+    default: 60,
+    min: 5,
+    max: 1440,
+  },
+  /**
+   * Inert. Accepted so existing deployments keep booting; nothing reads it.
+   *
+   * It sized the one-file-per-window scheme — events were written to a file
+   * per this many minutes, 96 a day at the default. Events now append to one
+   * file per UTC day, so there is no window left to size.
+   */
+  CARTETHYIA_TELEMETRY_WINDOW_MINUTES: {
+    kind: "int",
+    default: 15,
+    min: 1,
+    max: 1440,
+  },
+  /**
+   * Inert. Accepted so existing deployments keep booting; nothing reads it.
+   *
+   * It capped how many window files one pass could fold. Folding is driven by
+   * a byte offset into the day file now and never deletes the file, so there
+   * is no per-pass batch to bound.
+   */
+  CARTETHYIA_TELEMETRY_COMPACT_MAX_FILES: { kind: "int", default: 48, min: 1, max: 10_000 },
   CARTETHYIA_TELEMETRY_PAYLOAD_MAX_BYTES: {
     kind: "int",
     default: 16 * 1024 * 1024,
