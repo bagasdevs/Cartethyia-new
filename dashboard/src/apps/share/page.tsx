@@ -1,11 +1,10 @@
 import { useEffect, useRef, useState, type ReactElement } from "react";
-import { Bot, Brain, CheckCircle2, Clock, Eye, FlaskConical, Globe, Heart, Home, KeyRound, Link2, Moon, StickyNote, Sun, Wrench, X } from "lucide-react";
-import { useModalFocus } from "../../hooks/use-modal-focus";
+import { Bot, Brain, CheckCircle2, Clock, Download, Eye, FlaskConical, Globe, Heart, Home, KeyRound, Link2, Moon, StickyNote, Sun, Wrench } from "lucide-react";
 import { Button } from "../../components/ui/button";
 import { Card, CardBody } from "../../components/ui/card";
 import { EmptyState, ErrorState, LoadingState } from "../../components/ui/state";
 import { ClipboardButton } from "../../components/patterns/clipboard-button";
-import { downloadTextFile } from "../../lib/download";
+import { downloadTextFile, downloadBytes } from "../../lib/download";
 import { GithubBadge } from "../../components/patterns/github-badge";
 import { toast } from "../../lib/toast";
 import { formatModelTokens, UNKNOWN_LIMITS_TOOLTIP } from "../../lib/format/tokens";
@@ -34,6 +33,24 @@ function message(payload: ApiError): string {
   if (typeof payload.error === "string") return payload.error;
   return payload.error?.message ?? payload.message ?? "Unable to generate an API key.";
 }
+
+/**
+ * The heading over a refused share link, keyed by the gateway's refusal code.
+ *
+ * A revoked key and a paused key read the same to a recipient — "it doesn't
+ * work" — but ask for opposite things: a revoked key is gone and needs a new
+ * link, while a paused one still exists and only needs re-enabling. The title
+ * names which, so the message under it reads as an instruction instead of a
+ * dead end. An unknown code falls back to a neutral title.
+ */
+const SHARE_REFUSAL_TITLE: Readonly<Record<string, string>> = {
+  link_revoked: "Key revoked",
+  link_expired: "Link expired",
+  link_disabled: "Key paused",
+  link_not_found: "Link not available",
+  link_expired_or_used: "Link expired",
+  key_unavailable: "Key unavailable",
+};
 
 export function tokenFromPathname(pathname: string): string {
   const path = pathname.replace(/\/$/, "");
@@ -85,7 +102,7 @@ function ModelCard({
         <span className="inline-flex size-13 shrink-0 items-center justify-center rounded-lg bg-teal-soft text-teal" aria-hidden="true">
           <Bot size={14} />
         </span>
-        <span className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap font-mono text-caption font-semibold leading-[1.35] text-text-primary" title={id}>
+        <span className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap font-mono text-caption font-semibold leading-chat text-text-primary" title={id}>
           {label}
         </span>
       </div>
@@ -210,10 +227,7 @@ export function SharePage(): ReactElement {
   const [probingModels, setProbingModels] = useState<ReadonlySet<string>>(() => new Set());
   const [probeResults, setProbeResults] = useState<ReadonlyMap<string, ProbeResult>>(() => new Map());
   const probeAbortRef = useRef<Map<string, AbortController>>(new Map());
-  const [sharePopupOpen, setSharePopupOpen] = useState(false);
-  const sharePopupRef = useRef<HTMLElement>(null);
   const apiKeyPanelRef = useRef<HTMLDivElement>(null);
-  useModalFocus({ open: sharePopupOpen, mounted: sharePopupOpen, panelRef: sharePopupRef, onClose: () => setSharePopupOpen(false) });
   // Dark is the default reading of the share HUD; the toggle beside Home flips
   // the same `console-theme` preference the console uses.
   const [theme, setTheme] = useState<ConsoleThemeChoice>(() => readConsoleTheme("dark"));
@@ -343,8 +357,9 @@ export function SharePage(): ReactElement {
         signal: controller.signal,
       });
       if (!response.ok || !response.body) {
-        // The card keeps the status: a toast alone disappears, and the button
-        // used to revert to "Test", so a 403 looked identical to never tested.
+        // The card keeps the status: a toast alone disappears, and a button
+        // that reverts to "Test" would make a 403 look identical to never
+        // tested.
         setProbeResults((current) => new Map(current).set(model, { ok: false, status: response.status }));
         toast.error("Model probe failed", `Request failed with HTTP ${response.status}`);
         return;
@@ -400,7 +415,7 @@ export function SharePage(): ReactElement {
         <div className="share-backdrop" aria-hidden="true" />
       <header className="share-header" data-scrolled={scrolled}>
         <div className="share-header-inner" data-scrolled={scrolled}>
-          <a className="inline-flex items-center gap-5 font-head text-lead tracking-[-0.03em] text-text-primary no-underline" href="/">
+          <a className="inline-flex items-center gap-5 font-head text-lead tracking-tight text-text-primary no-underline" href="/">
             <span className="grid size-17 place-items-center overflow-hidden rounded-control border border-inner-border bg-accent-soft text-accent" aria-hidden="true">
               <img
                 className="block size-full object-cover"
@@ -445,7 +460,7 @@ export function SharePage(): ReactElement {
           <Card surface="muted" className="min-w-0 border-glass-border-2 bg-glass-bg backdrop-blur-md backdrop-saturate-150 p-5">
             <CardBody>
               <ErrorState
-                title={state.code === "link_disabled" ? "Key paused" : "Link not available"}
+                title={SHARE_REFUSAL_TITLE[state.code ?? ""] ?? "Link not available"}
                 message={state.error}
                 onRetry={() => window.location.reload()}
               />
@@ -460,14 +475,14 @@ export function SharePage(): ReactElement {
               </p>
               <h1>{data.name || "Shared API access"}</h1>
               {data.kind === "handoff" ? (
-                <p className="mt-2.5 text-text-secondary text-body leading-[1.55]">
+                <p className="mt-2.5 text-text-secondary text-body leading-loose">
                   The API key for this gateway, provided through a share link. It is subject to the
                   limits below.
                 </p>
               ) : null}
               <div className="mt-5 flex flex-wrap items-center gap-2">
                 {data.expiresAt ? (
-                  <span className="inline-flex min-h-7 items-center gap-1.5 rounded-chip border border-inner-border bg-surface-2 px-2.5 py-1 text-text-secondary font-mono text-micro leading-[1.3]">
+                  <span className="inline-flex min-h-7 items-center gap-1.5 rounded-chip border border-inner-border bg-surface-2 px-2.5 py-1 text-text-secondary font-mono text-micro leading-snug">
                     <Clock size={12} aria-hidden="true" />
                     Link expires {new Date(data.expiresAt).toLocaleString()}
                   </span>
@@ -490,22 +505,8 @@ export function SharePage(): ReactElement {
                     aria-label="Copy Base URL"
                   />
                 </div>
-                <p className="text-caption leading-[1.55] text-text-secondary">Point your SDK, Opencode, Claude Code, Droid, and any other CLI</p>
-                {data.sharePopup.enabled ? (
-                  <button
-                    type="button"
-                    className="flex w-full min-w-0 cursor-pointer items-center gap-6 rounded-panel border border-orange/30 bg-gradient-to-br from-orange-soft to-surface-2 p-6 text-left text-text-primary transition-transform duration-150 ease-spring hover:-translate-y-px hover:border-orange"
-                    onClick={() => setSharePopupOpen(true)}
-                    aria-haspopup="dialog"
-                    aria-label="Open popup"
-                  >
-                    <span className="grid size-19 flex-none place-items-center rounded-control bg-orange-soft text-orange" aria-hidden="true"><Heart size={16} /></span>
-                    <span className="grid min-w-0 gap-1.5">
-                      <strong className="text-caption">{data.sharePopup.title || "More information"}</strong>
-                    </span>
-                    <span className="ml-auto text-lead text-orange" aria-hidden="true">↗</span>
-                  </button>
-                ) : null}
+                <p className="text-caption leading-loose text-text-secondary">Point your SDK, Opencode, Claude Code, Droid, and any other CLI</p>
+
               </Card>
               <div ref={apiKeyPanelRef} tabIndex={-1}>
               <Card surface="muted" className="flex min-w-0 flex-col items-start gap-6 border-glass-border-2 bg-glass-bg backdrop-blur-md backdrop-saturate-150 p-5">
@@ -538,7 +539,7 @@ export function SharePage(): ReactElement {
                         </Button>
                         <span>Prefix {data.keyPrefix ?? "—"}</span>
                       </div>
-                      <p className="text-caption leading-[1.55] text-text-secondary">
+                      <p className="text-caption leading-loose text-text-secondary">
                         This link reveals the key itself, so anyone holding the URL can read it.
                         Keep the URL private; the link owner regenerates it to replace this key.
                       </p>
@@ -550,7 +551,7 @@ export function SharePage(): ReactElement {
                   )
                 ) : visibleSecret ? (
                   <div className="flex w-full min-w-0 flex-col gap-5" role="status">
-                    <p className="font-mono text-micro font-bold tracking-[0.06em] text-orange">GENERATED ONCE · COPY AND KEEP IT</p>
+                    <p className="font-mono text-micro font-bold tracking-wide text-orange">GENERATED ONCE · COPY AND KEEP IT</p>
                     <code className="block min-w-0 flex-1 overflow-hidden rounded-inset border border-inner-border bg-code-surface p-5 font-mono text-caption leading-normal text-text-primary [overflow-wrap:anywhere] [user-select:all]">{visibleSecret.key}</code>
                     <div className="flex flex-wrap items-center gap-5 [&>span]:font-mono [&>span]:text-micro [&>span]:text-text-tertiary">
                       <ClipboardButton
@@ -575,7 +576,7 @@ export function SharePage(): ReactElement {
                       </Button>
                       <span>Key ID {visibleSecret.keyId.slice(0, 12)}…</span>
                     </div>
-                    <p className="text-caption leading-[1.55] text-text-secondary">
+                    <p className="text-caption leading-loose text-text-secondary">
                       Saved in this browser while this enrollment link remains valid. It is not
                       shown again from another browser, and an expired, revoked, or unavailable
                       link does not restore a local copy.
@@ -629,52 +630,64 @@ export function SharePage(): ReactElement {
               </div>
             </div>
 
-            {sharePopupOpen && data.sharePopup.enabled ? (
-              <div
-                className="fixed inset-0 z-drawer grid place-items-center overflow-y-auto bg-black/70 p-10 backdrop-blur max-sm:place-items-end max-sm:p-5"
-                role="presentation"
-                onClick={(event) => {
-                  if (event.target === event.currentTarget) setSharePopupOpen(false);
-                }}
-              >
-                <section
-                  ref={sharePopupRef}
-                  tabIndex={-1}
-                  className="relative grid max-h-[min(calc(var(--spacing)*340),calc(100dvh-var(--spacing)*20))] w-full max-w-380 grid-cols-2 overflow-auto rounded-hero border border-glass-border-2 bg-surface-1 shadow-popout max-sm:max-h-[calc(100dvh-var(--spacing)*10)] max-sm:w-full max-sm:max-w-240 max-sm:grid-cols-1 max-sm:rounded-card"
-                  role="dialog"
-                  aria-modal="true"
-                  aria-labelledby="share-support-title"
-                >
-                  <button type="button" className="absolute top-6 right-6 z-card grid size-18 place-items-center rounded-pill border border-inner-border bg-surface-1 text-text-secondary focus-visible:outline-2 focus-visible:outline-focus-ring focus-visible:outline-offset-2" onClick={() => setSharePopupOpen(false)} aria-label="Close popup">
-                    <X size={18} aria-hidden="true" />
-                  </button>
-                  {data.sharePopup.hasImage ? (
+            {data.sharePopup.enabled && data.sharePopup.hasImage ? (
+              <Card surface="muted" className="min-w-0 overflow-hidden border-glass-border-2 bg-glass-bg backdrop-blur-md backdrop-saturate-150">
+                <div className="grid grid-cols-qris gap-0 max-sm:grid-cols-qris-compact">
+                  {/* Left: QRIS image */}
+                  <div className="relative flex items-center justify-center bg-white p-4">
                     <img
-                      className="h-full min-h-180 w-full object-cover max-sm:h-auto max-sm:max-h-[min(52dvh,calc(var(--spacing)*210))] max-sm:min-h-0 max-sm:object-contain"
-                      src={`/share/${linkToken}/popup-image`}
-                      alt=""
+                      src={"/share/" + linkToken + "/popup-image"}
+                      alt={data.sharePopup.title ?? "Support QR code"}
+                      className="block w-full max-w-qris-badge rounded-control"
                     />
-                  ) : (
-                    <div className="grid h-full min-h-180 w-full place-items-center bg-gradient-to-br from-orange-soft to-surface-2 text-7xl text-orange max-sm:h-[clamp(calc(var(--spacing)*85),34dvh,calc(var(--spacing)*130))] max-sm:min-h-85 max-sm:max-h-130" aria-hidden="true">
-                      <span>♡</span>
-                    </div>
-                  )}
-                  <div className="flex flex-col justify-center gap-7 p-[clamp(calc(var(--spacing)*12),5vw,calc(var(--spacing)*22))] max-sm:gap-6 max-sm:p-11">
-                    <h2 id="share-support-title" className="pr-10 font-head text-display leading-tight tracking-tight wrap-anywhere">{data.sharePopup.title || "More information"}</h2>
-                    {data.sharePopup.body ? (
-                      <p id="share-support-message" className="text-body leading-loose whitespace-pre-wrap text-text-secondary wrap-anywhere">
-                        {data.sharePopup.body}
+                  </div>
+                  {/* Right: title, body, download, project info */}
+                  <div className="flex flex-col justify-center gap-5 p-6 max-sm:p-4 max-sm:gap-3">
+                    <div>
+                      <p className="inline-flex items-center gap-2 text-text-tertiary font-mono text-micro font-bold tracking-label leading-normal mb-3">
+                        <Heart size={12} aria-hidden="true" className="text-orange" /> SUPPORT
                       </p>
-                    ) : null}
-                    <div className="mt-4 flex flex-wrap items-center gap-5 [&>*]:flex-auto">
-                      <button type="button" className="inline-flex min-h-21 items-center justify-center rounded-pill border border-inner-border bg-surface-2 px-8 text-caption font-bold text-text-primary no-underline hover:brightness-110 focus-visible:outline-2 focus-visible:outline-focus-ring focus-visible:outline-offset-2" onClick={() => setSharePopupOpen(false)}>
-                        Close
+                      {data.sharePopup.title ? (
+                        <h2 className="font-head text-title font-semibold leading-snug wrap-anywhere max-sm:text-lead">{data.sharePopup.title}</h2>
+                      ) : null}
+                      {data.sharePopup.body ? (
+                        <p className="mt-2 text-body leading-loose whitespace-pre-wrap text-text-secondary wrap-anywhere max-sm:text-caption max-sm:leading-normal">{data.sharePopup.body}</p>
+                      ) : null}
+                    </div>
+                    <div className="flex flex-wrap gap-3">
+                      <button
+                        type="button"
+                        className="inline-flex items-center gap-2 rounded-pill border border-inner-border bg-surface-2 px-5 py-2.5 text-caption font-semibold text-text-primary hover:brightness-110 focus-visible:outline-2 focus-visible:outline-focus-ring focus-visible:outline-offset-2 transition-[filter]"
+                        onClick={async () => {
+                          try {
+                            const res = await fetch("/share/" + linkToken + "/popup-image");
+                            if (!res.ok) throw new Error("fetch failed");
+                            const buf = await res.arrayBuffer();
+                            const mime = res.headers.get("content-type") ?? "image/png";
+                            const ext = mime.includes("jpeg") ? "jpg" : mime.split("/")[1] ?? "png";
+                            downloadBytes("qris-support." + ext, new Uint8Array(buf), mime);
+                          } catch {
+                            toast.error("Could not download the image.");
+                          }
+                        }}
+                      >
+                        <Download size={14} aria-hidden="true" />
+                        Download QR
                       </button>
                     </div>
+                    <div className="border-t border-inner-border pt-4 max-sm:pt-3 flex flex-col gap-1">
+                      <p className="text-badge text-text-tertiary">
+                        <span className="font-semibold text-text-secondary">Gateway</span>&ensp;{data.name}
+                      </p>
+                      <p className="text-badge text-text-tertiary max-sm:hidden">
+                        Scan with any QRIS-compatible banking or e-wallet app.
+                      </p>
+                    </div>
                   </div>
-                </section>
-              </div>
+                </div>
+              </Card>
             ) : null}
+
             {data.notes.title || data.notes.subtitle || data.notes.body ? (
               <Card surface="muted" className="min-w-0 border-glass-border-2 bg-glass-bg backdrop-blur-md backdrop-saturate-150 p-5">
                 <h2 className="inline-flex items-center gap-3 text-text-secondary font-mono text-micro font-bold tracking-label leading-normal"><StickyNote size={13} aria-hidden="true" /> NOTES</h2>

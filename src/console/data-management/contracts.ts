@@ -4,9 +4,9 @@
  *
  * Everything here is files on disk, except one deliberate row-level action.
  * Reclaiming a file is safe because the data it held is already past the point
- * where the gateway would read it: payload frames expire 15 minutes after they
- * are written, and telemetry files past the retention window are outside every
- * query's scan bound. Deleting rows is a different decision with a different
+ * where the gateway would read it: payload frames expire after the tenant's
+ * chosen retention, and telemetry files past the retention window are outside
+ * every query's scan bound. Deleting rows is a different decision with a different
  * blast radius, and the only row data the console offers purging is the health
  * & error log — purely an operator's diagnostic trail with no request-path
  * reader, unlike everything else in this panel.
@@ -19,7 +19,7 @@
 /** One measured category of on-disk data. */
 export interface DiskUsageBucket {
   /** Stable id, so the dashboard can key rows without matching on copy. */
-  readonly id: "telemetry_hourly" | "telemetry_compacted" | "payload_frames";
+  readonly id: "telemetry_events" | "telemetry_index" | "payload_frames";
   readonly label: string;
   readonly bytes: number;
   readonly files: number;
@@ -35,8 +35,15 @@ export interface DiskUsageResponse {
   readonly totalBytes: number;
   /** Retention in days; telemetry older than this is outside every scan. */
   readonly retentionDays: number;
-  /** Payload frames live this long before they are reclaimable. */
+  /** Payload frames live this long by default before they are reclaimable. */
   readonly payloadRetentionMs: number;
+  /**
+   * The longest retention a tenant may have chosen. A frame is only counted as
+   * reclaimable once it is older than *this*, because a tenant who raised the
+   * window has frames the default would call dead while their rows still
+   * address them.
+   */
+  readonly payloadRetentionMaxMs: number;
   /**
    * Stored health & error rows, for the purge row's label. Absent when the
    * composition does not wire the health-event store (a reduced console),
@@ -45,7 +52,7 @@ export interface DiskUsageResponse {
   readonly healthEventCount?: number;
 }
 
-export type ReclaimAction = "payload_frames" | "telemetry_retention" | "telemetry_hourly";
+export type ReclaimAction = "payload_frames" | "telemetry_retention";
 
 export interface ReclaimResponse {
   readonly action: ReclaimAction;

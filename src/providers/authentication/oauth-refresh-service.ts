@@ -23,6 +23,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import type { CartethyiaDatabase } from "../../persistence/db-handle";
+import { sleep } from "../../shared/sleep";
 import { providerAccounts, providerOauthStates } from "../../persistence/schema";
 import { decryptCredentialToString, encryptCredential } from "../../security/crypto";
 import { invalidateCredentialCache } from "../operations/provider-credential-service";
@@ -258,6 +259,7 @@ async function disableAccount(
       )
       .returning({ id: providerOauthStates.providerAccountId });
     if (leaseRows.length === 0) return;
+    const disabledRecoveryMs = resolveAccountDisabledRecoveryMs();
     await tx
       .update(providerAccounts)
       .set({
@@ -271,13 +273,13 @@ async function disableAccount(
         lastErrorCategory: "auth_invalidated",
         lastErrorAt: new Date(),
         // Carries a recovery deadline so `sweepExpiredCooldowns` can bring this
-        // account back once it elapses. `disabled` used to be terminal, which
-        // parked a credential for good on one definitive rejection; the deadline
-        // is also what distinguishes this (machine-disabled) from an operator's
-        // own disable, which leaves `cooldownUntil` null and is therefore never
-        // swept. See `resolveAccountDisabledRecoveryMs`.
-        ...(resolveAccountDisabledRecoveryMs() > 0
-          ? { cooldownUntil: new Date(Date.now() + resolveAccountDisabledRecoveryMs()) }
+        // account back once it elapses; without one, one definitive rejection
+        // parks the credential for good. The deadline is also what distinguishes
+        // this (machine-disabled) from an operator's own disable, which leaves
+        // `cooldownUntil` null and is therefore never swept. See
+        // `resolveAccountDisabledRecoveryMs`.
+        ...(disabledRecoveryMs > 0
+          ? { cooldownUntil: new Date(Date.now() + disabledRecoveryMs) }
           : {}),
       })
       .where(eq(providerAccounts.id, accountId));
@@ -309,10 +311,6 @@ async function markStaticToken(db: CartethyiaDatabase, accountId: string): Promi
       lastErrorAt: null,
     })
     .where(eq(providerAccounts.id, accountId));
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function failureMessage(error: unknown): string {

@@ -35,11 +35,12 @@ export interface DataManagementConfig {
   readonly retentionDays: number;
   readonly payloadRetentionMs: number;
   /**
-   * Whether hourly files may be dropped from the console. Off unless a caller
-   * opts in: an hourly file still inside the compaction window is the only
-   * copy of its requests, so removing one loses real history.
+   * The longest payload retention a tenant may have chosen, and therefore the
+   * only cutoff a frame file can be judged dead against without reading it.
+   * Defaults to `payloadRetentionMs` for callers that predate per-tenant
+   * retention, which is then the true ceiling in that deployment.
    */
-  readonly allowHourlyReclaim: boolean;
+  readonly payloadRetentionMaxMs?: number;
   /**
    * The health & error log store, backing the console's only row-level purge.
    * Absent (a reduced console composition) means the purge is not offered
@@ -79,9 +80,8 @@ async function scan(
 
 const isIndex = (name: string): boolean => name.endsWith(".index.json");
 const isHourly = (name: string): boolean => name.endsWith(".events.jsonl");
-// Both extensions: old `.jsonb` files are still on disk and still counted.
 const isFrame = (name: string): boolean =>
-  name.endsWith(".jsonl") || name.endsWith(".jsonb");
+  name.endsWith(".jsonl");
 
 /** The UTC day a telemetry file name starts with, compared to a cutoff. */
 function dayBefore(name: string, cutoff: number): boolean {
@@ -91,10 +91,19 @@ function dayBefore(name: string, cutoff: number): boolean {
 
 export function createDataManagementOperations(config: DataManagementConfig) {
   const payloadDir = (): string => payloadDirectory();
+  /**
+   * The only cutoff a frame file can be judged dead against without parsing it.
+   *
+   * A file's mtime says when it was last written, not what its frames' tenants
+   * chose — so a file written an hour ago can hold a frame with a week to live.
+   * The ceiling is therefore the bound, and the default retention is only used
+   * when no ceiling was configured.
+   */
+  const payloadMax = (): number => config.payloadRetentionMaxMs ?? config.payloadRetentionMs;
 
   async function usage(): Promise<DiskUsageResponse> {
     const retentionCutoff = Date.now() - config.retentionDays * 24 * 60 * 60_000;
-    const payloadCutoff = Date.now() - config.payloadRetentionMs;
+    const payloadCutoff = Date.now() - payloadMax();
 
     const [hourly, compacted, staleCompacted, frames, staleFrames, healthEventCount] = await Promise.all([
       scan(config.telemetryDir, isHourly),
@@ -107,8 +116,8 @@ export function createDataManagementOperations(config: DataManagementConfig) {
 
     const buckets: DiskUsageBucket[] = [
       {
-        id: "telemetry_hourly",
-        label: "Daily request files",
+        id: "telemetry_events",
+        label: "Request event files",
         bytes: hourly.bytes,
         files: hourly.files,
         note: "Feeds the request list and detail drawer.",
@@ -116,7 +125,7 @@ export function createDataManagementOperations(config: DataManagementConfig) {
         reclaimableFiles: null,
       },
       {
-        id: "telemetry_compacted",
+        id: "telemetry_index",
         label: "Day indexes",
         bytes: compacted.bytes,
         files: compacted.files,
@@ -131,7 +140,7 @@ export function createDataManagementOperations(config: DataManagementConfig) {
         files: frames.files,
         note: `Captured bodies, expiring ${Math.round(
           config.payloadRetentionMs / 60_000,
-        )} min after write.`,
+        )} min after write by default.`,
         reclaimableBytes: staleFrames.bytes,
         reclaimableFiles: staleFrames.files,
       },
@@ -142,6 +151,7 @@ export function createDataManagementOperations(config: DataManagementConfig) {
       totalBytes: buckets.reduce((sum, bucket) => sum + bucket.bytes, 0),
       retentionDays: config.retentionDays,
       payloadRetentionMs: config.payloadRetentionMs,
+      payloadRetentionMaxMs: payloadMax(),
       ...(healthEventCount === undefined ? {} : { healthEventCount }),
     };
   }
@@ -160,7 +170,7 @@ export function createDataManagementOperations(config: DataManagementConfig) {
       const now = new Date();
       const deletedFiles = await prunePayloadFrames(
         now,
-        new Date(now.getTime() - config.payloadRetentionMs),
+        new Date(now.getTime() - payloadMax()),
       );
       const after = await scan(payloadDir(), isFrame);
       return {
@@ -178,12 +188,7 @@ export function createDataManagementOperations(config: DataManagementConfig) {
         (isIndex(name) || isHourly(name)) && dayBefore(name, cutoff),
       );
     }
-    if (!config.allowHourlyReclaim) {
-      throw new ReclaimNotAllowedError(
-        "Hourly files are the only copy of their requests until compaction folds them up, so the console will not delete them.",
-      );
-    }
-    return unlinkWhere(action, config.telemetryDir, isHourly);
+    throw new ReclaimNotAllowedError(`Unknown reclaim action: ${action}`);
   }
 
   /** The one row-level deletion the console offers. */

@@ -108,6 +108,12 @@ export function useShareApiKey() {
       }),
     onSuccess: async (_result, { keyId }) => {
       await queryClient.invalidateQueries({ queryKey: queryKeys.apiKeys.shareLink(keyId) });
+      // The overview renders the key from the same list the panel does, and a
+      // regenerated link leaves that row's share state changed. Invalidating
+      // only the link cached the key list as it was before the rotate, so the
+      // overview kept showing pre-regeneration data for the key that had just
+      // changed.
+      await queryClient.invalidateQueries({ queryKey: queryKeys.apiKeys.all });
     },
   });
 }
@@ -184,13 +190,26 @@ export function useSharedKeyActivity(parentKeyId: string | null, childKeyId: str
   });
 }
 
-/** Revokes a child credential, invalidating its parent's live summary. */
+/**
+ * Revokes a child credential, invalidating its parent's live summary.
+ *
+ * `deferInvalidation` is for the bulk path. Invalidating per success means a
+ * six-wide revoke of sixty recipients fires sixty invalidations while the run
+ * is still going, each one refetching a list that is about to change another
+ * nine times — and the bulk handler refetches once at the end anyway. The
+ * caller that defers owes that one refetch.
+ */
 export function useRevokeSharedKey() {
   const queryClient = useQueryClient();
-  return useMutation<{ success: boolean }, ApiErrorShape, { parentKeyId: string; childKeyId: string }>({
+  return useMutation<
+    { success: boolean },
+    ApiErrorShape,
+    { parentKeyId: string; childKeyId: string; deferInvalidation?: boolean }
+  >({
     mutationFn: ({ childKeyId }) =>
       consoleRequest<{ success: boolean }>(`/api-keys/${encodeURIComponent(childKeyId)}`, { method: "DELETE" }),
-    onSuccess: async (_result, { parentKeyId }) => {
+    onSuccess: async (_result, { parentKeyId, deferInvalidation }) => {
+      if (deferInvalidation) return;
       await queryClient.invalidateQueries({ queryKey: queryKeys.apiKeys.sharedKeys(parentKeyId) });
       await queryClient.invalidateQueries({ queryKey: queryKeys.apiKeys.all });
     },

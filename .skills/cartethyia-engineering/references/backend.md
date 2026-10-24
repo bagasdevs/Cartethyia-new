@@ -91,7 +91,7 @@ on the next request, not at the next process start.
 | `search/` | Hosted search tools and grounding |
 
 Per-account quota thresholds are applied during route eligibility; they are not
-account health state. See [Usage floor](../../../documentation/features/usage-floor.md).
+account health state. See [Usage floor](../../../documentation/features/04-usage-floor.md).
 `base-adapter.ts` and `compatible-adapter.ts` cover standard-wire providers; a
 bespoke provider frames its own bytes in its adapter — that fact lives on
 provider metadata, not in `wire_family`. Details:
@@ -103,8 +103,8 @@ provider metadata, not in `wire_family`. Details:
 types and `InMemoryRouteSnapshotService`; `admission.ts`/`reservations.ts`
 hold slots and leases; `round-robin.ts` keeps the per-provider cursor. Three
 independently configured strategies: provider, pool, and combo (all `fallback`
-or `round_robin`) — see [network pools](../../../documentation/features/network-pools.md) and
-[routing aliases and combos](../../../documentation/features/routing-aliases-combos.md).
+or `round_robin`) — see [network pools](../../../documentation/features/03-network-pools.md) and
+[routing aliases and combos](../../../documentation/features/02-routing-aliases-combos.md).
 
 `src/network/` is the egress half: `pool/` selects a pool and accounts bytes,
 `ssrf.ts` rejects disallowed destinations, `retry.ts` is the outbound retry
@@ -220,4 +220,4 @@ benchmarks. Client version refresh is deferred until after startup.
 | New provider | a spec in `configured-provider.ts` (standard OpenAI shape) or a family under `integrations/`, then the registry and discovery catalog |
 | Routing rule | `router.ts` and `route-model.ts`, then the snapshot builder |
 | Console resource | the domain under `src/console/`, then the dashboard hook that calls it |
-| Schema | `schema.ts`, then a numbered file in both `migrations/` directories for an existing database, and `migrations/full-postgres/0000_baseline.sql` for a fresh one. Regenerate SQLite with `scripts/generate/sqlite-ddl.ts` |
+| Schema | `schema.ts`, then the next numbered migration in both `migrations/` directories. Fresh and existing databases both apply the forward files. Do not edit either pinned baseline for an ordinary schema change; the SQLite generator derives from the pinned PostgreSQL baseline, not the accumulated forward migrations |

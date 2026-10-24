@@ -310,9 +310,9 @@ function latestDeadlineMs(...candidates: readonly (number | undefined | null)[])
  * {@link latestDeadlineMs} cannot express *no* deadline — it floors at 0 — and
  * the account-wide write has one state that needs it. With
  * `CARTETHYIA_ACCOUNT_DISABLED_RECOVERY_MS=0` an automatic disable is meant to
- * be terminal again, and the classifier correctly reports `retryAt: null`; the
- * write used to derive the deadline from `Date.now() + cooldownMs` anyway,
- * which stamps *now*. The recovery sweep then treats that elapsed deadline as
+ * be terminal again, and the classifier correctly reports `retryAt: null`.
+ * Deriving the deadline from `Date.now() + cooldownMs` instead stamps *now*.
+ * The recovery sweep then treats that elapsed deadline as
  * an automatic disable awaiting recovery and returns the row to rotation on its
  * next tick — the escape hatch enabled exactly the behavior it documents
  * itself as disabling.
@@ -548,11 +548,12 @@ export function classifyAccountError(
     options?.providerId !== undefined &&
     BUDDY_PROVIDER_IDS.has(options.providerId.toLowerCase());
   if (policyBlock) {
+    const policyBlockMs = resolveAccountPolicyBlockCooldownMs();
     return result(
       "policy_blocked",
       "cooldown",
-      resolveAccountPolicyBlockCooldownMs(),
-      new Date(Date.now() + resolveAccountPolicyBlockCooldownMs()),
+      policyBlockMs,
+      new Date(Date.now() + policyBlockMs),
       reason("Provider content-policy block"),
       origin === "upstream",
     );
@@ -599,10 +600,10 @@ export function classifyAccountError(
   }
   // A channel rejection (`11128`) is the same shape: the upstream is refusing
   // the caller for this account, not this particular prompt, and it keeps
-  // refusing on every invocation. It used to fall through to `unknown` with
-  // `mutates=false`, so the account stayed in rotation and failed every
-  // request — and since every account failed the same way, the whole pool
-  // looked dead with nothing ever parked.
+  // refusing on every invocation. Classifying it as `unknown` with
+  // `mutates=false` would leave the account in rotation failing every request —
+  // and since every account fails the same way, the whole pool looks dead with
+  // nothing ever parked.
   const channelRejection =
     providerCode === "11128" || lower.includes("unapproved channel");
   const channelBlock =
@@ -610,11 +611,12 @@ export function classifyAccountError(
     options?.providerId !== undefined &&
     BUDDY_PROVIDER_IDS.has(options.providerId.toLowerCase());
   if (channelBlock) {
+    const channelBlockMs = resolveAccountPolicyBlockCooldownMs();
     return result(
       "policy_blocked",
       "cooldown",
-      resolveAccountPolicyBlockCooldownMs(),
-      new Date(Date.now() + resolveAccountPolicyBlockCooldownMs()),
+      channelBlockMs,
+      new Date(Date.now() + channelBlockMs),
       reason("Provider channel rejection"),
       origin === "upstream",
     );
@@ -700,10 +702,11 @@ export function classifyAccountError(
     // rotated a moment ago, an edge answering before the credential loads) and
     // cools down instead.
     //
-    // This distinction is the whole fix. The generic `401`/`403` branch used to
-    // reach `disabled` too, which no sweep recovers, so one transient rejection
-    // removed the account from rotation until an operator noticed — the exact
-    // outcome the comment above says a static token must not suffer.
+    // This distinction is the whole fix. Reaching `disabled` from the generic
+    // `401`/`403` branch would be unrecoverable by any sweep, so one transient
+    // rejection would remove the account from rotation until an operator
+    // noticed — the exact outcome the comment above says a static token must
+    // not suffer.
     const revoked = revocationNamed;
     const recoverable = staticTokenRecovery || oauthRecovery || !revoked;
     // An automatic disable is **not** terminal any more, but the deadline is what
@@ -927,13 +930,14 @@ export function classifyAccountError(
     // scoped to the account (an edge/WAF challenge answered to one account's
     // requests while its siblings on the same egress served fine) must cool
     // that account down, or it stays `active` and is re-dialled for as long as
-    // the block lasts. Provider-scoped 5xx keeps the old behavior: the upstream
-    // is indiscriminately failing and no single account is at fault.
+    // the block lasts. Provider-scoped 5xx does not: the upstream is
+    // indiscriminately failing and no single account is at fault.
+    const transientMs = TRANSIENT_ERROR_COOLDOWN_MS();
     return result(
       lower.includes("timeout") ? "timeout" : "server_error",
       "cooldown",
-      TRANSIENT_ERROR_COOLDOWN_MS(),
-      new Date(Date.now() + TRANSIENT_ERROR_COOLDOWN_MS()),
+      transientMs,
+      new Date(Date.now() + transientMs),
       reason(`Provider ${statusCode ?? "network"} failure`),
       canMutate,
     );
@@ -941,11 +945,12 @@ export function classifyAccountError(
 
   // Same reasoning as above, with the shortest backoff: an unmapped failure
   // must still be retried automatically rather than parked forever.
+  const unclassifiedMs = UNCLASSIFIED_COOLDOWN_MS();
   return result(
     "unknown",
     "cooldown",
-    UNCLASSIFIED_COOLDOWN_MS(),
-    new Date(Date.now() + UNCLASSIFIED_COOLDOWN_MS()),
+    unclassifiedMs,
+    new Date(Date.now() + unclassifiedMs),
     reason("Unclassified provider failure"),
     false,
   );
@@ -1312,8 +1317,8 @@ export async function sweepExpiredCooldowns(db: CartethyiaDatabase): Promise<num
             isNotNull(providerAccounts.cooldownUntil),
             lte(providerAccounts.cooldownUntil, now),
           ),
-          // An **automatic** disable, which used to be terminal. Selected only
-          // when it carries a deadline: an operator's disable leaves
+          // An **automatic** disable. Selected only when it carries a deadline:
+          // an operator's disable leaves
           // `cooldownUntil` null, so a human's decision still outranks the
           // machine and is never swept away. The deadline is written by the two
           // paths that disable on evidence — the classifier's revocation branch
@@ -1371,9 +1376,9 @@ export async function sweepExpiredCooldowns(db: CartethyiaDatabase): Promise<num
     // its locks for the whole pass. Recomputing the object in SQL does the same
     // work in one statement.
     //
-    // `jsonb_typeof(...) = 'object'` guards the shape the same way the old
-    // `typeof raw !== "object"` check did: a malformed value must not abort the
-    // whole sweep. `IS DISTINCT FROM` keeps the update from rewriting rows it
+    // `jsonb_typeof(...) = 'object'` guards the shape: a malformed value must
+    // not abort the whole sweep. `IS DISTINCT FROM` keeps the update from
+    // rewriting rows it
     // did not change, so the returned row count is the number of accounts whose
     // cooldown set actually shrank — the same thing the loop counted.
     const pruning = pruneExpiredCooldowns(sql`${providerAccounts.modelCooldowns}`, sql`${nowIso}`);

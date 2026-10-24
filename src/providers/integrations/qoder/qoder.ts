@@ -2,7 +2,14 @@
 // AES/RSA request signing, alphabet-scrambled binary body, enveloped SSE
 // frames — session/crypto protocol outside factory reach; stays bespoke.
 import { constants, createCipheriv, createHash, publicEncrypt, randomUUID } from "node:crypto";
-import { classifyUpstreamError, extractUpstreamMessage, mapUpstreamHttpError, upstreamErrorIdentifier } from "../../../transport/failure-policy";
+import {
+  classifyUpstreamError,
+  extractUpstreamMessage,
+  isUpstreamQueued,
+  mapUpstreamHttpError,
+  queueRetryAfterMs,
+  upstreamErrorIdentifier,
+} from "../../../transport/failure-policy";
 import { GatewayError } from "../../../protocol/gateway-error";
 import type { CanonicalEvent, CanonicalRequest, CanonicalStopReason, ContentPart } from "../../../protocol/canonical-model";
 import { toolResultParts } from "../../../protocol/canonical-model";
@@ -382,7 +389,17 @@ function qoderEnvelopeToFrames(data: string): Array<{ event: string | null; data
     // the same gateway error policy as the other dispatch paths.
     const detail = qoderEnvelopeMessage(rec);
     const identifier = upstreamErrorIdentifier(rec["body"]) ?? upstreamErrorIdentifier(rec);
-    const classification = classifyUpstreamError(status, identifier);
+    // Qoder signals a queued request the same way inside the stream as it does
+    // on HTTP: `{"code":"10605", "isQueued":true, "retryAfterSeconds":N}` on a
+    // non-200 envelope. The status table would read the 403 as a refusal, and
+    // the caller would end its turn on a request that was only waiting.
+    const queuedWaitMs = isUpstreamQueued(rec["body"]) ?? false;
+    const waitMs = queuedWaitMs
+      ? (queueRetryAfterMs(rec["body"]) ?? undefined)
+      : undefined;
+    const classification = queuedWaitMs
+      ? { code: "upstream_queued" as const, status: 503, origin: "upstream" as const }
+      : classifyUpstreamError(status, identifier);
     throw new GatewayError(
       classification.code,
       classification.status,
@@ -395,6 +412,8 @@ function qoderEnvelopeToFrames(data: string): Array<{ event: string | null; data
         ...(classification.rateLimitScope
           ? { rateLimitScope: classification.rateLimitScope }
           : {}),
+        ...(waitMs === undefined ? {} : { retryAfterMs: waitMs, cooldownMs: waitMs }),
+        ...(queuedWaitMs ? { reason: "upstream-queued" } : {}),
       },
       classification.origin,
     );
@@ -445,9 +464,9 @@ function qoderStableRecordId(modelId: string, messages: CanonicalRequest["messag
 
 function qoderRequestedMaxTokens(request: CanonicalRequest, modelConfig: QoderModelConfig): number {
   /**
-   * The ceiling is the roster's stated one. The 32k this used to fall back to
-   * clamped every model alike, so a request asking for more was silently
-   * lowered no matter which model it named.
+   * The ceiling is the roster's stated one. A fixed 32k fallback would clamp
+   * every model alike, so a request asking for more would be silently lowered
+   * no matter which model it named.
    */
   const configured = typeof modelConfig.max_output_tokens === "number" ? modelConfig.max_output_tokens : 65_536;
   const controls = request.generation_controls as Record<string, unknown>;
@@ -564,9 +583,9 @@ export function buildQoderRequest(
       is_vl: modelConfig.is_vl,
       is_reasoning: modelConfig.is_reasoning,
       max_input_tokens: modelConfig.max_input_tokens,
-      // Mirrors the roster's stated ceiling. The 32k this used to fall back to
-      // was sent for every model alike, so the request declared a cap the
-      // catalog no longer publishes.
+      // Mirrors the roster's stated ceiling. A fixed 32k fallback would be sent
+      // for every model alike, so the request would declare a cap the catalog
+      // does not publish.
       max_output_tokens: modelConfig.max_output_tokens ?? 65_536,
       source: modelConfig.source ?? "system",
     },
@@ -679,12 +698,12 @@ async function* qoderBodyToCanonicalEvents(
 /**
  * The intl catalog this provider publishes.
  *
- * Previously built from the legacy `QODER_MODEL_CONFIGS`, which froze most
- * rows at 180k while the upstream reports 1M for the same keys. That number is
- * not cosmetic: it is sent upstream as `model_config.max_input_tokens`, so a
- * stale low value told Qoder the conversation window was small and made it
- * behave that way. Both the published catalog and the dispatched request now
- * come from the realm's roster, which carries the upstream's own numbers.
+ * `QODER_MODEL_CONFIGS` is not the source here: it freezes most rows at 180k
+ * while the upstream reports 1M for the same keys. That number is not
+ * cosmetic: it is sent upstream as `model_config.max_input_tokens`, so a stale
+ * low value tells Qoder the conversation window is small and makes it behave
+ * that way. Both the published catalog and the dispatched request come from the
+ * realm's roster, which carries the upstream's own numbers.
  */
 export const QODER_MODELS: readonly ModelDefinition[] = QODER_INTL_MODELS;
 

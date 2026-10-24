@@ -308,6 +308,13 @@ export type ContentPart =
       /** Responses reasoning summary block index, preserved across surfaces. */
       summary_index?: number;
       signature?: string;
+      /**
+       * Responses item id the `encrypted_content` was issued for. The upstream
+       * binds encrypted reasoning to its item and rejects a replay whose item
+       * id does not match, so the id travels with the payload it belongs to
+       * rather than being re-derived at request time.
+       */
+      item_id?: string;
       encrypted_content?: string;
     }
   | { kind: "extension"; name: string; payload: unknown };
@@ -596,9 +603,10 @@ export function hasEncryptedReasoning(parts: readonly ContentPart[]): boolean {
  * Single-pass summary of a request's content parts.
  *
  * `deriveRequiredCapabilities` + `assessTranslation` run on every candidate
- * preflight and previously each flattened the whole request (`allParts`) and
- * then scanned the copy up to ~6 times. This walks the messages once, builds
- * no intermediate array, and answers every predicate the pipeline needs.
+ * preflight, and flattening the whole request (`allParts`) in each and then
+ * scanning the copy up to ~6 times is the cost this avoids. It walks the
+ * messages once, builds no intermediate array, and answers every predicate the
+ * pipeline needs.
  * Results are memoized per request object in a `WeakMap`, so the preflight +
  * translate passes over one request share a single summary and entries are
  * collected with the request itself — no manual invalidation, no leak.

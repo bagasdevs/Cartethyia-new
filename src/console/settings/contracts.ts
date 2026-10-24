@@ -7,6 +7,10 @@ import { t } from "elysia";
 import type { AccessDecision } from "../../security/access-control";
 import type { RedisBackend } from "../../persistence/redis";
 import type { ConsoleSettingsPreferences } from "../../persistence/schema";
+import { RTK_LEVELS } from "../../transport/request/rtk/rtk-constants";
+import { PONYTAIL_LEVELS } from "../../transport/request/rtk/ponytail-prompt";
+
+export { RTK_LEVELS, PONYTAIL_LEVELS };
 
 export interface RuntimeSettingsResponse {
   readonly redisBackendActual: RedisBackend;
@@ -17,6 +21,8 @@ export interface RuntimeSettingsResponse {
   readonly telemetryPayloads: TelemetryPayloadMode;
   /** Capture depth for `full` mode; `minimum` when unset. */
   readonly telemetryPayloadDepth: TelemetryPayloadDepth;
+  /** How long a captured frame is kept, in minutes; `null` means deployment default. */
+  readonly telemetryPayloadRetentionMinutes: number | null;
   readonly privacyMode: PrivacyMode;
   /** Compacts bulky tool-result text before dispatch (RTK prune). Default false. */
   readonly rtkPruneEnabled: boolean;
@@ -63,6 +69,17 @@ export interface RuntimeSettingsConfig {
   readonly store: RuntimeSettingsStore;
   readonly accessResolver: ConsoleAccessResolver;
   readonly auditSink?: AuditSink;
+  /**
+   * Structurally satisfied by `InMemoryRouteSnapshotService`.
+   *
+   * Two preferences here are read on the request path, not per request: the
+   * route snapshot reads `forceDisableCooldown` when it builds candidates, and
+   * the admission path reads `tenantConcurrencyLimit`. The snapshot is cached
+   * until something invalidates it, so without this a saved setting stays
+   * invisible to `/v1/*` until some unrelated console write happens to
+   * invalidate — the toggle looks broken while the row is already correct.
+   */
+  readonly snapshotInvalidator?: { invalidate(): unknown };
 }
 
 
@@ -75,13 +92,25 @@ export type TelemetryPayloadMode = (typeof TELEMETRY_PAYLOAD_MODES)[number];
 export const TELEMETRY_PAYLOAD_DEPTHS = ["minimum", "moderate", "maximum"] as const;
 /** Capture depth for `full` mode accepted by the runtime-settings PATCH. */
 export type TelemetryPayloadDepth = (typeof TELEMETRY_PAYLOAD_DEPTHS)[number];
+/**
+ * How long a captured payload frame is kept, in whole minutes, or `null` for
+ * the deployment default.
+ *
+ * Only the offered values are accepted, and a value off the list is *rejected*
+ * rather than clamped: clamping would answer a request for thirty days with
+ * seven and report success, and an operator who asked for the longer window
+ * would believe they got it.
+ */
+export const TELEMETRY_PAYLOAD_RETENTION_MINUTES = [15, 30, 60, 360, 720, 1440, 10080] as const;
+/** Payload retention in minutes accepted by the runtime-settings PATCH. */
+export type TelemetryPayloadRetentionMinutes =
+  | (typeof TELEMETRY_PAYLOAD_RETENTION_MINUTES)[number]
+  | null;
 export const PRIVACY_MODES = ["masked", "full"] as const;
 /** Provider/model label privacy accepted by the runtime-settings PATCH. */
 export type PrivacyMode = (typeof PRIVACY_MODES)[number];
-export const PONYTAIL_LEVELS = ["lite", "full", "ultra"] as const;
 /** PonyTail directive intensity accepted by the runtime-settings PATCH. */
 export type PonyTailLevel = (typeof PONYTAIL_LEVELS)[number];
-export const RTK_LEVELS = ["lite", "full", "ultra"] as const;
 /** RTK prune strength accepted by the runtime-settings PATCH. */
 export type RtkLevel = (typeof RTK_LEVELS)[number];
 
@@ -120,6 +149,19 @@ export function createRuntimeSettingsOperations(deps: RuntimeSettingsConfig) {
         if (patch.telemetryPayloadDepth !== undefined && !TELEMETRY_PAYLOAD_DEPTHS.includes(patch.telemetryPayloadDepth)) {
           throw new ConsoleDomainError("invalid_request", 400, "Invalid telemetryPayloadDepth");
         }
+        if (patch.telemetryPayloadRetentionMinutes !== undefined) {
+          const minutes = patch.telemetryPayloadRetentionMinutes;
+          if (
+            minutes !== null &&
+            !(TELEMETRY_PAYLOAD_RETENTION_MINUTES as readonly number[]).includes(minutes)
+          ) {
+            throw new ConsoleDomainError(
+              "invalid_request",
+              400,
+              "Invalid telemetryPayloadRetentionMinutes",
+            );
+          }
+        }
         if (patch.privacyMode !== undefined && !PRIVACY_MODES.includes(patch.privacyMode)) {
           throw new ConsoleDomainError("invalid_request", 400, "Invalid privacyMode");
         }
@@ -140,6 +182,14 @@ export function createRuntimeSettingsOperations(deps: RuntimeSettingsConfig) {
           target: a.tenantId,
           detail: patch as Record<string, unknown>,
         });
+        // Saved preferences are routing changes: `forceDisableCooldown` decides
+        // candidate eligibility and `tenantConcurrencyLimit` decides admission,
+        // and both are read from the cached route snapshot. Invalidate after the
+        // write commits so the next `/v1/*` request uses them instead of the
+        // revision that was built before the save. A failure here must not fail
+        // the save — the row is already correct, and the snapshot rebuilds on
+        // the next read anyway.
+        await Promise.resolve(deps.snapshotInvalidator?.invalidate()).catch(() => undefined);
         return updated;
       },
   };
@@ -156,6 +206,12 @@ export const runtimeUpdateBody = t.Object({
   responsesReasoningSummary: t.Optional(literalUnion(RESPONSES_REASONING_SUMMARIES)),
   telemetryPayloads: t.Optional(literalUnion(TELEMETRY_PAYLOAD_MODES)),
   telemetryPayloadDepth: t.Optional(literalUnion(TELEMETRY_PAYLOAD_DEPTHS)),
+  telemetryPayloadRetentionMinutes: t.Optional(
+    t.Union([
+      t.Null(),
+      t.Union(TELEMETRY_PAYLOAD_RETENTION_MINUTES.map((minutes) => t.Literal(minutes))),
+    ]),
+  ),
   privacyMode: t.Optional(literalUnion(PRIVACY_MODES)),
   tenantConcurrencyLimit: t.Optional(t.Union([t.Null(), t.Number()])),
   thinkingNormalizationEnabled: t.Optional(t.Boolean()),

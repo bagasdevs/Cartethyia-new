@@ -21,14 +21,14 @@ it catches a schema edit that no migration covers. Index and constraint *names*
 are normalized away; only structural differences are reported.
 
 The repository carries an active test suite (`test/`, `dashboard/test/`, run via
-`scripts/ci/run.ts`). Database suites use the disposable
+`scripts/test/run.ts`). Database suites use the disposable
 `CARTETHYIA_TEST_DATABASE_URL` configured in the local `.env` or shell; they
 never fall back to the development database.
 
 Typecheck proves code shape, not behavior. Run the affected scope alongside the
 gates, and exercise the real boundary: a UI surface through the `agent-browser`
-CLI (mandatory for dashboard work — see `AGENTS.md` "Browser verification"; drive
-it yourself, no harness, no delegation), a live gateway request, or a
+CLI (mandatory for dashboard work — follow `cartethyia-dashboard/SKILL.md`;
+drive it yourself, no harness, no delegation), a live gateway request, or a
 `.tmp-<topic>.ts` calling production code. Delete temporary files in the same
 turn you created them.
 
@@ -64,10 +64,11 @@ procedure is in the `cartethyia-trace-replay` skill.
 
 ## Schema changes
 
-Exercise the fresh baseline and legacy backup mappings. Keep the runtime
-schema, both baselines, and readers/writers aligned. Existing databases with
-retired migration history are restored into a fresh database; never test that
-recovery against development or production data.
+Exercise the fresh baseline plus all forward migrations and legacy backup
+mappings. Keep the runtime schema, both migration sets, and readers/writers
+aligned without rewriting released baselines. Existing databases with retired
+migration history are restored into a fresh database; never test that recovery
+against development or production data.
 
 ## Completion
 

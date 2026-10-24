@@ -229,12 +229,55 @@ export function extractUpstreamMessage(body: unknown): string {
  * Reading only a nested string dropped the code for the second family
  * entirely, so the operator saw a bare message with no provider code.
  */
+/**
+ * The provider code hidden inside one string value, or `undefined`.
+ *
+ * Recognizes both a nested JSON envelope written as an escaped string
+ * (`"{\"code\":\"11-128\"}"`) and the bare escaped form (`"\"code\\\":\\\"11-128\""`).
+ * Cheap by construction: the scan is a substring test, and only a string that
+ * looks like it carries a code is handed to `JSON.parse`, so a large message
+ * body costs one `includes` rather than a parse.
+ */
+function parseEmbeddedCode(value: string): string | undefined {
+  if (!value.includes("code")) return undefined;
+  // An escaped envelope: try it as JSON first, then with its escapes collapsed.
+  for (const candidate of [value, value.replace(/\\+"/g, '"')]) {
+    const trimmed = candidate.trim();
+    if (!trimmed.startsWith("{") && !trimmed.startsWith('"')) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    const code = upstreamProviderCode(parsed);
+    if (code !== undefined) return code;
+  }
+  // A bare `"code": "11-128"` fragment inside a longer message.
+  const match = value.match(/\\*["']?code\\*["']?\s*:\s*\\*["']?([A-Za-z0-9_.:-]{3,32})/i);
+  return match?.[1];
+}
+
 export function upstreamProviderCode(body: unknown): string | undefined {
   if (!isRecord(body)) return undefined;
   const nested = isRecord(body.error) ? body.error : undefined;
   const ext = isRecord(body.extError) ? body.extError : undefined;
   for (const candidate of [ext?.code, nested?.code, body.code]) {
     if (typeof candidate === "string" && candidate.length > 0) return candidate;
+  }
+  // A provider may embed its error envelope as an *escaped string* rather than a
+  // nested object — `"error": "{\"code\":\"11-128\",...}"` — so none of the
+  // candidates above is a record and the code is invisible. That is the shape
+  // the reference gateways detect, and it matters because the channel code is
+  // what decides whether an account is cooled: missing it, a blocked account
+  // stays in rotation failing every request.
+  for (const candidate of [ext, nested, body]) {
+    if (!isRecord(candidate)) continue;
+    for (const value of Object.values(candidate)) {
+      if (typeof value !== "string") continue;
+      const embedded = parseEmbeddedCode(value);
+      if (embedded !== undefined) return embedded;
+    }
   }
   // A numeric code is still the provider's identifier; keep it as text so an
   // operator can search for it. The nested string above wins when both exist.
@@ -364,6 +407,14 @@ export function classifyUpstreamFailure(error: unknown): UpstreamFailurePolicy {
     error.code === "model_not_found" ||
     error.code === "admission_unavailable" ||
     error.code === "capacity_exhausted" ||
+    // A provider max-inflight rejection: the plan's next sibling account may
+    // have a free slot, exactly as with an API-key concurrency rejection.
+    error.code === "provider_capacity_exhausted" ||
+    // The upstream accepted the request and is holding it in a queue. Another
+    // account of the same provider is very likely not queued, so failover is
+    // the faster answer — and if every account is queued, the caller still has
+    // the stated interval to wait for.
+    error.code === "upstream_queued" ||
     error.code === "accounts_unavailable" ||
     error.code === "accounts_rate_limited" ||
     error.code === "quota_exceeded" ||
@@ -499,8 +550,8 @@ export interface TerminalOutcome {
  * Derives a failed attempt's status, error category, and error origin **from
  * one decision**, so the three can never contradict each other.
  *
- * They used to be computed independently at each dispatch call site, and they
- * drifted: a request that failed on an upstream condition could be recorded
+ * Computing them independently at a dispatch call site lets them
+ * drift: a request that failed on an upstream condition could be recorded
  * `cancelled` (499) while its category said `transport_unavailable` and its
  * http status said 502 — a row no operator could trust. Bundling them here
  * makes the inconsistency unrepresentable: a cancel always carries
@@ -591,6 +642,88 @@ export function isContextLengthFailure(body: unknown): boolean {
   }
   return false;
 }
+/**
+ * How long an upstream asked the caller to wait before retrying, in
+ * milliseconds, or `undefined` when the body states no duration.
+ *
+ * `retryAfterSeconds` is the field the queue-shaped refusals carry. It is read
+ * from a few plausible spellings because the upstreams that queue a request do
+ * not agree on one, and a queue with no duration still has to be reported as a
+ * queue — the caller's wait is then bounded by the caller, not by us.
+ */
+export function queueRetryAfterMs(body: unknown): number | undefined {
+  if (!isRecord(body)) return undefined;
+  const envelope = isRecord(body.error) ? body.error : body;
+  for (const source of [envelope, body]) {
+    for (const key of ["retryAfterSeconds", "retry_after_seconds", "retryAfterMs", "retry_after"]) {
+      const raw = source[key];
+      if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {
+        return key.toLowerCase().endsWith("ms") ? Math.round(raw) : Math.round(raw * 1000);
+      }
+      if (typeof raw === "string") {
+        const value = Number(raw.trim());
+        if (Number.isFinite(value) && value > 0) {
+          return key.toLowerCase().endsWith("ms") ? Math.round(value) : Math.round(value * 1000);
+        }
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * True when an upstream error body says the request is **queued**, not refused.
+ *
+ * Qoder answers `403` with `{"code":"10605", "isQueued":true,
+ * "retryAfterSeconds":N}`. That is not a rejection — the request is accepted and
+ * will be served once capacity frees up — but it arrives on a status the
+ * gateway treats as a failure, so without this it surfaced as a 403 the client
+ * read as "you may not do this" and the turn ended. Reporting it as a queue
+ * lets the caller wait for the stated interval instead.
+ *
+ * Recognized conservatively: an explicit `isQueued` flag, the `10605` code, or
+ * a message naming a queue. A bare word like "queue" appearing anywhere in a
+ * long body is not enough on its own, which is why the message test requires
+ * the queue to be what the message is *about* rather than a word it contains.
+ */
+export function isUpstreamQueued(body: unknown): boolean {
+  if (!isRecord(body)) return false;
+  const envelope = isRecord(body.error) ? body.error : body;
+  if (envelope.isQueued === true || body.isQueued === true) return true;
+  if (envelope.queued === true || body.queued === true) return true;
+  for (const candidate of [envelope.code, body.code]) {
+    if (typeof candidate === "string" && candidate.trim() === "10605") return true;
+  }
+  for (const candidate of [envelope.message, envelope.msg, body.message, body.msg]) {
+    if (typeof candidate !== "string") continue;
+    const lower = candidate.toLowerCase();
+    // "is queued" / "queued, retry in Ns" — the queue as the message's subject.
+    if (/\bqueued\b|\bis queue\b|resource_limit/.test(lower)) return true;
+  }
+  return false;
+}
+
+/** The error a queued upstream request becomes: retryable, with its wait. */
+export function upstreamQueuedError(
+  providerId: string,
+  retryAfterMs: number | undefined,
+  detail: string,
+): GatewayError {
+  return new GatewayError(
+    "upstream_queued",
+    503,
+    detail.length > 0
+      ? detail
+      : "The upstream has queued this request. Retry after the stated interval.",
+    {
+      providerId,
+      reason: "upstream-queued",
+      ...(retryAfterMs === undefined ? {} : { retryAfterMs, cooldownMs: retryAfterMs }),
+    },
+    "upstream",
+  );
+}
+
 const QUOTA_ERROR_IDENTIFIERS: ReadonlySet<string> = new Set([
   "rate_limit_exceeded",
   "rate_limit_error",
@@ -815,12 +948,31 @@ export async function mapUpstreamHttpError(response: Response, providerId: strin
     parsedBody = undefined;
   }
   const identifier = upstreamErrorIdentifier(parsedBody) ?? providerCode;
-  const classification = isContextLengthFailure(parsedBody)
-    ? { code: "context_length_exceeded" as const, status: 413, origin: "upstream" as const }
-    : classifyUpstreamError(response.status, identifier);
+  // A queued request is checked *before* the status table: the upstream accepted
+  // the request and will serve it, but says so on a failure status (Qoder's 403
+  // + 10605). Letting the table classify it first turned "wait, then retry"
+  // into a refusal the client could not distinguish from a permissions error.
+  const upstreamQueued = isUpstreamQueued(parsedBody);
+  // The body's stated interval wins; the header is only a fallback, because an
+  // upstream that queues a request usually states the wait in the body and
+  // leaves `Retry-After` off entirely.
+  const queuedWaitMs = upstreamQueued
+    ? (queueRetryAfterMs(parsedBody) ??
+      (parseUpstreamBackoff(response.headers) ?? undefined))
+    : undefined;
+  const classification = upstreamQueued
+    ? { code: "upstream_queued" as const, status: 503, origin: "upstream" as const }
+    : isContextLengthFailure(parsedBody)
+      ? { code: "context_length_exceeded" as const, status: 413, origin: "upstream" as const }
+      : classifyUpstreamError(response.status, identifier);
   const extracted = extractUpstreamMessage(parsedBody ?? text);
   const message = (extracted.length > 0 ? extracted : text.trim() || `Provider returned HTTP ${response.status}.`).slice(0, MAX_UPSTREAM_ERROR_BYTES).replace(/[\r\n]+/g, " ");
-  const retryAfterMs = parseUpstreamBackoff(response.headers);
+  const headerWaitMs = parseUpstreamBackoff(response.headers);
+  // A queue carries its own interval, which is the one the caller must honour:
+  // it is what the upstream promised, while `Retry-After` may be absent or may
+  // describe a different window. `cooldownMs` rides along so the account-health
+  // layer can also read it.
+  const retryAfterMs = queuedWaitMs ?? headerWaitMs;
   const requestId = upstreamRequestId(response.headers);
   const reportedProviderCode = providerCode ?? identifier;
   throw new GatewayError(classification.code, classification.status, message, {
@@ -830,6 +982,9 @@ export async function mapUpstreamHttpError(response: Response, providerId: strin
     ...(requestId ? { upstreamRequestId: requestId } : {}),
     raw: text.slice(0, MAX_UPSTREAM_ERROR_BYTES),
     ...(retryAfterMs === null || retryAfterMs === undefined ? {} : { retryAfterMs }),
+    ...(queuedWaitMs !== undefined
+      ? { reason: "upstream-queued", cooldownMs: queuedWaitMs }
+      : {}),
     ...(classification.rateLimitScope
       ? { rateLimitScope: classification.rateLimitScope }
       : {}),
@@ -895,8 +1050,7 @@ export function isRetryableFailure(error: unknown): boolean {
  * timeout.
  *
  * Owned here so the attempt loop, the empty-stream replay, and the Codex
- * retry budget cannot drift apart; each previously declared its own copy of
- * the constant.
+ * retry budget cannot drift apart.
  */
 export const MIN_RETRY_BUDGET_MS = 15_000;
 

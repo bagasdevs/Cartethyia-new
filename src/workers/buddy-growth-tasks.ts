@@ -22,6 +22,7 @@ import { randomUUID } from "node:crypto";
 import type { CartethyiaDatabase } from "../persistence/db-handle";
 import { buddyTaskLedger, providerAccounts } from "../persistence/schema";
 import { log } from "../observability/logger";
+import { sleep } from "../shared/sleep";
 import { buddyAccountUid } from "../providers/integrations/buddy/buddy-oauth-shared";
 import {
   adoptFirstBuddy,
@@ -207,12 +208,6 @@ async function forAccount(
   return run(call);
 }
 
-/** Pause between accounts, so one pass does not look like a burst upstream. */
-function sleep(ms: number): Promise<void> {
-  const { promise, resolve } = Promise.withResolvers<void>();
-  setTimeout(resolve, ms);
-  return promise;
-}
 /** Walks the accounts, skipping any already settled today. */
 async function runTask(
   deps: BuddyTaskDeps,
@@ -353,10 +348,10 @@ export function buddyTrialTask(deps: BuddyTaskDeps) {
  * Growth-activity report: the `/v2/report` batch that lights the login streak and
  * scores the daily growth event.
  *
- * It used to ride the quota sweep with no ledger of its own, which meant eight
- * POSTs per account *per sweep* (two rounds of four events) because the sweep
- * ran every minute. It is its own once-a-day task here, gated by the same
- * (day, account, task) ledger as every other growth task.
+ * It is a once-a-day task with its own ledger, gated by the same
+ * (day, account, task) ledger as every other growth task: running it on the
+ * quota sweep would post two rounds of four events per account per sweep, and
+ * the sweep runs every minute.
  *
  * The report is not a credit claim, so its failure never marks an account
  * unhealthy — the result is logged and the ledger is stamped either way.

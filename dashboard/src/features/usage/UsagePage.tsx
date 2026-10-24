@@ -39,6 +39,7 @@ import {
   YAxis,
 } from "recharts";
 import { Button } from "../../components/ui/button";
+import { BAN_DURATION_CHOICES, DEFAULT_BAN_CHOICE, type BanDurationChoice } from "../../lib/ban-durations";
 import { useBanIp } from "../../hooks/model-bans";
 import { downloadTextFile } from "../../lib/download";
 import { toast } from "../../lib/toast";
@@ -64,7 +65,7 @@ import { usageApiKeyLabel, usageClientLabel, maskClientIp } from "./usage-labels
 import { useMaskIp } from "../../lib/privacy-mode";
 
 import { useProviderAccounts, useProviders } from "../../hooks/providers";
-import { useInFlight, type InFlightState } from "../../hooks/live";
+import { useInFlight, useRequestsStream, type InFlightState } from "../../hooks/live";
 import { useTrackedTimeout } from "../../hooks/use-timeout";
 import { USAGE_PERIODS, type UsagePeriod as Period } from "../../data/usage-periods";
 import { httpStatusLabel, httpStatusShortLabel, httpStatusTone } from "./http-status";
@@ -404,16 +405,22 @@ function errorMessageFor(errorKind: string | undefined): string {
     platform_unavailable: "upstream provider was unavailable",
     proxy_unreachable: "network proxy was unreachable",
     proxy_auth_required: "network proxy rejected the credential",
-    quota_exceeded: "upstream rate limit or quota was exceeded",
+    // `quota_exceeded` is produced by four layers — an API key's rpm/daily/
+    // monthly/lifetime budget, the per-IP abuse limit, the console mutation
+    // limit, and upstream itself. Read `details.reason` before assuming which;
+    // the plain-English text here is the shared thread, not the diagnosis.
+    quota_exceeded: "a rate limit or budget was exhausted",
     authentication_failed: "upstream rejected the credential",
-    capacity_exhausted: "upstream capacity was exhausted",
+    capacity_exhausted: "the API key's concurrency limit was reached",
+    provider_capacity_exhausted: "every account was at its max-inflight ceiling",
+    upstream_queued: "the upstream queued this request; retry after the stated interval",
     model_not_found: "no route served this model",
     context_length_exceeded: "the request exceeded the model's context window",
     capability_unsupported: "the route does not support this request",
     admission_unavailable: "gateway dependencies were unavailable",
     unknown_error: "the upstream failure could not be classified",
-    // Codes that previously had no entry and fell through to a mechanical
-    // underscore-to-space rendering of the raw code.
+    // Without an entry these fall through to a mechanical underscore-to-space
+    // rendering of the raw code.
     accounts_unavailable: "no account for this route was available",
     accounts_rate_limited: "every account for this route is rate limited or cooling down",
     ambiguous_model: "the model id matched more than one route",
@@ -431,6 +438,24 @@ function errorMessageFor(errorKind: string | undefined): string {
     unsupported_field: "the request carried a field this route rejects",
     shutting_down: "the gateway was draining for a restart",
     restart_for_update: "the gateway was restarting for an update; retry shortly",
+    upstream_not_found: "the upstream route did not exist",
+    request_too_large: "the request body exceeded the size limit",
+    proxy_pool_provider_capacity_exceeded:
+      "this provider reached its ceiling on the selected proxy pool",
+    proxy_pool_blocked: "the proxy pool refused this destination",
+    policy_rejected: "gateway policy refused this request",
+    link_not_found: "that share link does not exist",
+    link_expired: "that share link has expired",
+    link_revoked: "that share link was revoked",
+    link_disabled: "that share link is disabled",
+    invalid_sequence: "the request arrived out of sequence",
+    invalid_lifecycle: "the request is not valid in its current state",
+    unsupported_media_type: "the request's content type is not accepted",
+    upstream_conflict: "upstream reported a conflict",
+    upstream_unprocessable: "upstream could not process the request",
+    overloaded: "the gateway was overloaded; retry shortly",
+    client_router_denied: "the client router denied this request",
+    model_abuse_banned: "this address is banned for this key after repeated invalid model requests",
   };
   if (errorKind && messages[errorKind]) return messages[errorKind];
   if (errorKind) return errorKind.replaceAll("_", " ");
@@ -931,6 +956,7 @@ function RequestDetailDrawer({
   const [copiedRequestId, setCopiedRequestId] = useState(false);
   const [copiedPayload, setCopiedPayload] = useState<PayloadKind | null>(null);
   const [downloading, setDownloading] = useState(false);
+  const [banMenuOpen, setBanMenuOpen] = useState(false);
   const banIp = useBanIp();
   const scheduleReset = useTrackedTimeout();
   const copyRequestId = () => {
@@ -962,11 +988,21 @@ function RequestDetailDrawer({
       setDownloading(false);
     }
   };
-  const banThisUser = async () => {
+  const banThisUser = async (choice: BanDurationChoice = DEFAULT_BAN_CHOICE) => {
     if (!detail?.clientIp) return;
+    setBanMenuOpen(false);
+    // Scoped to this request's key by default: a shared address or a share link
+    // means other callers are behind the same IP, and banning the address for
+    // what one caller did takes them down too.
     try {
-      await banIp.mutateAsync(detail.clientIp);
-      toast.success(`Banned ${detail.clientIp}.`);
+      const ban = await banIp.mutateAsync({
+        ip: detail.clientIp,
+        apiKeyId: detail.apiKeyId ?? null,
+        minutes: choice.minutes,
+      });
+      toast.success(
+        `Banned ${detail.clientIp}${ban.ban.apiKeyId ? " for this key" : " for every key"} — ${choice.label}.`,
+      );
     } catch (error) {
       toast.error(getErrorMessage(error, "Could not ban the address."));
     }
@@ -1028,17 +1064,67 @@ function RequestDetailDrawer({
             />
           </div>
           <div className="grid grid-cols-2 gap-2">
-            <Button
-              variant="secondary"
-              size="sm"
-              icon={<Ban size={13} />}
-              disabled={!detail.clientIp || banIp.isPending}
-              title={detail.clientIp ? `Ban ${detail.clientIp}` : "No client IP recorded for this request"}
-              onClick={() => void banThisUser()}
-              className="w-full"
-            >
-              Banned User
-            </Button>
+            {/*
+              * A split control: the click bans for one hour, which is the
+              * reversible default, and the caret opens the longer choices.
+              * A bare button could only offer one duration, and "Permanent"
+              * as that one duration is a ban an operator then has to remember
+              * to lift.
+              */}
+            <div className="relative w-full">
+              <div className="flex w-full">
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  icon={<Ban size={13} />}
+                  disabled={!detail.clientIp || banIp.isPending}
+                  title={
+                    detail.clientIp
+                      ? `Ban ${detail.clientIp} for this API key for ${DEFAULT_BAN_CHOICE.label}`
+                      : "No client IP recorded for this request"
+                  }
+                  onClick={() => void banThisUser()}
+                  className="min-w-0 flex-1 rounded-r-none"
+                >
+                  Banned User
+                </Button>
+                <button
+                  type="button"
+                  disabled={!detail.clientIp || banIp.isPending}
+                  aria-haspopup="menu"
+                  aria-expanded={banMenuOpen}
+                  aria-label="Choose how long to ban this user"
+                  title="Choose how long to ban this user"
+                  onClick={() => setBanMenuOpen((value) => !value)}
+                  className="grid place-items-center px-2 border border-l-0 border-inner-border rounded-r-control bg-surface-1 text-text-secondary hover:bg-surface-muted hover:text-text-primary cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <ChevronDown size={12} aria-hidden="true" />
+                </button>
+              </div>
+              {banMenuOpen ? (
+                <div
+                  role="menu"
+                  aria-label="Ban duration"
+                  className="absolute bottom-full left-0 z-50 mb-1 min-w-36 flex flex-col gap-0.5 border border-inner-border rounded-control bg-popover-bg shadow-popout p-1.5"
+                >
+                  {BAN_DURATION_CHOICES.map((choice) => (
+                    <button
+                      key={choice.label}
+                      type="button"
+                      role="menuitem"
+                      onClick={() => void banThisUser(choice)}
+                      className="px-2.5 py-1.5 text-left text-caption text-text-secondary rounded-inset hover:bg-hover-bg hover:text-text-primary cursor-pointer whitespace-nowrap"
+                    >
+                      {choice.label}
+                    </button>
+                  ))}
+                  <p className="px-2.5 pb-0.5 pt-1.5 text-micro leading-snug text-text-tertiary">
+                    Scoped to this request's API key. Other keys from this IP
+                    are unaffected.
+                  </p>
+                </div>
+              ) : null}
+            </div>
             <Button
               variant="secondary"
               size="sm"
@@ -1268,6 +1354,7 @@ function RequestsStatCard({
   return (
     <StatCard
       label="Requests"
+      fit
       value={pending ? "…" : formatNumber(requests)}
       detail={
         flight.count === null || flight.uniqueIps === null
@@ -1290,12 +1377,11 @@ function RequestsStatCard({
  * not flash a "—" row before real numbers arrive.
  *
  * One row, four figures of the same size: `RESOLVE 367 ms · P50 … · P95 … ·
- * P99 …`. The average used to be larger and labelled "Route latency AVG",
- * which read as a heading sitting on top of the percentiles, then "Latency" —
- * which put it in the same series as the percentiles beside it when it is a
- * different measurement entirely (pre-dispatch delay, not response time).
- * "Resolve" says which one it is. It wraps rather than overflows when there is
- * no room.
+ * P99 …`. "Resolve" names the measurement: a larger label such as "Route
+ * latency AVG" reads as a heading sitting on top of the percentiles, and
+ * "Latency" puts it in the same series as the percentiles beside it when it is
+ * a different measurement entirely (pre-dispatch delay, not response time).
+ * It wraps rather than overflows when there is no room.
  *
  * Each figure carries a native `title` explaining the metric, the window, and
  * how many requests it was computed from — a percentile over twenty requests
@@ -1520,6 +1606,7 @@ export default function Usage(): ReactNode {
   const [requestLimit, setRequestLimit] = useState(50);
   const [requestStatusFilter, setRequestStatusFilter] = useState<number | null>(null);
   const requestsQuery = useUsageRequests(period, requestLimit, requestStatusFilter);
+  useRequestsStream();
   /** Scroll offset of the Requests table, restored after each live refresh. */
   const requestsScrollTopRef = useRef(0);
   const [requestSortKey, setRequestSortKey] = useState<"startedAt" | "model" | "status" | "tokens" | "tps" | "ttft" | "duration">("startedAt");
@@ -1671,6 +1758,7 @@ export default function Usage(): ReactNode {
         />
         <StatCard
           label="Input tokens"
+          fit
           value={summaryQuery.isPending ? "…" : tokenScaleValue(summary?.inputTokens, tokenScale)}
           detail="Prompt tokens"
           tone="accent"
@@ -1685,6 +1773,7 @@ export default function Usage(): ReactNode {
         />
         <StatCard
           label="Cached tokens"
+          fit
           value={summaryQuery.isPending ? "…" : tokenScaleValue(summary?.cachedTokens, tokenScale)}
           detail={
             summaryQuery.isPending
@@ -1704,6 +1793,7 @@ export default function Usage(): ReactNode {
         />
         <StatCard
           label="Output tokens"
+          fit
           value={summaryQuery.isPending ? "…" : tokenScaleValue(summary?.outputTokens, tokenScale)}
           detail="Completion tokens"
           icon={<ArrowUpFromLine size={13} />}

@@ -138,7 +138,7 @@ function TokenBudgetField({
         disabled={disabled}
       />
       <div
-        className="flex flex-wrap gap-3 mt-3"
+        className="flex flex-wrap gap-2 mt-2"
         role="group"
         aria-label={`${label} presets`}
       >
@@ -150,7 +150,7 @@ function TokenBudgetField({
             aria-label={`${preset.label}, ${preset.description} tokens`}
             onClick={() => onChange(preset.label)}
             disabled={disabled}
-            className="py-1 px-4 rounded-chip text-micro font-semibold"
+            className="py-0.5 px-3 rounded-chip text-micro font-semibold"
             style={{
               cursor: disabled ? "not-allowed" : "pointer",
               border: `1px solid ${selected === preset.label ? "var(--accent)" : "var(--inner-border)"}`,
@@ -211,9 +211,9 @@ function RemoteRoutingRow({
 
   return (
     <div
-      className="flex items-center justify-between gap-6 py-2 px-5 rounded-inset"
+      className="flex items-center justify-between gap-4 py-1.5 px-4 rounded-inset"
       style={{
-        minHeight: "44px",
+        minHeight: "38px",
         border: "1px solid var(--inner-border)",
         background: enabled ? "var(--accent-soft)" : "var(--surface-1)",
       }}
@@ -277,9 +277,8 @@ function RemoteRoutingSection({
 }): ReactNode {
   const registry = useToolRegistry();
   const tools = (registry.data ?? []).filter((tool) => tool.mappingSupported);
-  if (keyId.length === 0 || tools.length === 0) return null;
   return (
-    <section aria-labelledby="remote-routing-heading" className="flex flex-col gap-4">
+    <section aria-labelledby="remote-routing-heading" className="flex flex-col gap-3">
       <div>
     <h4 id="remote-routing-heading" className="inline-flex items-center gap-2 text-caption font-bold text-text-primary">
       <Route size={15} className="text-accent" aria-hidden="true" />
@@ -289,21 +288,31 @@ function RemoteRoutingSection({
           Route this key's CLI model calls through persisted mappings and grant routing:cli_mapping. Applies immediately — no save needed.
         </p>
       </div>
-      <div className="flex flex-col gap-3">
-        {tools.map((tool) => (
-          <RemoteRoutingRow
-            key={tool.id}
-            tool={tool}
-            keyId={keyId}
-            busy={busy}
-            scopeGranted={scopeGranted}
-            onScopeChange={(next) => {
-              onScopeChange(next);
-              persistScope(next);
-            }}
-          />
-        ))}
-      </div>
+      {keyId.length === 0 ? (
+        <p className="text-badge text-text-tertiary m-0">
+          Save the key first to configure per-tool remote routing mappings.
+        </p>
+      ) : tools.length === 0 ? (
+        <p className="text-badge text-text-tertiary m-0">
+          No CLI tools with mapping support are currently registered.
+        </p>
+      ) : (
+        <div className="flex flex-col gap-3">
+          {tools.map((tool) => (
+            <RemoteRoutingRow
+              key={tool.id}
+              tool={tool}
+              keyId={keyId}
+              busy={busy}
+              scopeGranted={scopeGranted}
+              onScopeChange={(next) => {
+                onScopeChange(next);
+                persistScope(next);
+              }}
+            />
+          ))}
+        </div>
+      )}
     </section>
   );
 }
@@ -359,8 +368,12 @@ export function oneTimeSecretForMode(keyMode: ApiKeyResponse["keyMode"], secret:
 export function initialApiKeyScopes(
   record: { readonly isDefault?: boolean; readonly scopes?: readonly string[] } | null,
 ): string[] {
-  if (record?.isDefault) return [...TENANT_KEY_SCOPES];
+  // For the default key: use whatever is stored on the record (so removals
+  // survive re-open); fall back to the full set only when no scopes are saved yet.
   const savedScopes = record?.scopes;
+  if (record?.isDefault) {
+    return savedScopes && savedScopes.length > 0 ? [...savedScopes] : [...TENANT_KEY_SCOPES];
+  }
   return savedScopes && savedScopes.length > 0
     ? [...savedScopes]
     : ["routing:invoke", "search:invoke"];
@@ -420,7 +433,7 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose, actionsRef }: 
     const b = (record as unknown as { notesBody?: string | null })?.notesBody;
     return b ?? "";
   });
-  const [sharePopupEnabled, setSharePopupEnabled] = useState(record?.sharePopupEnabled ?? false);
+  const [sharePopupEnabled, setSharePopupEnabled] = useState(record?.sharePopupEnabled ?? true);
   // Tri-state upload: no pick yet, a freshly picked data URL, or an explicit
   // removal of the art already stored on the key.
   const [sharePopupImageDataUrl, setSharePopupImageDataUrl] = useState<string | null>(null);
@@ -432,8 +445,31 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose, actionsRef }: 
     (hasStoredImage && !sharePopupImageRemoved && record !== null
       ? `/console/api/api-keys/${record.id}/share-popup-image`
       : null);
-  const [sharePopupTitle, setSharePopupTitle] = useState(record?.sharePopupTitle ?? "");
-  const [sharePopupBody, setSharePopupBody] = useState(record?.sharePopupBody ?? "");
+  // Pre-fill QRIS image when there is no stored image and user hasn't picked one yet.
+  useEffect(() => {
+    if (hasStoredImage || sharePopupImageDataUrl !== null || sharePopupImageRemoved) return;
+    fetch("/donation/qris-risun-marke.png")
+      .then((r) => r.ok ? r.blob() : Promise.reject(r.status))
+      .then((blob) => {
+        const { promise, resolve, reject } = Promise.withResolvers<string>();
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as string);
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+        return promise;
+      })
+      .then((dataUrl) => setSharePopupImageDataUrl(dataUrl))
+      .catch(() => { /* silently skip if asset not reachable */ });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const [sharePopupTitle, setSharePopupTitle] = useState(
+    record?.sharePopupTitle ??
+    "Support via QRIS"
+  );
+  const [sharePopupBody, setSharePopupBody] = useState(
+    record?.sharePopupBody ??
+    "Scan the QR code above with any QRIS-compatible banking or e-wallet app to support this gateway's upkeep. Every contribution helps keep the service running — thank you! 🙏"
+  );
   const [keyMode, setKeyMode] = useState<ApiKeyResponse["keyMode"]>(
     record?.keyMode ?? "personal",
   );
@@ -442,8 +478,8 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose, actionsRef }: 
   // template to a personal key (or back) revokes its children and links, so the
   // edit form shows the mode but never lets it change.
   const modeLocked = mode === "edit";
-  // Used to persist the routing scope the instant the Remote routing switch
-  // flips, rather than deferring it to "Save changes".
+  // Persists the routing scope the instant the Remote routing switch flips,
+  // rather than deferring it to "Save changes".
   const updateKey = useUpdateApiKey();
   const toggleScope = (scope: string) =>
     setScopes((cur) => (cur.includes(scope) ? cur.filter((s) => s !== scope) : [...cur, scope]));
@@ -484,9 +520,9 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose, actionsRef }: 
     );
   });
   return (
-    <div className="flex flex-col gap-6 min-w-0 pb-2">
-      <section className="flex flex-col gap-4 min-w-0 p-6 border border-inner-border rounded-card bg-surface-2 col-span-full">
-        <h3 className="inline-flex items-center gap-2 text-body font-bold text-text-primary">
+    <div className="flex flex-col gap-3 min-w-0 pb-2">
+      <section className="flex flex-col gap-3 min-w-0 p-4 border border-inner-border rounded-card bg-surface-2 col-span-full">
+        <h3 className="inline-flex items-center gap-2 text-caption font-bold text-text-primary">
           <KeyRound size={16} className="text-accent" aria-hidden="true" />
           Credential mode
         </h3>
@@ -495,7 +531,7 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose, actionsRef }: 
             <button key={modeOption} type="button" aria-pressed={keyMode === modeOption}
               disabled={busy || modeLocked} onClick={() => setKeyMode(modeOption)}
               title={modeLocked ? "Credential mode cannot change after creation" : undefined}
-              className="rounded-inset py-2 px-6"
+              className="rounded-inset py-1.5 px-5"
               style={{ border: "1px solid var(--inner-border)",
                 color: keyMode === modeOption ? "var(--accent)" : "var(--text-secondary)",
                 background: keyMode === modeOption ? "var(--accent-soft)" : "var(--surface-2)",
@@ -513,11 +549,11 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose, actionsRef }: 
             : "A personal key authenticates requests directly; its secret is shown once when created or rotated."}
         </p>
       </section>
-      <div className="columns-2 gap-6 min-w-0 max-medium:columns-1">
+      <div className="grid grid-cols-2 gap-3 min-w-0 max-medium:grid-cols-1">
       {mode === "create" && (
-        <section className="flex flex-col gap-4 min-w-0 p-6 border border-inner-border rounded-card bg-surface-2 break-inside-avoid mb-6">
+        <section className="flex flex-col gap-3 min-w-0 p-4 border border-inner-border rounded-card bg-surface-2">
           <div>
-            <h3 className="inline-flex items-center gap-2 text-body font-bold text-text-primary">
+            <h3 className="inline-flex items-center gap-2 text-caption font-bold text-text-primary">
               <Fingerprint size={16} className="text-accent" aria-hidden="true" />
               Identity
             </h3>
@@ -538,9 +574,9 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose, actionsRef }: 
         </section>
       )}
       {mode === "edit" && (
-        <section className="flex flex-col gap-4 min-w-0 p-6 border border-inner-border rounded-card bg-surface-2 break-inside-avoid mb-6">
+        <section className="flex flex-col gap-3 min-w-0 p-4 border border-inner-border rounded-card bg-surface-2">
           <div>
-            <h3 className="text-body font-bold text-text-primary">
+            <h3 className="text-caption font-bold text-text-primary">
               <Fingerprint size={16} className="mr-2 inline text-accent" aria-hidden="true" />
               Identity
             </h3>
@@ -563,9 +599,9 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose, actionsRef }: 
           </div>
         </section>
       )}
-      <section className="flex flex-col gap-4 min-w-0 p-6 border border-inner-border rounded-card bg-surface-2 break-inside-avoid mb-6">
+      <section className="flex flex-col gap-3 min-w-0 p-4 border border-inner-border rounded-card bg-surface-2">
         <div>
-          <h3 className="text-body font-bold text-text-primary">
+          <h3 className="text-caption font-bold text-text-primary">
             <StickyNote size={16} className="mr-2 inline text-accent" aria-hidden="true" />
             Share notes
           </h3>
@@ -588,6 +624,7 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose, actionsRef }: 
           placeholder="e.g. Come and save your tokens"
           disabled={busy}
         />
+        <div className="col-span-full">
         <Input
           label="Body"
           value={notesBody}
@@ -596,10 +633,11 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose, actionsRef }: 
           disabled={busy}
         />
         </div>
+        </div>
       </section>
-      <section className="flex flex-col gap-4 min-w-0 p-6 border border-inner-border rounded-card bg-surface-2 break-inside-avoid mb-6">
+      <section className="flex flex-col gap-3 min-w-0 p-4 border border-inner-border rounded-card bg-surface-2 col-span-full">
         <div>
-          <h3 className="text-body font-bold text-text-primary">
+          <h3 className="text-caption font-bold text-text-primary">
             <Gauge size={16} className="mr-2 inline text-accent" aria-hidden="true" />
             Limits
           </h3>
@@ -628,7 +666,7 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose, actionsRef }: 
           />
         </div>
         <div
-          className="flex items-center justify-between gap-6 rounded-panel border border-inner-border px-6 py-5 bg-surface-2"
+          className="flex items-center justify-between gap-4 rounded-panel border border-inner-border px-4 py-3 bg-surface-2"
         >
           <div>
             <div className="text-caption font-bold text-text-primary">
@@ -648,9 +686,9 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose, actionsRef }: 
               type="button"
               onClick={() => setBudgetMode("recurring")}
               disabled={busy}
-              className="py-2 px-5 rounded-chip font-semibold border-0 cursor-pointer"
+              className="py-1.5 px-4 rounded-chip font-semibold border-0 cursor-pointer"
               style={{
-                fontSize: "10.5px",
+                fontSize: "10px",
                 background: !isOneTime ? "var(--accent-soft)" : "transparent",
                 color: !isOneTime ? "var(--accent)" : "var(--text-tertiary)",
               }}
@@ -664,9 +702,9 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose, actionsRef }: 
               type="button"
               onClick={() => setBudgetMode("one-time")}
               disabled={busy}
-              className="py-2 px-5 rounded-chip font-semibold border-0 cursor-pointer"
+              className="py-1.5 px-4 rounded-chip font-semibold border-0 cursor-pointer"
               style={{
-                fontSize: "10.5px",
+                fontSize: "10px",
                 background: isOneTime ? "var(--accent-soft)" : "transparent",
                 color: isOneTime ? "var(--accent)" : "var(--text-tertiary)",
               }}
@@ -703,10 +741,10 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose, actionsRef }: 
         )}
       </section>
       </div>
-      <section className="flex flex-col gap-4 min-w-0 p-6 border border-inner-border rounded-card bg-surface-2 col-span-full" aria-labelledby="share-popup-heading">
+      <section className="flex flex-col gap-3 min-w-0 p-4 border border-inner-border rounded-card bg-surface-2 col-span-full" aria-labelledby="share-popup-heading">
         <div className="flex items-start justify-between gap-6">
           <div>
-            <h3 id="share-popup-heading" className="text-body font-bold text-text-primary">
+            <h3 id="share-popup-heading" className="text-caption font-bold text-text-primary">
               <Share2 size={16} className="mr-2 inline text-accent" aria-hidden="true" />
               Share page popup
             </h3>
@@ -785,9 +823,9 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose, actionsRef }: 
         ) : null}
       </section>
       <details className="group min-w-0 col-span-full rounded-card border border-inner-border bg-surface-2">
-        <summary className="flex cursor-pointer list-none items-center justify-between gap-4 p-6 [&::-webkit-details-marker]:hidden">
+        <summary className="flex cursor-pointer list-none items-center justify-between gap-3 p-4 [&::-webkit-details-marker]:hidden">
           <span className="flex min-w-0 items-start gap-3">
-            <span className="grid size-10 shrink-0 place-items-center rounded-inset bg-accent-soft text-accent">
+            <span className="grid size-8 shrink-0 place-items-center rounded-inset bg-accent-soft text-accent">
               <Shield size={18} aria-hidden="true" />
             </span>
             <span className="min-w-0">
@@ -804,7 +842,7 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose, actionsRef }: 
             <ChevronDown size={14} className="transition-transform group-open:rotate-180" aria-hidden="true" />
           </span>
         </summary>
-        <div className="flex flex-col gap-5 border-t border-inner-border p-6">
+        <div className="flex flex-col gap-4 border-t border-inner-border p-4">
           {record?.isDefault ? (
             <div className="flex items-start gap-3 rounded-control border border-accent/30 bg-accent-soft p-4 text-badge text-text-secondary">
               <ShieldCheck size={16} className="mt-0.5 shrink-0 text-accent" aria-hidden="true" />
@@ -816,232 +854,235 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose, actionsRef }: 
               </p>
             </div>
           ) : null}
-        <div className="columns-2 gap-6 min-w-0 max-medium:columns-1">
-        <div>
-          <label className="inline-flex items-center gap-2 text-badge font-semibold text-text-secondary block mb-3">
-            <Boxes size={14} className="text-accent" aria-hidden="true" />
-            Model access
-          </label>
-          <div
-            role="group"
-            aria-label="Model access mode"
-            className="flex gap-3 mb-4"
-          >
-            {(["whitelist", "blacklist"] as const).map((option) => (
-              <button
-                key={option}
-                type="button"
-                aria-pressed={modelAccessMode === option}
-                disabled={busy}
-                onClick={() => setModelAccessMode(option)}
-                title={
-                  option === "whitelist"
-                    ? "Only the listed models may be used. An empty list allows every model."
-                    : "The listed models are refused. Everything else is allowed."
-                }
-                className="flex-1 py-2.5 px-4 text-badge font-semibold"
-                style={{
-                  borderRadius: "7px",
-                  border: `1px solid ${modelAccessMode === option ? "var(--accent)" : "var(--inner-border)"}`,
-                  background: modelAccessMode === option ? "var(--accent-soft)" : "var(--surface-2)",
-                  color: modelAccessMode === option ? "var(--accent)" : "var(--text-secondary)",
-                  cursor: busy ? "not-allowed" : "pointer",
-                  opacity: busy ? 0.6 : 1,
-                }}
-              >
-                {option === "whitelist" ? "Whitelist" : "Blacklist"}
-                {option === "whitelist"
-                  ? <ShieldCheck size={13} className="ml-2 inline" aria-hidden="true" />
-                  : <ShieldX size={13} className="ml-2 inline" aria-hidden="true" />}
-              </button>
-            ))}
-          </div>
-          <label
-            className="text-badge font-semibold text-text-secondary block mb-3"
-          >
-            {modelAccessMode === "whitelist" ? "Allowed models" : "Blocked models"}
-          </label>
-          <div className="flex gap-3 flex-wrap mb-4">
-            {models.length === 0 ? (
-              <span className="mt-1 text-badge text-text-tertiary">
-                {modelAccessMode === "whitelist" ? "All models allowed" : "No models blocked"}
-              </span>
-            ) : (
-              models.map((m) => (
-                <span key={m}
-                 className="font-mono tabular-nums inline-flex items-center gap-2 text-badge bg-accent-soft text-accent py-1 px-4 rounded-chip border border-accent">
-                  {m}
+          {/* Two-column layout: Model Access left, everything else right. Collapses to single column on medium screens. */}
+          <div className="grid grid-cols-access gap-5 min-w-0 max-medium:grid-cols-1">
+            {/* ── Left column: Model access ── */}
+            <section aria-labelledby="model-access-heading" className="flex flex-col gap-3 min-w-0 rounded-card border border-inner-border bg-surface-1 p-4">
+              <h4 id="model-access-heading" className="inline-flex items-center gap-2 text-caption font-bold text-text-primary">
+                <Boxes size={15} className="text-accent" aria-hidden="true" />
+                Model access
+              </h4>
+              <div role="group" aria-label="Model access mode" className="flex gap-2">
+                {(["whitelist", "blacklist"] as const).map((option) => (
                   <button
+                    key={option}
                     type="button"
-                    aria-label={`Remove ${m} from the model list`}
-                    onClick={() => setModels((prev) => prev.filter((x) => x !== m))}
+                    aria-pressed={modelAccessMode === option}
                     disabled={busy}
-                    className="bg-transparent border-0 cursor-pointer p-0 flex"
+                    onClick={() => setModelAccessMode(option)}
+                    title={
+                      option === "whitelist"
+                        ? "Only the listed models may be used. An empty list allows every model."
+                        : "The listed models are refused. Everything else is allowed."
+                    }
+                    className="flex-1 py-2 px-3 text-badge font-semibold"
+                    style={{
+                      borderRadius: "7px",
+                      border: `1px solid ${modelAccessMode === option ? "var(--accent)" : "var(--inner-border)"}`,
+                      background: modelAccessMode === option ? "var(--accent-soft)" : "var(--surface-2)",
+                      color: modelAccessMode === option ? "var(--accent)" : "var(--text-secondary)",
+                      cursor: busy ? "not-allowed" : "pointer",
+                      opacity: busy ? 0.6 : 1,
+                    }}
                   >
-                    ×
+                    {option === "whitelist" ? "Whitelist" : "Blacklist"}
+                    {option === "whitelist"
+                      ? <ShieldCheck size={13} className="ml-1.5 inline" aria-hidden="true" />
+                      : <ShieldX size={13} className="ml-1.5 inline" aria-hidden="true" />}
                   </button>
-                </span>
-              ))
-            )}
-          </div>
-          <Button
-            variant="secondary"
-            size="sm"
-            type="button"
-            onClick={() => setPickerOpen(true)}
-            disabled={busy}
-          >
-            Browse models
-          </Button>
-          <ModelPickerModal
-            open={pickerOpen}
-            onClose={() => setPickerOpen(false)}
-            selected={models}
-            onToggle={(v) =>
-              setModels((prev) => (prev.includes(v) ? prev.filter((x) => x !== v) : [...prev, v]))
-            }
-            title={modelAccessMode === "whitelist" ? "Select allowed models" : "Select blocked models"}
-            multi
-          />
-        </div>
-        <section aria-labelledby="blocked-routers-heading" className="flex flex-col gap-4">
-          <div>
-            <h4 id="blocked-routers-heading" className="inline-flex items-center gap-2 text-caption font-bold text-text-primary">
-              <Ban size={15} className="text-accent" aria-hidden="true" />
-              Blocked client routers
-            </h4>
-            <p className="mt-1 text-badge text-text-tertiary">
-              Matching fingerprints are rejected with 403 before routing. Detection is best-effort; clients without a fingerprint are not matched. This may also block bazaar probe links that share the same fingerprint.
-            </p>
-          </div>
-          <div className="flex flex-col gap-3">
-            {CLIENT_ROUTERS.map((router) => (
-              <div
-                key={router.id}
-                className="flex items-center justify-between gap-6 py-2 px-5 rounded-inset"
-                style={{
-                  minHeight: "44px",
-                  border: "1px solid var(--inner-border)",
-                  background: blockedRouters.includes(router.id) ? "var(--accent-soft)" : "var(--surface-1)",
-                }}
-              >
-                <div className="flex min-w-0 items-start gap-3">
-                  <Ban size={15} className="mt-1 shrink-0 text-orange" aria-hidden="true" />
-                  <div className="min-w-0">
-                  <div className="text-caption text-text-primary">
-                    Block {router.label} Client
-                  </div>
-                  <p className="mt-1 text-badge text-text-tertiary">
-                    Reject requests fingerprinted as {router.label}.
+                ))}
+              </div>
+              <p className="text-badge text-text-tertiary m-0">
+                {modelAccessMode === "whitelist"
+                  ? "Only these models may be called. Empty = all allowed."
+                  : "These models are refused. Everything else is allowed."}
+              </p>
+              <div className="flex gap-1.5 flex-wrap min-h-6">
+                {models.length === 0 ? (
+                  <span className="text-badge text-text-tertiary">
+                    {modelAccessMode === "whitelist" ? "All models allowed" : "No models blocked"}
+                  </span>
+                ) : (
+                  models.map((m) => (
+                    <span key={m} className="font-mono tabular-nums inline-flex items-center gap-1.5 text-badge bg-accent-soft text-accent py-1 px-3 rounded-chip border border-accent">
+                      {m}
+                      <button
+                        type="button"
+                        aria-label={`Remove ${m} from the model list`}
+                        onClick={() => setModels((prev) => prev.filter((x) => x !== m))}
+                        disabled={busy}
+                        className="bg-transparent border-0 cursor-pointer p-0 flex"
+                      >
+                        ×
+                      </button>
+                    </span>
+                  ))
+                )}
+              </div>
+              <Button variant="secondary" size="sm" type="button" onClick={() => setPickerOpen(true)} disabled={busy}>
+                Browse models
+              </Button>
+              <ModelPickerModal
+                open={pickerOpen}
+                onClose={() => setPickerOpen(false)}
+                selected={models}
+                onToggle={(v) =>
+                  setModels((prev) => (prev.includes(v) ? prev.filter((x) => x !== v) : [...prev, v]))
+                }
+                title={modelAccessMode === "whitelist" ? "Select allowed models" : "Select blocked models"}
+                multi
+              />
+            </section>
+
+            {/* ── Right column: 2 bordered cards ── */}
+            <div className="flex flex-col gap-4 min-w-0">
+
+              {/* ── Card 1: Routing & Client Blocking ── */}
+              <section aria-labelledby="routing-blocking-heading" className="flex flex-col gap-0 min-w-0 rounded-card border border-inner-border bg-surface-1 overflow-hidden">
+                <div className="px-4 pt-4 pb-3 border-b border-inner-border">
+                  <h4 id="routing-blocking-heading" className="inline-flex items-center gap-2 text-caption font-bold text-text-primary">
+                    <Route size={15} className="text-accent" aria-hidden="true" />
+                    Routing &amp; Client Blocking
+                  </h4>
+                  <p className="mt-1 mb-0 text-badge text-text-tertiary">
+                    Control which gateway routes this key can call and which client apps are blocked before routing.
                   </p>
+                </div>
+
+                <div className="flex flex-col divide-y divide-inner-border">
+                  {/* Gateway routing */}
+                  <div className="flex flex-col gap-2 px-4 py-3">
+                    <p className="text-badge font-semibold text-text-secondary m-0">Gateway routing</p>
+                    {TENANT_KEY_SCOPES.filter((scope) => scope === "routing:invoke").map((scope) => (
+                      <div
+                        key={scope}
+                        className="flex items-center justify-between gap-4 py-1.5 px-4 rounded-inset"
+                        style={{
+                          minHeight: "38px",
+                          border: "1px solid var(--inner-border)",
+                          background: scopes.includes(scope) ? "var(--accent-soft)" : "var(--surface-2)",
+                        }}
+                      >
+                        <div className="flex items-start gap-3">
+                          <Route size={14} className="mt-0.5 shrink-0 text-accent" aria-hidden="true" />
+                          <div className="min-w-0">
+                            <div className="text-caption font-semibold text-text-primary">{scope}</div>
+                            <p className="mt-0.5 mb-0 text-badge text-text-tertiary">{SCOPE_DESCRIPTIONS[scope]}</p>
+                          </div>
+                        </div>
+                        <Switch checked={scopes.includes(scope)} onChange={() => toggleScope(scope)} disabled={busy} aria-label={`Grant ${scope}`} />
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Blocked client apps */}
+                  <div className="flex flex-col gap-2 px-4 py-3">
+                      <p className="text-badge font-semibold text-text-secondary m-0">Blocked client apps</p>
+                    <div className="flex flex-col gap-2">
+                      {CLIENT_ROUTERS.map((router) => (
+                        <div
+                          key={router.id}
+                          className="flex items-center justify-between gap-4 py-1.5 px-4 rounded-inset"
+                          style={{
+                            minHeight: "38px",
+                            border: "1px solid var(--inner-border)",
+                            background: blockedRouters.includes(router.id) ? "var(--accent-soft)" : "var(--surface-2)",
+                          }}
+                        >
+                          <div className="flex min-w-0 items-center gap-3">
+                            <Ban size={14} className="shrink-0 text-orange" aria-hidden="true" />
+                            <div className="min-w-0">
+                              <div className="text-caption font-semibold text-text-primary">Block {router.label} Client</div>
+                              <p className="mt-0.5 mb-0 text-badge text-text-tertiary">
+                                {router.id === "9router"
+                                  ? "9router, Omniroute, and Baazar Probes"
+                                  : "Fingerprint-based detection — best-effort; unrecognised clients are never matched"}
+                      </p>
+                    </div>
+                          </div>
+                          <Switch
+                            checked={blockedRouters.includes(router.id)}
+                            onChange={(checked) =>
+                              setBlockedRouters((current) =>
+                                checked ? [...current, router.id] : current.filter((entry) => entry !== router.id),
+                              )
+                            }
+                            disabled={busy}
+                            aria-label={`Block ${router.label} client`}
+                          />
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 </div>
-                <Switch
-                  checked={blockedRouters.includes(router.id)}
-                  onChange={(checked) =>
-                    setBlockedRouters((current) =>
-                      checked
-                        ? [...current, router.id]
-                        : current.filter((entry) => entry !== router.id),
-                    )
-                  }
-                  disabled={busy}
-                  aria-label={`Block ${router.label} client`}
-                />
-              </div>
-            ))}
-          </div>
-        </section>
-        <section aria-labelledby="routing-scopes-heading" className="flex flex-col gap-4">
-          <h4 id="routing-scopes-heading" className="inline-flex items-center gap-2 text-caption font-bold text-text-primary">
-            <Route size={15} className="text-accent" aria-hidden="true" />
-            Routing
-          </h4>
-          <div className="flex flex-col gap-3">
-            {/* routing:cli_mapping is intentionally absent here: it is the scope
-                half of the Remote routing switch below, which grants it and
-                enables the routes together. Listing it separately let the two
-                disagree. */}
-            {TENANT_KEY_SCOPES.filter((scope) => scope === "routing:invoke").map((scope) => (
-              <div
-                key={scope}
-                className="flex items-center justify-between gap-6 py-2 px-5 rounded-inset"
-                style={{
-                  minHeight: "44px",
-                  border: "1px solid var(--inner-border)",
-                  background: scopes.includes(scope) ? "var(--accent-soft)" : "var(--surface-1)",
-                }}
-              >
-                <div className="flex items-start gap-3">
-                  <Route size={16} className="mt-1 shrink-0 text-accent" aria-hidden="true" />
-                  <div className="min-w-0">
-                  <div className="text-caption font-semibold text-text-primary">{scope}</div>
-                  <p className="mt-1 text-badge text-text-tertiary">{SCOPE_DESCRIPTIONS[scope]}</p>
+
+                  {/* Remote routing */}
+                  <div className="px-4 py-3">
+                    <RemoteRoutingSection
+                      keyId={mode === "edit" && record ? record.id : ""}
+                      busy={busy}
+                      scopeGranted={scopes.includes("routing:cli_mapping")}
+                      onScopeChange={(next) => {
+                        if (next === scopes.includes("routing:cli_mapping")) return;
+                        toggleScope("routing:cli_mapping");
+                      }}
+                      persistScope={(next) => {
+                        if (mode !== "edit" || !record) return;
+                        const nextScopes = next
+                          ? [...new Set([...scopes, "routing:cli_mapping"])]
+                          : scopes.filter((scope) => scope !== "routing:cli_mapping");
+                        updateKey.mutate(
+                          { keyId: record.id, request: { scopes: nextScopes } },
+                          {
+                            onError: (error) =>
+                              toast.error(getErrorMessage(error, "Could not update the key's routing scope.")),
+                          },
+                        );
+                      }}
+                    />
                   </div>
+              </section>
+
+              {/* ── Card 2: Dashboard / Resources ── */}
+              <section aria-labelledby="dashboard-scopes-heading" className="flex flex-col gap-0 min-w-0 rounded-card border border-inner-border bg-surface-1 overflow-hidden">
+                <div className="px-4 pt-4 pb-3 border-b border-inner-border">
+                  <h4 id="dashboard-scopes-heading" className="inline-flex items-center gap-2 text-caption font-bold text-text-primary">
+                    <LayoutDashboard size={15} className="text-accent" aria-hidden="true" />
+                    Dashboard / Resources
+                  </h4>
+                  <p className="mt-1 mb-0 text-badge text-text-tertiary">
+                    Grants read or write access to console data — providers, models, configuration, and usage stats. No routing is implied by these scopes.
+                  </p>
                 </div>
-                <Switch checked={scopes.includes(scope)} onChange={() => toggleScope(scope)} disabled={busy} aria-label={`Grant ${scope}`} />
-              </div>
-            ))}
-          </div>
-        </section>
-        <RemoteRoutingSection
-          keyId={mode === "edit" && record ? record.id : ""}
-          busy={busy}
-          scopeGranted={scopes.includes("routing:cli_mapping")}
-          onScopeChange={(next) => {
-            if (next === scopes.includes("routing:cli_mapping")) return;
-            toggleScope("routing:cli_mapping");
-          }}
-          persistScope={(next) => {
-            // The scope must take effect now, not on "Save changes": a route
-            // enabled without the scope would never resolve. Persist it right
-            // away so the CLI page and the gateway agree the moment the switch
-            // flips. `scopes` here is still the pre-toggle value.
-            if (mode !== "edit" || !record) return;
-            const nextScopes = next
-              ? [...new Set([...scopes, "routing:cli_mapping"])]
-              : scopes.filter((scope) => scope !== "routing:cli_mapping");
-            updateKey.mutate(
-              { keyId: record.id, request: { scopes: nextScopes } },
-              {
-                onError: (error) =>
-                  toast.error(getErrorMessage(error, "Could not update the key's routing scope.")),
-              },
-            );
-          }}
-        />
-        <section aria-labelledby="dashboard-scopes-heading" className="flex flex-col gap-4">
-          <h4 id="dashboard-scopes-heading" className="inline-flex items-center gap-2 text-caption font-bold text-text-primary">
-            <LayoutDashboard size={15} className="text-accent" aria-hidden="true" />
-            Dashboard / Resources
-          </h4>
-          <div className="flex flex-col gap-3">
-            {TENANT_KEY_SCOPES.filter((scope) => !scope.startsWith("routing:")).map((scope) => (
-              <div
-                key={scope}
-                className="flex items-center justify-between gap-6 py-2 px-5 rounded-inset"
-                style={{
-                  minHeight: "44px",
-                  border: "1px solid var(--inner-border)",
-                  background: scopes.includes(scope) ? "var(--accent-soft)" : "var(--surface-1)",
-                }}
-              >
-                <div className="flex items-start gap-3">
-                  {(() => {
-                    const ScopeIcon = SCOPE_ICONS[scope];
-                    return <ScopeIcon size={16} className="mt-1 shrink-0 text-accent" aria-hidden="true" />;
-                  })()}
-                  <div className="min-w-0">
-                  <div className="text-caption font-semibold text-text-primary">{scope}</div>
-                  <p className="mt-1 text-badge text-text-tertiary">{SCOPE_DESCRIPTIONS[scope]}</p>
-                  </div>
+
+                <div className="flex flex-col gap-2 p-4">
+                  {TENANT_KEY_SCOPES.filter((scope) => !scope.startsWith("routing:")).map((scope) => (
+                    <div
+                      key={scope}
+                      className="flex items-center justify-between gap-4 py-1.5 px-4 rounded-inset"
+                      style={{
+                        minHeight: "38px",
+                        border: "1px solid var(--inner-border)",
+                        background: scopes.includes(scope) ? "var(--accent-soft)" : "var(--surface-2)",
+                      }}
+                    >
+                      <div className="flex items-start gap-3 min-w-0">
+                        {(() => {
+                          const ScopeIcon = SCOPE_ICONS[scope];
+                          return <ScopeIcon size={14} className="mt-0.5 shrink-0 text-accent" aria-hidden="true" />;
+                        })()}
+                        <div className="min-w-0">
+                          <div className="text-caption font-semibold text-text-primary">{scope}</div>
+                          <p className="mt-0.5 mb-0 text-badge text-text-tertiary">{SCOPE_DESCRIPTIONS[scope]}</p>
+                        </div>
+                      </div>
+                      <Switch checked={scopes.includes(scope)} onChange={() => toggleScope(scope)} disabled={busy} aria-label={`Grant ${scope}`} />
+                    </div>
+                  ))}
                 </div>
-                <Switch checked={scopes.includes(scope)} onChange={() => toggleScope(scope)} disabled={busy} aria-label={`Grant ${scope}`} />
-              </div>
-            ))}
+              </section>
+            </div>
           </div>
-        </section>
-        </div>
         </div>
       </details>
     </div>

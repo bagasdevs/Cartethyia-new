@@ -24,6 +24,7 @@ import {
 import { ProxyConnectRefusalError } from "../../network/pool/agent";
 import {
   payloadCaptureKeepsBodies,
+  payloadRetentionMs,
   resolvePayloadCapture,
 } from "../../observability/payload-capture";
 
@@ -106,6 +107,29 @@ export async function resolveCaptureDepthForRequest(
 }
 
 /**
+ * The tenant's chosen payload retention, memoized on the request like the mode
+ * and depth above — and resolved *after* one of them has populated the memo, so
+ * all three come from one preference read.
+ *
+ * Falls back to the deployment default when the read failed, which is the same
+ * answer the capture path reaches on its own; returning it here keeps the
+ * caller from having to know the fallback exists.
+ */
+export async function resolveCaptureRetentionForRequest(
+  db: CartethyiaDatabase,
+  tenantId: string | null,
+  state: { payloadCapturePreference?: unknown },
+): Promise<number> {
+  if (state.payloadCapturePreference === undefined) {
+    state.payloadCapturePreference = await resolvePayloadCapture(db, tenantId);
+  }
+  const resolved = state.payloadCapturePreference as
+    | { readonly ok: true; readonly retentionMs: number }
+    | { readonly ok: false };
+  return resolved.ok === true ? resolved.retentionMs : payloadRetentionMs();
+}
+
+/**
  * Combined body cap for one capture depth. Fixed size tiers: every depth
  * stores all four drawer panels (client request, translated provider
  * request, raw provider response, final client response) — only the cap
@@ -123,8 +147,8 @@ function captureDepthMaxBytes(depth: TelemetryPayloadDepth): number {
  * What the client received for a failed terminal attempt, in the same public
  * envelope the error middleware sends on the wire (`{ error: { origin, code,
  * message, details } }`). Stored so Request Detail's "Client Response"
- * panel can trace an error exactly as the client saw it — failures used to
- * leave that panel empty.
+ * panel can trace an error exactly as the client saw it, including for failures
+ * that never produced a response body.
  */
 export function errorClientResponseBody(error: unknown): string {
   if (error instanceof GatewayError) {
@@ -344,7 +368,8 @@ async function resolvedProviderResponse(
     new Promise<null>((resolve) => setTimeout(() => { timedOut = true; resolve(null); }, PROVIDER_CAPTURE_AWAIT_MS)),
   ]);
   if (settled === null || settled === undefined) {
-    // Distinguish "slow payload" from "no payload": a null used to mean both.
+    // Distinguish "slow payload" from "no payload": a bare null cannot tell the
+    // two apart, so the timeout is reported explicitly.
     return timedOut ? { _truncated: true, _reason: "provider_capture_timeout" } : null;
   }
   return settled;
@@ -390,7 +415,7 @@ async function captureTerminalPayload(
       note("skipped_preference_read_failed");
       return;
     }
-    const { mode, depth } = resolved;
+    const { mode, depth, retentionMs } = resolved;
     if (mode === "none") {
       note("skipped_mode_none");
       return;
@@ -407,6 +432,7 @@ async function captureTerminalPayload(
         requestBody: null,
         responseBody: null,
         providerRequestBody: providerRequest,
+        retentionMs,
         scope: "tenant",
         tenantOptIn: true,
       });
@@ -425,6 +451,7 @@ async function captureTerminalPayload(
       ...(providerRequest === null ? {} : { providerRequestBody: providerRequest }),
       ...(providerResponse === null ? {} : { providerResponseBody: providerResponse }),
       maxBytes,
+      retentionMs,
       scope: "tenant",
       tenantOptIn: true,
     });
@@ -486,7 +513,22 @@ export function terminalFailure(
     if (terminal.provider_stop_reason) details["provider_code"] = terminal.provider_stop_reason;
     if (terminal.stop_details) Object.assign(details, terminal.stop_details);
     const message = typeof details["message"] === "string" ? details["message"] : "upstream request failed";
-    return new GatewayError("transport_unavailable", 502, message, details, "upstream");
+   // Preserve the upstream's error code when the provider embedded it in
+   // `stop_details` (Cursor writes `quota_exceeded` and `authentication_failed`
+   // there). Wrapping every terminal failure as `transport_unavailable` discarded
+   // those codes, so `quota_exceeded` was never seen by the classifier and the
+   // exhausted account was never cooled.
+   const code = typeof details["code"] === "string" ? details["code"] : undefined;
+   const status = typeof details["status"] === "number" ? details["status"] : 502;
+   const gatewayCode =
+     code === "quota_exceeded" ? "quota_exceeded" :
+     code === "authentication_failed" ? "authentication_failed" :
+     "transport_unavailable";
+   const gatewayStatus =
+     gatewayCode === "quota_exceeded" ? 429 :
+     gatewayCode === "authentication_failed" ? 401 :
+     status;
+   return new GatewayError(gatewayCode, gatewayStatus, message, details, "upstream");
   }
   if (terminal.state === "aborted") {
     // A client-initiated cancellation is not an upstream fault; the stream path

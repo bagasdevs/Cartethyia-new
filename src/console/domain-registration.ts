@@ -36,11 +36,14 @@ import { createModelAbuseRoutes } from "./admin/model-abuse/routes";
 import { DrizzleAuditReadStore } from "./audit/store";
 import { createPerformanceRoutes } from "./observability/performance";
 import { createUpdateRoutes } from "./updates/routes";
+import { createRemoteSupportRoutes } from "./remote-support/routes";
+import { createRemoteSupportService } from "./remote-support/service";
+import { resolvePort } from "../config/runtime";
 import { createBackupRoutes } from "./backup/routes";
 import { BackupService } from "./backup/service";
 import type { ConsoleCredentialService } from "./auth/credentials";
 import { resolveTelemetryRetentionDays } from "../config/telemetry";
-import { payloadRetentionMs } from "../observability/payload-capture";
+import { MAX_PAYLOAD_RETENTION_MS, payloadRetentionMs } from "../observability/payload-capture";
 import { TELEMETRY_EVENT_DIR } from "../observability/event-log";
 
 import { InMemoryOAuthFlowStore, OAuthFlowStore } from "../providers/authentication/oauth-flow-store";
@@ -241,6 +244,10 @@ export function registerConsoleDomains(
     accessResolver: ctx.accessResolver,
     observabilityStore,
   }));
+  console.use(createRemoteSupportRoutes({
+    accessResolver: ctx.accessResolver,
+    service: createRemoteSupportService({ port: resolvePort() }),
+  }));
   console.use(createAuditRoutes({ store: auditReadStore, accessResolver: ctx.accessResolver }));
   if (ctx.modelStrikes) {
     console.use(createModelAbuseRoutes({
@@ -281,15 +288,13 @@ export function registerConsoleDomains(
     // same SSRF-validated fetch as every other egress.
     relayFetch: createValidatedFetch({ policy: resolveSsrfPolicy() }),
   }));
-  console.use(createRuntimeSettingsRoutes({ store: runtimeSettingsStore, accessResolver: ctx.accessResolver, auditSink: ctx.auditRecorder }));
+  console.use(createRuntimeSettingsRoutes({ store: runtimeSettingsStore, accessResolver: ctx.accessResolver, auditSink: ctx.auditRecorder, snapshotInvalidator: ctx.routeSnapshotService }));
   console.use(
     createDataManagementRoutes({
       telemetryDir: TELEMETRY_EVENT_DIR,
       retentionDays: resolveTelemetryRetentionDays(),
       payloadRetentionMs: payloadRetentionMs(),
-      // Hourly files are the only copy of their requests until compaction
-      // folds them up, so the console does not delete them on request.
-      allowHourlyReclaim: false,
+      payloadRetentionMaxMs: MAX_PAYLOAD_RETENTION_MS,
       accessResolver: ctx.accessResolver,
       auditSink: ctx.auditRecorder,
       flusher: ctx.flushBuffers,

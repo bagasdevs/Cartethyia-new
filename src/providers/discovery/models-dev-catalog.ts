@@ -3,7 +3,7 @@
  * bundled providers can route to.
  *
  * The data is a packed, brotli-compressed binary blob (`catalog-blob.ts`, built
- * by `scripts/generate/models-catalog.ts`) read through {@link PackedCatalog}.
+ * by `scripts/tools/generate-models.ts`) read through {@link PackedCatalog}.
  * There is no JSON parse and no per-row object: a lookup is a binary search
  * over a typed-array column, and the metadata object for a row is built only
  * when something asks for that row.
@@ -143,10 +143,10 @@ const UNKNOWN_COST: ModelsDevModelCost = {
  * rather than resolving a truncated catalog.
  *
  * The decode is lazy on purpose. It is ~105 KB of base64 that expands to a
- * much larger buffer, and it used to run at module load — so every process,
+ * much larger buffer, and running it at module load would bill every process,
  * including the ones that never resolve a model (a CLI subcommand, a migration
- * run, a test that only touches the console), paid it on the boot path.
- * Deferring it moves that cost to the first catalog lookup and pays it once.
+ * run, a test that only touches the console), on the boot path. Deferring it
+ * moves that cost to the first catalog lookup and pays it once.
  */
 let catalogCache: PackedCatalog | undefined;
 
