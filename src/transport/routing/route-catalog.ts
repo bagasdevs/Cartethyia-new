@@ -404,7 +404,7 @@ class RouteCatalogRepository {
         // The cooldown override is a console_settings preference, read inside
         // the same fan-out rather than per request: one more row set on a
         // query that already runs, instead of a Postgres round trip on every
-        // admitted request the way `tenantConcurrencyLimit` once did.
+        // admitted request.
         this.db
           .select({ tenantId: consoleSettings.tenantId, preferences: consoleSettings.preferences })
           .from(consoleSettings),
@@ -747,6 +747,13 @@ class RouteCatalogRepository {
               // The account is still cooling — this only stops it from being
               // excluded. `plan()` reads `cooldown_until` to answer the
               // all-cooling case, so it stays populated either way.
+              //
+              // Neither `health_status` nor `cooldown_kind` is set: the
+              // evaluator excludes a hard cooldown on `health_status ===
+              // "cooldown"` alone, so stamping it here would keep excluding
+              // the very accounts the override exists to reach — a spent quota
+              // or a policy block, which are the ones an operator actually
+              // wants to override.
               candidate.cooldown_until = account.cooldownUntil.getTime();
             } else {
               candidate.health_status = "cooldown";

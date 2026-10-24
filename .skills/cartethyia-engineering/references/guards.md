@@ -20,9 +20,9 @@ Two different reasons to leave a file alone, and they call for different moves:
 
 - **Generated** — a script owns the content, so hand-editing is lost on the next
   run. Change the generator and re-run it. In this repo that is
-  `migrations/lite-sqlite3/0000_baseline.sql` (`scripts/generate/sqlite-ddl.ts`)
+  `migrations/lite-sqlite3/0000_baseline.sql` (`scripts/tools/generate-sqlite.ts`)
   and `src/providers/discovery/catalog/catalog-blob.ts`
-  (`scripts/generate/models-catalog.ts`).
+  (`scripts/tools/generate-models.ts`).
 - **Pinned** — the file is hand-written but its *content hash* is recorded in
   persisted state, so editing it invalidates databases or clients already out
   there. `migrations/full-postgres/0000_baseline.sql` is this: it has no
@@ -35,8 +35,9 @@ editing, and change it the way it is meant to change".
 
 ## Naming and structure
 
-- Keep `scripts/` grouped by purpose: `cli/`, `operations/`, `install/`,
-  `build/`, `generate/`, `dev/`, `test/`, and `shared/`.
+- Keep `scripts/` grouped by purpose: `cli/`, `install/`, `build/`, `test/`,
+  `dev/`, and `tools/`. Health helpers and standalone launchers may remain at
+  the scripts root when their callers expect that location.
 - How a change should read — names, comments, types, errors — is `taste.md`.
   Do not restate it here.
 
@@ -50,6 +51,25 @@ mechanism and fix the owning layer.
 
 Update README, `.env.example`, layer docs, or references when a change makes a
 claim or setting wrong. Do not leave deleted paths or symbols as false authority.
+
+## Skill and doc upkeep
+
+Update a skill or a reference only after a repeated failure, a rejected change,
+or a newly found drift class — not after a single surprise.
+
+- **Extend the closest owner first.** Add a new skill folder only when the
+  topic has its own trigger and no existing folder owns it. A new file that
+  restates another is worse than no file.
+- Keep guidance procedural: state the trigger, the required check, the failure
+  mode, and the evidence.
+- Verify every cited path, symbol, command, and export before writing it. A
+  skill that names a symbol must name one that exists.
+- Remove guidance that no longer matches the repository.
+- Do not repeat the gate list or the shared rules in a second file; point at
+  `verification.md` or `guards.md`.
+
+A skill teaches a reusable decision or verification step, not a one-off
+implementation note.
 
 ## Proved deadness
 

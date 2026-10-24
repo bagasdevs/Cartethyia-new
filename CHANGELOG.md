@@ -8,6 +8,344 @@ current baseline; an existing one applies the numbered files that followed it.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.5.6] - 2026-10-24
+
+### Added
+
+- **Remote support is a card on the Overview.** The Overview grows a Remote
+  Support card ahead of API Credentials, holding one row per publisher:
+  cloudflared and Tailscale. Each row carries the publisher's own logo, a
+  toggle, and the address it published.
+
+  Turning a publisher on launches it **detached**, so the tunnel is not a child
+  of the gateway: a gateway restart, a hot reload, or a Ctrl-C in the owning
+  terminal cannot kill a live support session. The launch waits for an address
+  and reports it in the card; until one arrives the row says
+  "Waiting for address…" beside a Cancel button.
+
+  The product never installs anything. A publisher that is not on PATH is
+  reported as missing with its own install hint, and installation is detected
+  once per process rather than re-probed on every poll.
+
+### Fixed
+
+- **Switching between thinking models no longer breaks WorkBuddy/CodeBuddy
+  history.** Clients that replace an earlier model's reasoning with an
+  unavailable placeholder could produce an empty assistant turn that the
+  upstream rejected with `11151 "history not found"`. Those bare turns are
+  now removed while tool calls and verifiable reasoning remain intact.
+
+- **A backup can restore into a fresh tenant.** Current exports deliberately
+  omit the tenant row, but the restore previously created it only when that
+  row was present in the file. Restoring could therefore fail on the
+  `api_keys` foreign key before any configuration was written. The receiving
+  tenant is now ensured before child rows are inserted; an existing tenant is
+  left unchanged.
+
+- **Restore failures retain the original bulk-insert error.** When both the
+  bulk write and the row-by-row diagnostic fail, the reported error now names
+  the bulk failure and retains the diagnostic error as its cause instead of
+  hiding a connection or transaction fault behind a derived row error.
+
+- **A revoked share link says so, and says what to do.** The gateway already
+  refused a revoked link, but the public page titled every refusal
+  "Link not available" — so a revoked key and a paused key read identically to
+  a recipient while asking for opposite things. The heading now names the cause
+  (`Key revoked`, `Key paused`, `Link expired`), and the revoked copy states
+  that a revoked key cannot be re-enabled and a new link is needed. A revoked
+  link also clears the key this browser kept, so a dead credential is not left
+  on screen.
+
+- **Tailscale's own setup step is surfaced.** Tailscale requires "serve" to be
+  enabled on the tailnet, and until it is, the launch fails with a message from
+  Tailscale itself. That message is now shown in the card as a setup notice,
+  with a link straight to the enable page, instead of a generic failure.
+
+- **Tailscale stop and status are detected from Tailscale.** Tailscale runs as
+  a system service, so the launcher's pid file could not describe it: stopping
+  left the tunnel serving, and status reported it stopped while it was up.
+  Stopping now resets the serve, and status asks Tailscale whether a serve is
+  live.
+
+- **The Remote Support toggle reflects the click, not just the poll.** The
+  toggle read server state alone, so turning a publisher off left it showing
+  "on" until the next poll landed. It now follows the click immediately and
+  falls back to the last server reading if the action fails.
+
+- **CodeBuddy tool calls written as markup are recovered.** A tool call
+  serialized as DSML markup instead of a native tool block reached the client
+  as literal text. It is parsed back into a real tool call; the tool-name
+  allowlist stays strict only when the caller supplied one.
+
+- **Encrypted reasoning is replayed under the id it was issued for.** Codex
+  rejected a turn whose reasoning item id had been re-derived
+  (`item_id did not match the target item id`). The id the payload arrived with
+  is now carried through unchanged, and a payload with no surviving id is
+  dropped rather than sent with a made-up one.
+
+- **A share link no longer clears the key's name.** Creating or rotating a
+  share link left the key list showing a key with no name. The list is now
+  refreshed after either action.
+
+### Changed
+
+- **Backup export and restore do less waiting.** Independent table reads run
+  concurrently, and restore groups compatible rows into bulk inserts with a
+  savepoint-protected per-row fallback for precise diagnostics.
+
+- **Model and account probes keep their concurrency windows full.** Workers
+  start the next probe as soon as one finishes rather than waiting for the
+  slowest member of a fixed batch. Both probe paths now run one sequential
+  warm-up first to prime credentials and connections before concurrent work.
+
+- **The QRIS support card is inline on the share page.** It used to open as a
+  modal; it is now a card on the page itself, image left and copy right, with a
+  download button, and it keeps its two-column layout on a narrow screen.
+
+- **The share page's kawaii styling is themed.** The leading and tracking steps
+  it needed as bracketed literals are named tokens now, which also clears the
+  styling ratchet's last two entries.
+
+## [2.5.5] - 2026-10-23
+
+### Added
+
+- **Payload retention is a per-tenant choice.** Captured bodies used to be kept
+  for 15 minutes for every tenant, in a resolver the configuration spec did not
+  even declare. Settings -> Privacy now offers 15 minutes, 30 minutes, 1 hour,
+  6 hours, 12 hours, 1 day, and 7 days, and the deployment variable
+  (`CARTETHYIA_TELEMETRY_PAYLOAD_RETENTION_MS`) becomes the default rather than
+  the only value. Seven days is the ceiling.
+
+  A longer window costs disk, and the panel says so from one hour up: every
+  captured request keeps a gzipped copy of up to four bodies, so a week of
+  retention is a week of bodies on disk.
+
+- **Model-abuse bans can be scoped and timed.** A ban used to be address-only
+  and always one duration. It is now keyed on the address **and** the API key
+  that was used, so banning one caller behind a shared address or a share link
+  leaves every other caller on that address working. Durations are 1 hour,
+  6 hours, 12 hours, 1 day, 7 days, and Permanent; the request-detail button
+  bans for one hour and the caret beside it opens the rest.
+
+  "Ban every key from this IP" is still available, and is now an explicit
+  choice rather than the only behaviour — which is what an operator wants when
+  the address, not the credential, is the problem. The ban list names the key
+  each ban is scoped to and says "This key only" or "All keys from this IP".
+
+  **One gap, stated rather than hidden:** a share key's children are issued per
+  recipient, so a banned recipient can enroll a new child key from the same
+  address and continue. Closing that would ban every recipient behind the same
+  NAT — the exact collateral this scoping exists to avoid.
+
+- **The request list updates as requests finish.** The Usage page request list
+  polls no more: each completed request pushes to the open dashboard over SSE
+  and the list refetches immediately.
+
+- **Usage cards open on millions.** The four token cards defaulted to raw
+  counts, which overflowed the card on a busy tenant. They now open on `M`, and
+  a value too small for the chosen unit falls back to its exact count instead of
+  reading `0M`.
+
+### Fixed
+
+- **`forceDisableCooldown` reaches hard cooldowns.** The override was stamping
+  the very flags the eligibility evaluator uses to exclude a hard cooldown, so
+  it only ever affected soft cooldowns — which were already eligible. An account
+  parked for a spent quota or a policy block is now reachable, which is the case
+  an operator actually wants to override.
+
+- **A saved setting takes effect immediately.** Two preferences are read on the
+  request path from the cached route snapshot, and a save did not invalidate it:
+  the row was correct while `/v1/*` kept using the revision built before the
+  save, so the toggle looked broken. Settings now invalidate on save.
+
+- **Cursor's exhausted accounts cool down.** `quota_exceeded` was wrapped as a
+  transport failure regardless of what Cursor put in `stop_details`, so the
+  classifier never saw it and an out-of-quota account was never parked. The
+  real code is now read and promoted, so quota and authentication failures cool
+  the account they came from.
+
+- **Share child keys get their own rate window.** RPM and concurrency ran on the
+  parent's counter, so one recipient hitting its limit cooled every other
+  recipient of the same link. Each child now has an independent window and
+  slot. Token budgets stay on the parent — that shared pool is the operator's
+  control.
+
+- **A captured body is no longer dropped on write.** The frame's key list named
+  four body surfaces while the record builds five, so the fifth was serialized
+  and then discarded: a capture whose client response sat in the legacy slot
+  came back with that panel empty.
+
+- **Disk housekeeping reports what is really there.** The panel counted payload
+  frames reclaimable after 15 minutes even when a tenant had chosen a longer
+  window, so it offered a reclaim that always reported nothing to reclaim. It
+  now judges against the longest retention a tenant may choose. The same bound
+  covers the prune pass, which could otherwise delete a file still holding
+  frames their rows addressed.
+
+- **Provider max-inflight and API-key concurrency no longer share an error
+  code.** Both rejections arrived as `capacity_exhausted`, so the two settings
+  that cause them were indistinguishable on the wire: an operator who raised
+  the provider's max-inflight saw no change when the ceiling that fired was the
+  API key's own `max_concurrent`, and the other way around. Routing exhaustion
+  is now `provider_capacity_exhausted`, and the key's message names the key
+  rather than the provider.
+
+  The routing error also carries `providerId`, `model`, `maxInflight`, and
+  `candidate_count`. A plan that held a single candidate now says so, because
+  that is a routing or eligibility fact — raising the ceiling does not fix it.
+
+- **Max inflight says what it bounds.** The routing card labelled the field
+  "Max inflight / account" and then described it as a "Shared provider
+  ceiling". It is per account: each account enforces its own limit, so a full
+  account spills to the next. The subtext now says that.
+
+- **A tunnel's forwarded client address is no longer thrown away.** With
+  `TRUSTED_PROXY_CIDRS` unset, a request arriving from a loopback peer
+  (`127.0.0.1`, `::1`, or the mapped `::ffff:127.0.0.1` Bun reports on Windows)
+  now has its forwarded client headers believed. That is the shape of
+  cloudflared, an SSH forward, and a local Caddy or Nginx — and when their
+  headers were ignored, every caller behind one was recorded as the loopback
+  address.
+
+  That collapse was the dangerous direction: per-IP abuse throttling and
+  model-abuse bans are keyed on this address, so one caller reaching the limit
+  banned every other caller behind the same tunnel. The audit trail also showed
+  one address for everyone.
+
+  A **public** peer's headers are still ignored, so a client cannot name its own
+  address. Setting `TRUSTED_PROXY_CIDRS` overrides the loopback arm entirely: a
+  configured boundary is `trusted` or `platform`, and neither reaches it.
+
+- **A misconfigured tunnel now says so.** A forwarded client header arriving from
+  a loopback peer that the boundary will not trust logs one warning naming the
+  fix and the shared-fate consequence, instead of silently degrading.
+
+- **Legacy tool parameter roots are accepted.** Some clients send a tool's
+  `parameters` as an empty root, or as a property-name → schema map with a
+  per-field boolean `required` flag and no `{"type":"object", …}` wrapper.
+  Upstreams reject both as `invalid_function_parameters` (CodeBuddy `11129`).
+  The root is now rewritten into an explicit object schema, with the legacy
+  flag hoisted into `required` — and a field the caller did not flag stays
+  optional. A root that already holds schema keywords is left untouched:
+  guessing there would rewrite a valid schema into a wrong one.
+
+- **A provider code hidden in an escaped envelope is found.** A provider may
+  embed its error object as a string rather than nesting it, so the code that
+  decides whether an account is cooled was invisible and a blocked account
+  stayed in rotation failing every request. Both the escaped and doubly-escaped
+  spellings are now read, as a fallback behind the real nested code.
+
+- **Escaped-underscore schema keys no longer collide away.** A `\_` in a
+  property name is stripped, which can collapse two distinct keys onto one; they
+  are now merged with `allOf` (which accepts boolean schemas, so neither
+  constraint is lost) instead of one silently overwriting the other.
+
+- **A queued upstream request is no longer reported as a refusal.** Qoder
+  answers `403` with `{"code":"10605","isQueued":true,"retryAfterSeconds":N}`
+  when it has accepted a request and is holding it until capacity frees up. The
+  status said "forbidden", so the gateway classified it as one and the client
+  ended its turn on a request that was only waiting. It is now
+  `upstream_queued` (503), carrying the interval the upstream stated, and it
+  fails over to another account first — one that is very likely not queued.
+
+  Recognized conservatively: an explicit queue flag, the `10605` code, or a
+  message that is *about* a queue. A body that merely mentions the word does
+  not qualify, so an unrelated failure is never turned into "wait and retry".
+
+- **Qoder accounts report whether they belong to an organization.** Read from
+  the userinfo profile with upstream's own precedence: an organization id or
+  name, a `userType` naming a team or enterprise, or a shared credit pool. Any
+  one is enough, because an enterprise account whose `userType` still reads
+  personal is enterprise as soon as it carries an organization. Both the
+  snake_case and camelCase spellings are read, since the OAuth and PAT login
+  paths do not agree on one.
+
+  This is the classification and the label; no console surface renders it yet.
+
+- **Buddy accounts send their enterprise identity.** An enterprise account is
+  billed from its organization's credit assignment rather than a personal
+  package, and the upstream reads that from the request: `X-Enterprise-Id` and
+  `X-Tenant-Id` name the organization, and `X-Private-Data` says the account is
+  not personal. Both were missing on chat — `X-Private-Data` was hardcoded to
+  `false`, which the code already flagged as unfinished.
+
+  The enterprise is resolved from `auth_state.enterpriseId` first, then from a
+  claim on the access token, so accounts authorized before this existed are
+  picked up too. An account with no evidence stays personal: claiming an
+  enterprise it does not belong to is the kind of mismatch that draws a channel
+  check, and personal is what the gateway already sent.
+
+  The token claim is read from a list of plausible spellings rather than one
+  name, because the upstream's token shape is not pinned anywhere this codebase
+  can verify.
+
+- **Error codes and messages are unambiguous.** A scan of every rejection site
+  found codes doing double duty, and messages a client could not act on:
+
+  - `model_abuse_banned` answered in Indonesian — the only non-English message
+    on a client-facing surface. It is now English, and names that the ban is
+    scoped to this address **with this key**.
+  - Two `/admin` and backup-export refusals answered `invalid_request` when
+    nothing was wrong with the body: a loopback-only endpoint refused a
+    well-formed request (`policy_rejected`), and a bad drain token is a
+    credential failure (`authentication_failed`).
+  - Z.AI authentication answered `400` where every other authentication
+    failure is `401`, sending clients to fix a body that was never the problem.
+  - Every IP-abuse refusal carried `details.reason: "admission-unavailable"`,
+    which is the label for an unreachable store — so a ban, a rate limit, and
+    an outage were indistinguishable. They are now `ip-banned` and
+    `ip-rate-limited`.
+  - Seventeen codes had no plain-English definition in the Usage page and fell
+    through to a mechanical underscore-to-space rendering. All are defined;
+    `quota_exceeded` now says which layers can produce it and points at
+    `details.reason` to tell them apart.
+
+  Two guards now hold this: a table asserting one code means one status, and a
+  scan of every public message for non-English text. Both read `src/` directly,
+  so a new inconsistent site is caught the day it is written rather than
+  whenever someone re-reads a hand-collected list.
+
+### Changed
+
+- **Compatibility shims are gone.** Backward-compat paths removed across the
+  board: the `jsonb-file` payload storage type and its binary length header,
+  the legacy backup rewrites (user-agent mapping, `bypass_proxy`,
+  `model_allowlist`/`model_denylist`, label-based default-key promotion), and
+  the resolver prefs behind the retired telemetry compaction. Two environment
+  variables (`CARTETHYIA_TELEMETRY_WINDOW_MINUTES`,
+  `CARTETHYIA_TELEMETRY_COMPACT_MAX_FILES`) are no longer accepted — they were
+  inert, so a deployment still setting them boots unchanged only if it drops
+  them.
+
+- **The disk panel's buckets are renamed to what the files are.** `Hourly
+  request files` and `Daily summaries` are now `Request event files` and `Day
+  indexes`, matching the per-day index. Event files were never individually
+  reclaimable; they go with their index at retention.
+
+- **The gateway's 401 no longer tells you to rotate.** Rotation moved to the
+  public model surface, where the seeded default key is what normally fails. On
+  a proxy request it sent operators to rotate a key they were never using.
+
+### Performance
+
+- **Environment resolvers are read once.** Ten cooldown resolvers read
+  `process.env` on every call, and several hot paths called them twice for one
+  value — including the classifier that runs on every failed upstream request.
+  Each now caches per process. The model catalog also fetches providers and
+  accounts in parallel instead of sequentially.
+
+### Documentation
+
+- **One index, one skill set.** The documentation is deduplicated onto single
+  owning pages, the skill folders are consolidated from twelve to nine with
+  their unique material folded into the pages that own it, and historical
+  narrative that had drifted from the code is pruned. `documentation/archive/`
+  is now marked off-limits and says why: those records were true when written
+  and are not kept in sync, so reading one as current is worse than reading
+  nothing.
+
 ## [2.5.4] - 2026-10-22
 
 ### Added

@@ -1,70 +1,13 @@
 /**
- * Compaction for hourly telemetry files: old per-request rows become one
- * summary row per (tenant, API key, day).
+ * Bucket primitives for the per-day telemetry index.
  *
- * The problem this solves is growth, and growth alone. Hourly JSONL files were
- * never deleted, so every read of the usage list scanned every file ever
- * written — the cost grew with total volume, not with the number of users. An
- * install serving 20 users got slower purely by serving them longer.
- *
- * Compaction is **accumulation, not sampling**. A compacted row carries the
- * running sums of everything it replaced, so a total that read 2B tokens
- * before compaction still reads 2B after it. Nothing is estimated and nothing
- * is averaged away — the per-request rows are gone, their totals are not.
- *
- * What compaction cannot preserve is anything that needs the individual row:
- * the request list, per-request filters, and the detail drawer. Latency is the
- * interesting middle case — a percentile needs every sample, so compaction
- * keeps a fixed histogram instead. P50 stays available as an approximation and
- * is marked as one rather than silently reported as exact.
- *
- * Retention becomes tiered:
- *
- *   0 .. N days   hourly files, complete
- *   N .. M days   compacted daily summary
- *   beyond M      deleted
+ * Each day's events are folded into a `CompactedBucket` via `accumulate()` and
+ * stored as a `.index.json` file alongside the source `.events.jsonl`. Buckets
+ * are pure accumulators: every field is a running sum, min, or max — nothing
+ * is averaged or estimated away. `mergeBucketsInternal` adds two buckets so
+ * partial indexes can be merged without re-reading source files.
  */
 import type { TelemetryEventRecord } from "./event-log";
-import type { CartethyiaDatabase } from "../persistence/db-handle";
-import { consoleSettings } from "../persistence/schema";
-import { resolveTelemetryWindowMinutes } from "../config/telemetry";
-
-/**
- * The compaction age to apply on a pass with no explicit age given.
- *
- * Hourly files are **not** partitioned per tenant — one file per hour holds
- * every tenant's rows — so a per-tenant age cannot be honoured per file. The
- * safest reading of several tenants' preferences is the **largest**: compacting
- * smaller than one tenant asked for moves its requests into the summary before
- * that tenant expected, losing the per-request view of them, while keeping them
- * longer than another wanted only costs disk and a slower scan. Losing detail
- * is not reversible; using more disk is.
- *
- * Falls back to the deployment default when no tenant overrides, and never
- * exceeds the retention window (compacting at or past the delete age would
- * fold a file and discard it in the same pass).
- */
-export async function resolveEffectiveWindowMinutes(db: CartethyiaDatabase): Promise<number> {
-  const fallback = resolveTelemetryWindowMinutes();
-  try {
-    const rows = await db
-      .select({ preferences: consoleSettings.preferences })
-      .from(consoleSettings);
-    let widest = fallback;
-    for (const row of rows) {
-      const minutes = row.preferences?.telemetryWindowMinutes;
-      if (typeof minutes === "number" && Number.isFinite(minutes) && minutes > widest) {
-        widest = minutes;
-      }
-    }
-    return Math.floor(widest);
-  } catch {
-    return fallback;
-  }
-}
-
-/** Discriminator so a reader can tell a summary from a request row at a glance. */
-const COMPACTED_KIND = "compacted" as const;
 
 /**
  * Histogram bucket edges in milliseconds.
@@ -112,21 +55,51 @@ export interface CompactedBucket {
   readonly byProvider: Readonly<Record<string, number>>;
   readonly byClient: Readonly<Record<string, number>>;
   readonly byClientIp: Readonly<Record<string, number>>;
+  /**
+   * Requests per HTTP status, keyed by the status as a decimal string.
+   *
+   * Kept as counts for the same reason the other dimensions are: the Usage
+   * summary's status chips and the request-list filters read these, and without
+   * them every chip reads zero once the day's events have been folded — the
+   * numbers were on the source events, which no longer exist.
+   */
+  readonly byStatus: Readonly<Record<string, number>>;
+  /**
+   * Sum and count of gateway routing delay, so `avgResolveMs` survives
+   * compaction. Kept as a sum rather than an average of averages for the same
+   * reason the latency sum is: an average of per-file averages drifts as soon
+   * as the files hold different request counts.
+   */
+  readonly resolveSumMs: number;
+  readonly resolveCount: number;
 }
 
-/** One compacted row: the totals of everything it replaced, for one key/day. */
-export interface CompactedRow extends CompactedBucket {
-  readonly kind: typeof COMPACTED_KIND;
-  /** ISO day (UTC) this row summarises. */
-  readonly day: string;
-  readonly tenantId: string;
-  readonly apiKeyId: string | null;
-}
-
-/** A number from a value that may be a numeric string; 0 when unusable. */
-function numeric(value: unknown): number {
+/**
+ * A number from a value that may be a numeric string; 0 when unusable.
+ *
+ * Exported so readers of a compacted bucket coerce its fields the same way the
+ * fold does: a second local copy of "is this a number" is how one caller ends
+ * up summing `undefined` into NaN while another reads it as zero.
+ */
+export function numeric(value: unknown): number {
   const asNumber = typeof value === "number" ? value : Number(value);
   return Number.isFinite(asNumber) ? asNumber : 0;
+}
+
+/**
+ * The two fields added after the first index format, read defensively.
+ *
+ * An index file written before they existed carries neither, and `undefined +
+ 0` is `NaN` — which then propagates straight through every later fold and
+ * merge, so one old day turns the whole period's `avgResolveMs` into `NaN`.
+ * Reading them as 0/{} is the same answer an empty day gives, and a folded
+ * day that predates the field genuinely has no resolve measurement to report.
+ */
+function readResolveSum(bucket: CompactedBucket): number {
+  return numeric(bucket.resolveSumMs);
+}
+function readResolveCount(bucket: CompactedBucket): number {
+  return numeric(bucket.resolveCount);
 }
 
 /** Adds one occurrence to a count map, ignoring an absent key. */
@@ -156,6 +129,9 @@ export function emptyBucket(): CompactedBucket {
     byProvider: {},
     byClient: {},
     byClientIp: {},
+    byStatus: {},
+    resolveSumMs: 0,
+    resolveCount: 0,
     requests: 0,
     inputTokens: 0,
     cachedTokens: 0,
@@ -207,11 +183,18 @@ export function accumulate(
   // summing, which turned a cost of 0.000966 into "00.000966". Coerced here so
   // every downstream sum is arithmetic.
   const priced = numeric(event.estimatedCostUsd);
+  const resolve = event.resolveMs;
+  const hasResolve = resolve !== null && resolve !== undefined && Number.isFinite(resolve);
   return {
     byModel: bump(into.byModel, event.requestedModel ?? event.reportedModel),
     byProvider: bump(into.byProvider, event.providerId),
     byClient: bump(into.byClient, event.sourceSurface),
     byClientIp: bump(into.byClientIp, event.clientIp),
+    // Keyed on the HTTP status, not the internal one: the chips and the filters
+    // are the status the client was given.
+    byStatus: bump(into.byStatus, event.httpStatus?.toString()),
+    resolveSumMs: readResolveSum(into) + (hasResolve ? resolve : 0),
+    resolveCount: readResolveCount(into) + (hasResolve ? 1 : 0),
     requests: into.requests + 1,
     inputTokens: into.inputTokens + (event.inputTokens ?? 0),
     cachedTokens: into.cachedTokens + (event.cachedInputTokens ?? 0),
@@ -251,13 +234,20 @@ export function accumulate(
  *
  * Returns the upper edge of the bucket that contains it — never a value
  * between edges, because a histogram cannot be more precise than the bucket
- * that holds the sample. `null` when there are no samples, and `null` when the
- * percentile falls in the overflow bucket, whose upper edge is unbounded.
+ * that holds the sample. `null` when there are no samples.
+ *
+ * The overflow bucket is the last one and has no upper edge, so it returns
+ * {@link HISTOGRAM_OVERFLOW_MS} — the top edge of the last real bucket — rather
+ * than `null`. Returning `null` there was read as "no data" by every caller,
+ * which collapsed a P95 of 40 s to `0 ms`: the slowest, most interesting
+ * percentiles were the ones reported as zero. Callers that can do better pass
+ * the period's `latencyMaxMs` as `overflowMs` and get that instead.
  */
 export function percentileFromHistogram(
   histogram: readonly number[],
   percentile: number,
-): (typeof LATENCY_BUCKETS_MS)[number] | null {
+  overflowMs?: number | null,
+): number | null {
   const total = histogram.reduce((sum, count) => sum + count, 0);
   if (total === 0) return null;
   const target = Math.ceil((percentile / 100) * total);
@@ -267,11 +257,20 @@ export function percentileFromHistogram(
     if (seen >= target) {
       // The bucket's upper edge: a percentile from a histogram can never be
       // more precise than the bucket that contains it.
-      return index < LATENCY_BUCKETS_MS.length ? LATENCY_BUCKETS_MS[index]! : null;
+      if (index < LATENCY_BUCKETS_MS.length) return LATENCY_BUCKETS_MS[index]!;
+      // Above the last edge. `latencyMaxMs` is the honest answer when the
+      // caller has it — it is the real slowest request in the period, so a
+      // percentile past the last edge is at most that. Falling back to the
+      // last edge rather than 0 keeps the figure in the right order of
+      // magnitude even when no max was recorded.
+      return overflowMs ?? HISTOGRAM_OVERFLOW_MS;
     }
   }
   return null;
 }
+
+/** Top edge of the last real latency bucket; the floor for an overflow answer. */
+export const HISTOGRAM_OVERFLOW_MS = LATENCY_BUCKETS_MS[LATENCY_BUCKETS_MS.length - 1]!;
 
 /** Newline count of a file, so a torn or unparsable line is detectable. */
 /** Adds two buckets. Exported so the day index can merge without duplicating it. */
@@ -282,6 +281,9 @@ export function mergeBucketsInternal(a: CompactedBucket, b: CompactedBucket): Co
     byProvider: mergeCounts(a.byProvider, b.byProvider),
     byClient: mergeCounts(a.byClient, b.byClient),
     byClientIp: mergeCounts(a.byClientIp, b.byClientIp),
+    byStatus: mergeCounts(a.byStatus, b.byStatus),
+    resolveSumMs: readResolveSum(a) + readResolveSum(b),
+    resolveCount: readResolveCount(a) + readResolveCount(b),
     requests: a.requests + b.requests,
     inputTokens: a.inputTokens + b.inputTokens,
     cachedTokens: a.cachedTokens + b.cachedTokens,

@@ -1,5 +1,9 @@
 # Cursor Run protocol — evidence ledger
 
+This is a dated evidence ledger, not a guarantee of the current upstream
+contract. Revalidate before using its model roster, entitlement, or client
+version observations to change current behavior.
+
 Build pinned: `CursorSetup-x64-3.24.18.exe` (installer inspected statically only;
 never launched). Donor protocol source: `Public/cursor-opencode-provider`
 v0.8.3. Wire client version observed live: `cli-2026.10.19-6bbf2c4`.
@@ -34,7 +38,7 @@ named model — `grok-4.6`, `grok-4.7`, `claude-opus-4-8`, `claude-haiku-4-5` �
 across all declared variants, with and without `parameters`, with and without
 `max_mode`. Only `default` (Auto) serves.
 
-Swept with `scripts/operations/cursor-live-probe.ts` (the `--params`/`--max-mode`
+Swept with `scripts/tools/probe-cursor.ts` (the `--params`/`--max-mode`
 flags and a temporary variant sweep). Identical refusal on ~9 combinations per
 model means no parameter, variant, or flag fixes it: it is the account's plan.
 

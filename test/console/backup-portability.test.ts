@@ -20,7 +20,8 @@ import { gzipSync } from "node:zlib";
 import { getDb } from "../../src/persistence/boot";
 import { decryptCredentialToString, setCredentialEncryptionKeyForTesting, snapshotCredentialEncryptionKeyForTesting } from "../../src/security/crypto";
 import { BackupService } from "../../src/console/backup/service";
-import { compressBackup, exportBackup } from "../../src/console/backup/store";
+import { applyRestore, compressBackup, exportBackup } from "../../src/console/backup/store";
+import { restoreOrder, validateRestorePayload } from "../../src/console/backup/validate";
 import { tablesForSection } from "../../src/console/backup/contracts";
 import { createRunId, dbDescribe, getTestPool } from "../helpers/database";
 import { createWorld } from "../helpers/fixtures";
@@ -159,6 +160,23 @@ dbDescribe("backup credential portability", () => {
     expect(await sealedCredentialOf(importingTenant)).toBeNull();
   });
 
+  /**
+   * One restore of `payload` into a fresh tenant.
+   *
+   * Split out from the two-restore test that used to cover both input formats:
+   * `api_keys.key_hash` is unique *globally*, not per tenant, so a second
+   * restore of the same payload — into any tenant — collides with the key the
+   * first one inserted. The old test shared one payload across both restores
+   * and passed only while the second write was masked: the table grew on every
+   * run and the restore eventually exceeded the runner's 15 s hang detector,
+   * which reports a timeout rather than the constraint violation underneath.
+   */
+  async function restoreInto(input: string | Uint8Array) {
+    const db = getDb();
+    const service = new BackupService({ db, verifyPassword: async () => true });
+    return service.restore("pw", input, randomUUID());
+  }
+
   test("a restore accepts the compressed file the export downloads", async () => {
     const db = getDb();
     const world = await createWorld();
@@ -166,20 +184,92 @@ dbDescribe("backup credential portability", () => {
     const { payload } = await exportBackup(db, tablesForSection("config"), world.tenantId);
     await dropSourceRows(world.tenantId);
 
-    const importingTenant = randomUUID();
-    const service = new BackupService({ db, verifyPassword: async () => true });
-
-    // What the dashboard puts on disk: gzip bytes, base64-encoded to travel in a
-    // JSON body.
-    const gzBase64 = compressBackup(payload).toString("base64");
-    const fromEnvelope = await service.restore("pw", gzBase64, importingTenant);
+    // What the dashboard puts on disk: gzip bytes, base64-encoded to travel in
+    // a JSON body.
+    const fromEnvelope = await restoreInto(compressBackup(payload).toString("base64"));
     expect(fromEnvelope.format).toBe("native");
     expect(fromEnvelope.restored["provider_accounts"]).toBe(1);
+  });
 
-    // And the same bytes as a file, without the base64 step.
+  test("a restore accepts the same bytes as a file, without the base64 step", async () => {
+    const db = getDb();
+    const world = await createWorld();
+    await world.addAccount({ tenantId: world.tenantId, credential: SECRET, credentialKind: "api_key" });
+    const { payload } = await exportBackup(db, tablesForSection("config"), world.tenantId);
+    await dropSourceRows(world.tenantId);
+
     const gzBytes = gzipSync(Buffer.from(JSON.stringify(payload), "utf8"));
-    const fromBytes = await service.restore("pw", new Uint8Array(gzBytes), importingTenant);
+    const fromBytes = await restoreInto(new Uint8Array(gzBytes));
+    expect(fromBytes.format).toBe("native");
     expect(fromBytes.restored["provider_accounts"]).toBeGreaterThan(0);
+  });
+
+  test("a tenant-less export restores into a tenant that does not exist yet", async () => {
+    // Current exports deliberately omit the `tenants` section. The restore
+    // must still ensure the receiving tenant exists before inserting child
+    // rows, or `api_keys.tenant_id` violates its FK on a fresh install.
+    const db = getDb();
+    const world = await createWorld();
+    await world.addAccount({ tenantId: world.tenantId, credential: SECRET, credentialKind: "api_key" });
+    const { payload } = await exportBackup(db, tablesForSection("config"), world.tenantId);
+    await dropSourceRows(world.tenantId);
+    expect(
+      (payload as unknown as { sections: { config: Record<string, unknown> } }).sections.config["tenants"],
+    ).toBeUndefined();
+
+    const importingTenant = randomUUID();
+    const service = new BackupService({ db, verifyPassword: async () => true });
+    const result = await service.restore("pw", payload, importingTenant);
+    expect(result.warnings).toEqual([]);
+
+    const pool = await getTestPool();
+    const client = await pool.connect();
+    try {
+      const tenant = await client.query<{ id: string }>("select id from tenants where id = $1", [importingTenant]);
+      expect(tenant.rows).toHaveLength(1);
+      const keys = await client.query<{ id: string }>("select id from api_keys where tenant_id = $1", [importingTenant]);
+      expect(keys.rows.length).toBeGreaterThan(0);
+    } finally {
+      client.release();
+    }
+  });
+
+  test("a failed bulk restore keeps the bulk error when per-row diagnostics also fail", async () => {
+    const db = getDb();
+    const world = await createWorld();
+    const { payload: exported } = await exportBackup(db, tablesForSection("config"), world.tenantId);
+    const config = (exported as unknown as { sections: { config: Record<string, unknown> } }).sections.config;
+    // The export shares this test database with the importing tenants. Drop
+    // the source key so the first restore inserts it rather than colliding
+    // with the fixture's own globally unique primary key.
+    await dropSourceRows(world.tenantId);
+    // Isolate api_keys so the only collision is its globally unique key_hash.
+    const payload = {
+      app: "cartethyia",
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      sections: { config: { api_keys: config["api_keys"] } },
+    };
+
+    const firstTenant = randomUUID();
+    const first = validateRestorePayload(payload, firstTenant);
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    await applyRestore(db, first.value, restoreOrder(), firstTenant);
+
+    const secondTenant = randomUUID();
+    const second = validateRestorePayload(payload, secondTenant);
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    const failure = await applyRestore(db, second.value, restoreOrder(), secondTenant).then(
+      () => {
+        throw new Error("expected duplicate key_hash restore to fail");
+      },
+      (error: unknown) => error as Error & { cause?: unknown },
+    );
+    expect(failure.message).toContain("bulk insert into api_keys failed");
+    expect(failure.message).toContain("per-row diagnostic also failed");
+    expect(failure.cause instanceof Error).toBe(true);
   });
 
   test("a payload's secrets are named for what they are, and still restore", async () => {

@@ -108,7 +108,7 @@ caller — capability does not fall back, because an invented default is worse
 than a stated false. The offline catalog is a single generated, brotli-packed
 binary blob (`discovery/catalog/catalog-blob.ts`, read by
 `discovery/catalog/catalog-format.ts` behind `models-dev-catalog.ts`); refresh
-with `bun run scripts/generate/models-catalog.ts`; id remaps live in
+with `bun run scripts/tools/generate-models.ts`; id remaps live in
 `CATALOG_PROVIDER_IDS`. `seedBundledModels` writes rows as
 `source: 'builtin'`, prunes retired pairs, and reconciles capability drift
 while leaving operator-owned `enabled` alone.
@@ -153,7 +153,7 @@ refresh error — never replaces usable quota with an empty result.
 minutes old — half the 15-minute cache TTL, so a reading is refreshed roughly
 twice per window instead of three times — and bounds each pass to 40 accounts /
 45 seconds (set in `src/boot/dependencies.ts`). See
-[Usage floor](../features/usage-floor.md) for how readings affect eligibility.
+[Usage floor](../features/04-usage-floor.md) for how readings affect eligibility.
 
 ## Per-family notes
 
@@ -171,7 +171,7 @@ Verified in code only. `bespokeWire` = the adapter frames its own protocol, not 
 | xai / grok | Same issuer and JWKS, different surfaces: `grok` is the free Grok Build CLI proxy, `xai` is the paid API (`provider-metadata.ts`, `grok`/`xai` rows). |
 | kilo | Resells the OpenRouter catalog behind a `{accessToken, orgId}` JSON credential. No refresh grant. |
 | qoder | Device flow whose refresh endpoint answers 403; no refresher. Two realms (`qoder`, `qodercn`) with separate gateways, OAuth clients, and rosters. Upstream keys are opaque slots (`dfmodel`, `cmodel`), so the catalog publishes caller-facing names instead (`deepseek-v4.1-flash`, `cantus`); dispatch translates them back — see `integrations/qoder/qoder-virtual.ts`. `/model/list` states no output limit, so ceilings come per row. Free tier is read from upstream's own `is_free`, not hardcoded. |
-| trae / traecn | Two disjoint surfaces that share no model id: chat (`/api/ide/v1/llm_raw_chat`, keyed by `model_name`) and agent (`/api/agent/v3/llm_utils_chat`, keyed by `config_name` + `config_source` + `function: solo_agent`). The intl catalog is agent-only, because neither surface serves the other's ids. See `documentation/research/trae-agent-vs-chat-surface.md`. |
+| trae / traecn | Two disjoint surfaces that share no model id: chat (`/api/ide/v1/llm_raw_chat`, keyed by `model_name`) and agent (`/api/agent/v3/llm_utils_chat`, keyed by `config_name` + `config_source` + `function: solo_agent`). The intl catalog is agent-only, because neither surface serves the other's ids. Current behavior is owned by the Trae provider implementation and its tests. |
 | cline | Discovery reads only `recommended` + `free` — the pass roster would write subscription rows an operator's account can only 401 on. |
 | openrouter / zcode | PKCE ends by minting a **durable API key**, not an access token; no refresher. |
 | xiaomi-mimo | Two ids: `xiaomipg`, `xiaomitp`, both key-based. MiMo Studio browser-cookie login is not supported. |
@@ -185,7 +185,7 @@ Verified in code only. `bespokeWire` = the adapter frames its own protocol, not 
 | alibabacp | International and mainland-China plans on different hosts with non-interchangeable keys; region stored with the token and resolved to a base URL ending `/compatible-mode/v1`, so endpoint paths are unprefixed. No refresh grant. |
 | dashscope | Alibaba's mainland DashScope coding host, plain bearer on `https://coding.dashscope.aliyuncs.com/v1`. Distinct from `alibabacp` (Token Plan on `token-plan.*.maas.aliyuncs.com`). Live `/v1/models` discovery plus an 8-row static floor. |
 | factory / cloudflareai / alibabacp catalogs | Static rosters in `integrations/*/*-models.ts`; none publishes a listable endpoint, so the catalog is the list. Limits come from the base catalog via `models-dev-catalog.ts` remaps; capability is declared per row. |
-| cursor | Bespoke (`provider-metadata.ts`). Connect-RPC over protobuf on a bidirectional HTTP/2 stream, so it uses the validated `outbound_http2` capability rather than `fetch`. The Run origin comes from `GetServerConfig` per dispatch, not from the metadata base URL (which serves auth and catalog only). Its tool loop spans two client requests on one upstream Run, so the Run and its account/pool slot outlive the request that opened them — see [Cursor provider](../features/cursor-provider.md). No quota collector: no endpoint is established. The `x-cursor-client-version` identity is `cli-<version>-<sha7>` and is **discovered** from the official download API (`VERSION_SOURCES.cursor`), which is the only source returning both halves; the constant in `cursor-shared.ts` is only what a cold process sends before the first fetch. |
+| cursor | Bespoke (`provider-metadata.ts`). Connect-RPC over protobuf on a bidirectional HTTP/2 stream, so it uses the validated `outbound_http2` capability rather than `fetch`. The Run origin comes from `GetServerConfig` per dispatch, not from the metadata base URL (which serves auth and catalog only). Its tool loop spans two client requests on one upstream Run, so the Run and its account/pool slot outlive the request that opened them — see [Cursor provider](../features/08-cursor-provider.md). No quota collector: no endpoint is established. The `x-cursor-client-version` identity is `cli-<version>-<sha7>` and is **discovered** from the official download API (`VERSION_SOURCES.cursor`), which is the only source returning both halves; the constant in `cursor-shared.ts` is only what a cold process sends before the first fetch. |
 
 ## Where to change what
 

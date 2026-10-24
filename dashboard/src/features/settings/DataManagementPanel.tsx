@@ -106,8 +106,14 @@ export function DataManagementPanel(): ReactNode {
         })}
       </div>
 
+      {/*
+        * `data-panel`, not `data-bucket`: this row is not one of the grid's
+        * buckets. It carried `data-bucket` while being rendered outside the
+        * grid, so a selector for the buckets counted four cards where the grid
+        * holds three.
+        */}
       <div
-        data-bucket="health_events"
+        data-panel="health_events"
         className="flex items-center justify-between gap-6 rounded-control border border-inner-border px-6 py-5"
       >
         <span className="min-w-0 flex items-center gap-4">
@@ -205,21 +211,20 @@ export function DataManagementPanel(): ReactNode {
 }
 
 /**
- * Which reclaim each bucket offers. Hourly files have none: they are the only
- * copy of their requests until compaction folds them up, so the backend
- * refuses to delete them and the row says so rather than offering a dead
- * button.
+ * Which reclaim each bucket offers. Event files have none: they are kept for
+ * the retention window and cleaned up together with their index via
+ * `telemetry_retention`. The index row offers that action directly.
  */
 function reclaimActionFor(bucket: DiskUsageBucket): ReclaimAction | null {
   if (bucket.id === "payload_frames") return "payload_frames";
-  if (bucket.id === "telemetry_compacted") return "telemetry_retention";
+  if (bucket.id === "telemetry_index") return "telemetry_retention";
   return null;
 }
 
 /** One glyph per section, so the five parts of the panel read as a family. */
 function bucketIconFor(bucket: DiskUsageBucket): LucideIcon {
   if (bucket.id === "payload_frames") return FileJson;
-  if (bucket.id === "telemetry_compacted") return CalendarDays;
+  if (bucket.id === "telemetry_index") return CalendarDays;
   return FileClock;
 }
 

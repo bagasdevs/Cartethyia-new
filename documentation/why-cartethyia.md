@@ -4,9 +4,8 @@ The reasoning behind this project: what problem it was built for, what it does
 differently from the gateways around it, and which behaviors exist here and
 nowhere else.
 
-This page is the story. For indexes and procedures, use
-[reference](reference/README.md), [features](features/README.md), and
-`.skills/`.
+This page is the story. For indexes and procedures, use the
+[project README](../README.md) and `.skills/`.
 
 ## The problem
 
@@ -75,7 +74,7 @@ These are implemented here from scratch, shaped by operating this gateway — no
 - **CLI model mapping.** Reroute a CLI tool's *native model slots*
   (`opus`, `sonnet`, …) to operator-chosen targets, scoped per API key, and
   inject the result into the tool's own config file. See
-  [CLI model mapping](features/cli-model-mapping.md) and the injectors under
+  [CLI model mapping](features/01-cli-model-mapping.md) and the injectors under
   [`src/console/cli-tools/injectors/`](../src/console/cli-tools/injectors/).
 - **Per-model cooldown.** A 429 or a refusal can be scoped to one
   `(account, model)` pair instead of the whole account: `modelCooldowns` carries
@@ -86,19 +85,19 @@ These are implemented here from scratch, shaped by operating this gateway — no
   (`round_robin` with its own rotation cursor, or weighted least-loaded) decides
   which one each dispatch takes. Background work — quota refreshes, daily
   check-ins — rotates egress per account so it spreads across addresses instead
-  of hammering one. See [Network pools](features/network-pools.md).
+  of hammering one. See [Network pools](features/03-network-pools.md).
 - **Usage floor.** Accounts whose remaining quota sits at or below a provider
   threshold are skipped before they are dialed. See
-  [Usage floor](features/usage-floor.md).
+  [Usage floor](features/04-usage-floor.md).
 - **Share keys.** A public link enrolls a child API key under a parent's
   policy, so recipients spend against the parent's budget and inherit its
-  limits. See [Share keys](features/share-keys.md).
+  limits. See [Share keys](features/05-share-keys.md).
 - **Routing aliases and combos.** Name a model something else, or fan one name
   out across several with weighted failover. See
-  [Routing aliases and combos](features/routing-aliases-combos.md).
+  [Routing aliases and combos](features/02-routing-aliases-combos.md).
 - **Buddy media generation.** Images and submit/poll video tasks through Buddy
   providers, including the undocumented polling contract — see
-  [Buddy media generation](features/buddy-media-generation.md).
+  [Buddy media generation](features/07-buddy-media-generation.md).
 - **Built-in remote debugging.** Pull a recorded request off a running instance
   and replay it until one field flips the status. That method is how the
   OpenCode free-tier gate was solved.
@@ -127,8 +126,5 @@ telemetry, and the console API — is this project's own.
 
 ## Where to go next
 
-- [Getting started](getting-started.md) — install and choose a database mode.
-- [Reference](reference/README.md) — one page per layer.
-- [Features](features/README.md) — one page per user-facing feature.
-- [Agent context](agent-context.md) — orientation for a new contributor or
-  agent.
+- [Installation](installation.md) — install and choose a database mode.
+- [Project README](../README.md) — product overview and installation entrypoint.

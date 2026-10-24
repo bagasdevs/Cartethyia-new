@@ -187,6 +187,7 @@ export interface ApiKeyStore {
   reorder(tenantId: string, keyIds: readonly string[]): Promise<void>;
   update(tenantId: string, keyId: string, patch: ApiKeyPatch): Promise<ApiKeyRecord | undefined>;
   revoke(tenantId: string, keyId: string, revokedAt: Date): Promise<boolean>;
+  remove(tenantId: string, keyId: string): Promise<boolean>;
   findActiveByHash?(hash: string): Promise<typeof apiKeys.$inferSelect | undefined>;
   findActiveById?(keyId: string): Promise<typeof apiKeys.$inferSelect | undefined>;
   sumChildrenConsumed?(parentKeyId: string): Promise<number>;
@@ -380,10 +381,6 @@ export class DrizzleApiKeyStore implements ApiKeyStore {
         .set({
           ...(patch.enabled !== undefined ? { enabled: patch.enabled } : {}),
           ...(patch.label !== undefined ? { label: patch.label } : {}),
-          // Promotes a legacy default key: `isDefaultGatewayApiKey` recognizes
-          // it by its canonical label, but recognition was never written back,
-          // so the row stayed unflagged and a later rename — which changes the
-          // only field that identifies it — dropped the default entirely.
           ...(patch.isDefault !== undefined ? { isDefault: patch.isDefault } : {}),
           ...(patch.keyHash !== undefined ? { keyHash: patch.keyHash } : {}),
           ...(patch.keyMode !== undefined ? { keyMode: patch.keyMode } : {}),
@@ -413,8 +410,8 @@ export class DrizzleApiKeyStore implements ApiKeyStore {
             : {}),
           // Scopes are validated once, in `validateApiKeyRequest`, against the
           // tenant scope set; the store writes what it is handed. Omitting the
-          // field here meant an update was type-checked, accepted, and then
-          // silently dropped — a grant like `routing:cli_mapping` could be
+          // field here means an update is type-checked, accepted, and then
+          // silently dropped — a grant like `routing:cli_mapping` can be
           // turned on and never stick.
           ...(patch.scopes === undefined ? {} : { scopes: patch.scopes }),
         })
@@ -451,6 +448,21 @@ export class DrizzleApiKeyStore implements ApiKeyStore {
           .where(and(eq(shareLinks.apiKeyId, keyId), eq(shareLinks.active, true)));
       }
       return true;
+    });
+  }
+  async remove(tenantId: string, keyId: string): Promise<boolean> {
+    return this.db.transaction(async (tx) => {
+      const rows = await tx
+        .delete(apiKeys)
+        .where(
+          and(
+            eq(apiKeys.tenantId, tenantId),
+            eq(apiKeys.id, keyId),
+            eq(apiKeys.isDefault, false),
+          ),
+        )
+        .returning({ id: apiKeys.id });
+      return rows.length > 0;
     });
   }
   async findActiveByHash(hash: string): Promise<typeof apiKeys.$inferSelect | undefined> {

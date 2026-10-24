@@ -11,6 +11,7 @@ import { isGatewayError } from "../../observability/telemetry-status";
 import { queryIndexedBuckets, type IndexedBucket } from "../../observability/event-day-index";
 import {
   LATENCY_BUCKETS_MS,
+  numeric,
   percentileFromHistogram,
 } from "../../observability/event-compaction";
 import { cachedReadWithEtag, type CachedResult } from "../shared/read-through-cache";
@@ -198,9 +199,9 @@ const HEALTH_WINDOW_MS = 24 * 3_600_000;
 const TOP_N = 50;
 /**
  * How long a parsed window is shared. A dashboard poll fires ~8 usage
- * endpoints at once, and a slow parse used to outlive a 1.5 s window — so the
- * endpoints that missed it each re-read and re-parsed the same files, which is
- * how one page load became several full parses of the retention window.
+ * endpoints at once, and a slow parse outlives a 1.5 s window — so the
+ * endpoints that miss it each re-read and re-parse the same files, which is how
+ * one page load becomes several full parses of the retention window.
  */
 const PERIOD_MEMO_TTL_MS = 5_000;
 
@@ -264,10 +265,20 @@ export function summarizeBucketPerformance(
 ): UsagePerformanceSummary {
   let latencySum = 0;
   let latencyCount = 0;
+  let resolveSum = 0;
+  let resolveCount = 0;
+  let latencyMaxMs: number | null = null;
   const histogram: number[] = [];
   for (const bucket of buckets) {
     latencySum += bucket.latencySum;
     latencyCount += bucket.latencyCount;
+    // Read defensively: an index written before these fields existed carries
+    // neither, and summing `undefined` poisons the whole period with NaN —
+    // including the days that do have the data.
+    resolveSum += numeric(bucket.resolveSumMs);
+    resolveCount += numeric(bucket.resolveCount);
+    if (bucket.latencyMaxMs !== null)
+      latencyMaxMs = latencyMaxMs === null ? bucket.latencyMaxMs : Math.max(latencyMaxMs, bucket.latencyMaxMs);
     for (let index = 0; index < bucket.latencyHistogram.length; index += 1) {
       histogram[index] = (histogram[index] ?? 0) + (bucket.latencyHistogram[index] ?? 0);
     }
@@ -277,13 +288,17 @@ export function summarizeBucketPerformance(
       ? histogram
       : new Array<number>(LATENCY_BUCKETS_MS.length + 1).fill(0);
   return {
-    avgResolveMs: 0,
+    avgResolveMs: resolveCount > 0 ? resolveSum / resolveCount : 0,
     avgDurationMs: latencyCount > 0 ? latencySum / latencyCount : 0,
-    latencyP50Ms: percentileFromHistogram(fill, 50) ?? 0,
-    latencyP95Ms: percentileFromHistogram(fill, 95) ?? 0,
-    latencyP99Ms: percentileFromHistogram(fill, 99) ?? 0,
+    // `latencyMaxMs` is passed as the overflow answer: a percentile past the
+    // histogram's last edge is at most the slowest request actually recorded.
+    // Without it an overflow returned `null`, and `?? 0` turned a P95 of 40 s
+    // into "0 ms" — the slow tail reported as nothing at all.
+    latencyP50Ms: percentileFromHistogram(fill, 50, latencyMaxMs) ?? 0,
+    latencyP95Ms: percentileFromHistogram(fill, 95, latencyMaxMs) ?? 0,
+    latencyP99Ms: percentileFromHistogram(fill, 99, latencyMaxMs) ?? 0,
     latencySampleCount: latencyCount,
-    resolveSampleCount: 0,
+    resolveSampleCount: resolveCount,
   };
 }
 
@@ -340,9 +355,8 @@ export class DrizzleObservabilityStore implements ObservabilityStore {
   ) {}
 
   async health(tenantId: string): Promise<CachedResult<SystemHealthResponse>> {
-    // The only usage-family read that used to bypass both the 5 s in-process
-    // memo and the Redis read-through, so it re-parsed 24 hourly files every
-    // page load. Same 10 s TTL as `/system/usage`.
+    // Cached like its siblings: reading this directly re-parses 24 hourly files
+    // every page load. Same 10 s TTL as `/system/usage`.
     return this.readThroughWithEtag(
       this.usageCacheKey(tenantId, "24h", "health"),
       () => this.computeHealth(tenantId),
@@ -424,8 +438,8 @@ export class DrizzleObservabilityStore implements ObservabilityStore {
       p99 = percentile(latencies, 0.99);
       // Cached share of the prompt: cached/input, the same honest definition
       // usageSummary uses, so the health card and the Usage page cannot
-      // disagree. (This used to be prompt-share input/(input+output), which
-      // read ~99% and was mislabeled a cache hit rate.)
+      // disagree. (Cached share, not prompt share: input/(input+output) reads
+      // ~99% and mislabels it a cache hit rate.)
       cacheHitRate = inputTokens > 0 ? Math.round((cachedTokens / inputTokens) * 10000) / 100 : 0;
       avgTokensPerSec = tokensPerSecCount > 0 ? tokensPerSecSum / tokensPerSecCount : 0;
     } catch {
@@ -596,6 +610,15 @@ export class DrizzleObservabilityStore implements ObservabilityStore {
     let tokensPerSecCount = 0;
     const statuses = new Map<number, number>();
     for (const row of buckets) {
+      // Folded from the index's own per-status counts. These used to be left
+      // empty: the loop below never filled `statuses`, so every status chip and
+      // the requests-list filters read zero for any day whose events had been
+      // folded — while `requests` beside them read the real total.
+      for (const [status, count] of Object.entries(row.byStatus ?? {})) {
+        const code = Number(status);
+        if (!Number.isFinite(code)) continue;
+        statuses.set(code, (statuses.get(code) ?? 0) + count);
+      }
       requests += row.requests;
       inputTokens += row.inputTokens;
       outputTokens += row.outputTokens;
@@ -983,9 +1006,9 @@ export class DrizzleObservabilityStore implements ObservabilityStore {
   ): Promise<TelemetryEventListPage> {
     const before = decodeDatedCursor(cursor);
     // The cursor becomes an `until` bound inside the query, so `limit` applies
-    // to every page and not only the first. Filtering after the read forced the
-    // previous shape: a cursor page had to fetch the whole window to know where
-    // it ended, so `limit` was dropped the moment a cursor appeared.
+    // to every page and not only the first. Filtering after the read would force
+    // a cursor page to fetch the whole window to know where it ended, dropping
+    // `limit` the moment a cursor appears.
     //
     // `until` is inclusive while the cursor is exclusive, so rows at the exact
     // cursor timestamp are still compared by id here — the cheap part of the

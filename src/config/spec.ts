@@ -165,8 +165,7 @@ export const CONFIG_SPEC = {
    * Age at which a request's detail is described as no longer stored.
    *
    * Retention itself is `CARTETHYIA_TELEMETRY_RETENTION_DAYS`; this only words
-   * the message shown when a request that old is asked for. Kept because the
-   * message is operator-facing and was written against this knob.
+   * the operator-facing message shown when a request that old is asked for.
    */
   CARTETHYIA_TELEMETRY_COMPACT_AFTER_DAYS: { kind: "int", default: 7, min: 1, max: 365 },
   /**
@@ -183,27 +182,6 @@ export const CONFIG_SPEC = {
     min: 5,
     max: 1440,
   },
-  /**
-   * Inert. Accepted so existing deployments keep booting; nothing reads it.
-   *
-   * It sized the one-file-per-window scheme — events were written to a file
-   * per this many minutes, 96 a day at the default. Events now append to one
-   * file per UTC day, so there is no window left to size.
-   */
-  CARTETHYIA_TELEMETRY_WINDOW_MINUTES: {
-    kind: "int",
-    default: 15,
-    min: 1,
-    max: 1440,
-  },
-  /**
-   * Inert. Accepted so existing deployments keep booting; nothing reads it.
-   *
-   * It capped how many window files one pass could fold. Folding is driven by
-   * a byte offset into the day file now and never deletes the file, so there
-   * is no per-pass batch to bound.
-   */
-  CARTETHYIA_TELEMETRY_COMPACT_MAX_FILES: { kind: "int", default: 48, min: 1, max: 10_000 },
   CARTETHYIA_TELEMETRY_PAYLOAD_MAX_BYTES: {
     kind: "int",
     default: 16 * 1024 * 1024,
@@ -246,10 +224,10 @@ export const CONFIG_SPEC = {
   /**
    * An unmapped upstream failure cools the account down for 15 minutes.
    *
-   * It used to be 60s, which put the account straight back into rotation and
-   * re-dialled an upstream that had just answered something this gateway does
-   * not understand — so the same unknown error was retried every minute, and
-   * an account that was actually broken contributed a steady stream of failed
+   * A shorter window puts the account straight back into rotation and re-dials
+   * an upstream that has just answered something this gateway does not
+   * understand — so the same unknown error is retried every minute, and an
+   * account that is actually broken contributes a steady stream of failed
    * attempts instead of one. Fifteen minutes is long enough for a transient
    * provider condition to clear on its own and short enough that no operator
    * action is needed to recover it. It is still a cooldown with a deadline,
@@ -279,6 +257,18 @@ export const CONFIG_SPEC = {
   CARTETHYIA_MODEL_STRIKE_THRESHOLD: { kind: "int", default: 10, min: 1, max: 100 },
   CARTETHYIA_MODEL_STRIKE_WINDOW_MS: { kind: "int", default: 1_800_000, min: 1_000, max: 86_400_000 },
   CARTETHYIA_MODEL_BAN_TTL_MS: { kind: "int", default: 21_600_000, min: 1_000, max: 604_800_000 },
+  /**
+   * The longest ban the console will record, however long a request asks for.
+   * The "Permanent" choice is a very long TTL rather than an unbounded one,
+   * and this is what keeps a typo in a duration from parking a caller for a
+   * decade.
+   */
+  CARTETHYIA_MODEL_BAN_MAX_TTL_MS: {
+    kind: "int",
+    default: 604_800_000,
+    min: 1_000,
+    max: 604_800_000,
+  },
   CARTETHYIA_ENCRYPTION_KEY: {
     kind: "required",
     error:
@@ -295,9 +285,9 @@ export const CONFIG_SPEC = {
   /**
    * Loopback port the browser-OAuth callback listener binds.
    *
-   * Configurable because the default is a fixed number and a busy port used to
-   * strand the operator: the login could not start and there was no way to move
-   * it. Codex's authorization server still expects 59653, so changing this
+   * Configurable because the default is a fixed number: a busy port would strand
+   * the operator, since the login could not start and there would be no way to
+   * move it. Codex's authorization server still expects 59653, so changing this
    * only helps the providers whose redirect URI is not allowlisted upstream.
    */
   CARTETHYIA_OAUTH_CALLBACK_PORT: { kind: "int", default: 59_653, min: 1_024, max: 65_535 },

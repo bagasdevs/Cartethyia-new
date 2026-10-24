@@ -78,10 +78,10 @@ export interface IpAbuseOutcome {
    *
    * The store is the only component that knows this: a ban's remainder is its
    * marker's TTL, and a rate-limited window's remainder is the age of its
-   * oldest attempt. Both are server state. The middleware used to answer every
-   * 429 with a fixed `retry-after: 3600`, which told a client hitting a 60-second
-   * window to wait sixty times longer than it had to — and told a client whose
-   * ban had nearly elapsed to wait the full hour again.
+   * oldest attempt. Both are server state. Answering every 429 with a fixed
+   * `retry-after: 3600` would tell a client hitting a 60-second window to wait
+   * sixty times longer than it had to — and tell a client whose ban had nearly
+   * elapsed to wait the full hour again.
    */
   readonly retryAfterMs: number;
 }
@@ -224,7 +224,7 @@ export class InMemoryIpAbuseStore implements IpAbuseStore {
 
   /** Evicts the oldest entries of `map` down to `maxKeys` in a single pass so
    *  an adversarial fan-out over unique identities cannot pin memory. Deleting
-   *  one entry at a time was O(1) but starved reclaim. */
+   *  one entry at a time is O(1) but starves reclaim. */
   private evictOldest<K, V>(map: Map<K, V>): void {
     if (map.size < this.maxKeys) return;
     let toEvict = map.size - this.maxKeys + 1;
@@ -251,10 +251,10 @@ export class InMemoryIpAbuseStore implements IpAbuseStore {
   /**
    * Outage injection for tests, mirroring the store's own reachability.
    *
-   * The service no longer probes the store before using it: every method below
+   * The service does not probe the store before using it: every method below
    * throws when the store is unreachable, and the service's catch maps that to
-   * a bounded `admission_unavailable`. Keeping a separate probe would only add
-   * a round trip to every request on the Redis store.
+   * a bounded `admission_unavailable`. A separate probe would only add a round
+   * trip to every request on the Redis store.
    */
   private assertAvailable(): void {
     if (this.failing) throw new Error("ip store unavailable");
@@ -421,7 +421,12 @@ export class IpAbuseProtectionService {
 
       if (outcome.banned) {
         throw new GatewayError("quota_exceeded", 429, "This address is temporarily banned for too many failed requests. Wait for the ban to lift, then slow down.", {
-          reason: "admission-unavailable",
+          // Distinguishes this from the rate-limited 429 below and from an API
+          // key's own budget. It used to be "admission-unavailable", which is
+          // the label for an *unreachable* store — so every refusal from this
+          // layer claimed an outage that had not happened, and a client could
+          // not tell "banned" from "over the window" from "store is down".
+          reason: "ip-banned",
           ip,
           route: input.route,
           // Measured by the store: the ban marker's remaining TTL. Carried as
@@ -433,7 +438,7 @@ export class IpAbuseProtectionService {
 
       if (outcome.count > this.maxRequestsPerWindow) {
         throw new GatewayError("quota_exceeded", 429, "This address is sending requests faster than the abuse limit allows. Back off and retry after the window rolls over.", {
-          reason: "admission-unavailable",
+          reason: "ip-rate-limited",
           ip,
           route: input.route,
           count: outcome.count,

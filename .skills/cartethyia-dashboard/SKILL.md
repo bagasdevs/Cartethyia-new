@@ -24,9 +24,9 @@ the backend.
 - A card blurs only what is painted behind it in the same group. `BackgroundLayer` mounts inside `.app-main-column`, and `.route-enter` must not animate `opacity`, `transform`, or `filter` — any of those groups the page and the card blurs black instead of the image. `contain` other than `none` on `.custom-background` does the same, and also makes a `fixed` layer scroll. Clarity (`--blur-cards`) and blur (`--blur-cards-depth`) are separate; never let one slider write both.
 - Polling lists use stable sorting with a deterministic name tiebreaker.
 - User-initiated console mutations should report both outcomes: use
-  `toast.success(...)` on success (short outcome, e.g. "Proxy pool created") and
-  `toast.error(...)` with `getErrorMessage(error, ...)` on failure. A deliberately
-  quiet or automated path may suppress toasts.
+  `toast.success(...)` on success (short outcome, e.g. "Proxy pool created")
+  and `toast.error(...)` with `getErrorMessage(error, ...)` on failure. A
+  deliberately quiet or automated path may suppress toasts.
 - `Dialog` sizes come from `DialogSize` (`sm 420 / md 640 / lg 880 / xl 960`)
   in `dashboard/src/components/ui/dialog.tsx`; `size` wins over `width`, and
   arbitrary `width={...}` px is supported but existing usage should be checked
@@ -39,8 +39,8 @@ the backend.
   defensively for SSR, unavailable storage, invalid values, and junk. Issued
   share keys are stored in IndexedDB rather than localStorage.
 
-Read `references/dashboard.md` for the social-metadata and share-page
-procedure, and the verification choice matrix.
+Read `references/dashboard-map.md` for the page map, the social-metadata and
+share-page procedure, the styling migration order, and the console sign-in.
 
 ## Styling contract
 
@@ -98,8 +98,8 @@ overflow that was not measured with `eval` is unverified, whatever else is green
 **Console surfaces need a sign-in.** `bun run dev:console-auth` does it from
 `CARTETHYIA_DEV_ADMIN_PASSWORD` through the real form, after which plain
 `agent-browser` commands share that browser already signed in. See
-`references/dashboard.md` "Authenticated console session" — it also covers the
-fresh-database `/console/setup` wizard and which origin serves what.
+`references/dashboard-map.md` "Authenticated console session" — it also covers
+the fresh-database `/console/setup` wizard and which origin serves what.
 
 Pick the tool that can actually answer:
 

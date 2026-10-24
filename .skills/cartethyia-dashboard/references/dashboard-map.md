@@ -60,11 +60,11 @@ loop.
 Unknown protected paths redirect to `/`. There is no fusion page.
 
 Three of those pages are backed by a feature page that owns the data and the
-console domain behind them: [`/combos`](../../../documentation/features/routing-aliases-combos.md),
-[`/proxy`](../../../documentation/features/network-pools.md), and `/cli-tools`
-([CLI model mapping](../../../documentation/features/cli-model-mapping.md)). The share page is public
-and has its own: [share keys](../../../documentation/features/share-keys.md). Provider detail's
-quota threshold is documented in [Usage floor](../../../documentation/features/usage-floor.md).
+console domain behind them: [`/combos`](../../../documentation/features/02-routing-aliases-combos.md),
+[`/proxy`](../../../documentation/features/03-network-pools.md), and `/cli-tools`
+([CLI model mapping](../../../documentation/features/01-cli-model-mapping.md)). The share page is public
+and has its own: [share keys](../../../documentation/features/05-share-keys.md). Provider detail's
+quota threshold is documented in [Usage floor](../../../documentation/features/04-usage-floor.md).
 
 ## Data flow
 
@@ -137,7 +137,7 @@ or media-generation tools run; **YOLO** runs those tools automatically.
 lets recipients copy granted model ids and test allowed models with the shared
 key, and carries no key-management controls such as enable, disable, or delete.
 What the page is for, and what enforces it, is on the
-[share keys](../../../documentation/features/share-keys.md) page.
+[share keys](../../../documentation/features/05-share-keys.md) page.
 
 `apps/landing` is the unauthenticated product page. Crawlers do not run the
 bundle, so title, description, and social tags for landing, console, and share
@@ -177,15 +177,16 @@ timestamp must not swap places between polls.
 
 ## Mutation feedback
 
-Every mutation toasts both arms.
+User-initiated mutations report both outcomes unless deliberately quiet or
+automated.
 
 | Result | Toast |
 | --- | --- |
 | success | `toast.success` with the outcome, for example "Proxy pool created" |
 | failure | `toast.error` with `getErrorMessage(error, ...)` |
 
-A `mutate` that reports neither is a bug. The operator cannot tell whether the
-click landed.
+An interactive mutation that reports neither leaves the operator unable to
+tell whether the click landed.
 
 ## Provider routing controls
 
@@ -216,6 +217,18 @@ data bug.
 Social tags are verified on the served HTML, not in the React tree. The served
 document for `/`, a console route, and a share route must each carry the tags
 `dashboard-assets.ts` injects.
+
+## Authenticated console session
+
+Follow [the dashboard reference](dashboard.md#authenticated-console-session)
+for the real-form sign-in and shared browser session. Do not duplicate its
+credential and session procedure here.
+
+## Styling migration
+
+Follow [the dashboard reference](dashboard.md) for the visual-baseline,
+style-guard, and migration procedure. Keep this page as the route/layout map
+rather than maintaining a second copy of that procedure.
 
 ## Where to change what
 
