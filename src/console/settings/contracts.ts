@@ -21,8 +21,6 @@ export interface RuntimeSettingsResponse {
   readonly telemetryPayloads: TelemetryPayloadMode;
   /** Capture depth for `full` mode; `minimum` when unset. */
   readonly telemetryPayloadDepth: TelemetryPayloadDepth;
-  /** How long a captured frame is kept, in minutes; `null` means deployment default. */
-  readonly telemetryPayloadRetentionMinutes: number | null;
   readonly privacyMode: PrivacyMode;
   /** Compacts bulky tool-result text before dispatch (RTK prune). Default false. */
   readonly rtkPruneEnabled: boolean;
@@ -39,13 +37,45 @@ export interface RuntimeSettingsResponse {
    * cooldown is still recorded and still recovered by the sweep.
    */
   readonly forceDisableCooldown: boolean;
+  /**
+   * Stops every invoke and route for this tenant while on. The console stays
+   * reachable so the switch can be turned back off from the UI that set it.
+   */
+  readonly invokeDisabled: boolean;
+  /**
+   * Slack above every key's concurrency limit; `null` means none. The
+   * effective ceiling is `maxConcurrentRequests + concurrencyTolerance`.
+   */
+  readonly concurrencyTolerance: number | null;
   /** Per-tenant upstream request timeout in seconds; null means deployment default. */
   readonly upstreamTimeoutSeconds: number | null;
-  /** Per-tenant telemetry compaction age in days; null means deployment default. */
+  /** Captured payload detail lifetime in minutes; null means deployment default. */
   readonly telemetryWindowMinutes: number | null;
   /** Per-tenant inline attachment ceiling in bytes; null means deployment default. */
   readonly imageClampMaxBytes: number | null;
   readonly updatedAt: string;
+  /*
+   * What each `null` actually resolves to, in the same units the row stores.
+   *
+   * A row that says "Deployment default" without the number makes the operator
+   * guess, and the guess is the one thing they cannot check from here: the
+   * value lives in an env var on a server they are not looking at. Sent in the
+   * same response rather than mirrored in the client, because a copied number
+   * is right until someone changes the deployment — then it lies quietly.
+   */
+  readonly defaults: RuntimeSettingsDefaults;
+}
+
+/** The deployment-level values a `null` runtime setting falls back to. */
+export interface RuntimeSettingsDefaults {
+  /** Seconds; from `CARTETHYIA_UPSTREAM_TIMEOUT_MS`. */
+  readonly upstreamTimeoutSeconds: number;
+  /** Minutes; what the payload store expires frames after. */
+  readonly telemetryWindowMinutes: number;
+  /** Bytes; the inline attachment ceiling. */
+  readonly imageClampMaxBytes: number;
+  /** Days; how long raw event files are kept. */
+  readonly telemetryRetentionDays: number;
 }
 
 /**
@@ -92,20 +122,6 @@ export type TelemetryPayloadMode = (typeof TELEMETRY_PAYLOAD_MODES)[number];
 export const TELEMETRY_PAYLOAD_DEPTHS = ["minimum", "moderate", "maximum"] as const;
 /** Capture depth for `full` mode accepted by the runtime-settings PATCH. */
 export type TelemetryPayloadDepth = (typeof TELEMETRY_PAYLOAD_DEPTHS)[number];
-/**
- * How long a captured payload frame is kept, in whole minutes, or `null` for
- * the deployment default.
- *
- * Only the offered values are accepted, and a value off the list is *rejected*
- * rather than clamped: clamping would answer a request for thirty days with
- * seven and report success, and an operator who asked for the longer window
- * would believe they got it.
- */
-export const TELEMETRY_PAYLOAD_RETENTION_MINUTES = [15, 30, 60, 360, 720, 1440, 10080] as const;
-/** Payload retention in minutes accepted by the runtime-settings PATCH. */
-export type TelemetryPayloadRetentionMinutes =
-  | (typeof TELEMETRY_PAYLOAD_RETENTION_MINUTES)[number]
-  | null;
 export const PRIVACY_MODES = ["masked", "full"] as const;
 /** Provider/model label privacy accepted by the runtime-settings PATCH. */
 export type PrivacyMode = (typeof PRIVACY_MODES)[number];
@@ -149,19 +165,6 @@ export function createRuntimeSettingsOperations(deps: RuntimeSettingsConfig) {
         if (patch.telemetryPayloadDepth !== undefined && !TELEMETRY_PAYLOAD_DEPTHS.includes(patch.telemetryPayloadDepth)) {
           throw new ConsoleDomainError("invalid_request", 400, "Invalid telemetryPayloadDepth");
         }
-        if (patch.telemetryPayloadRetentionMinutes !== undefined) {
-          const minutes = patch.telemetryPayloadRetentionMinutes;
-          if (
-            minutes !== null &&
-            !(TELEMETRY_PAYLOAD_RETENTION_MINUTES as readonly number[]).includes(minutes)
-          ) {
-            throw new ConsoleDomainError(
-              "invalid_request",
-              400,
-              "Invalid telemetryPayloadRetentionMinutes",
-            );
-          }
-        }
         if (patch.privacyMode !== undefined && !PRIVACY_MODES.includes(patch.privacyMode)) {
           throw new ConsoleDomainError("invalid_request", 400, "Invalid privacyMode");
         }
@@ -183,10 +186,11 @@ export function createRuntimeSettingsOperations(deps: RuntimeSettingsConfig) {
           detail: patch as Record<string, unknown>,
         });
         // Saved preferences are routing changes: `forceDisableCooldown` decides
-        // candidate eligibility and `tenantConcurrencyLimit` decides admission,
-        // and both are read from the cached route snapshot. Invalidate after the
-        // write commits so the next `/v1/*` request uses them instead of the
-        // revision that was built before the save. A failure here must not fail
+        // candidate eligibility, `tenantConcurrencyLimit` decides admission, and
+        // `invokeDisabled` decides whether the request is refused at all — all
+        // three read from the cached route snapshot. Invalidate after the write
+        // commits so the next `/v1/*` request uses them instead of the revision
+        // that was built before the save. A failure here must not fail
         // the save — the row is already correct, and the snapshot rebuilds on
         // the next read anyway.
         await Promise.resolve(deps.snapshotInvalidator?.invalidate()).catch(() => undefined);
@@ -206,12 +210,6 @@ export const runtimeUpdateBody = t.Object({
   responsesReasoningSummary: t.Optional(literalUnion(RESPONSES_REASONING_SUMMARIES)),
   telemetryPayloads: t.Optional(literalUnion(TELEMETRY_PAYLOAD_MODES)),
   telemetryPayloadDepth: t.Optional(literalUnion(TELEMETRY_PAYLOAD_DEPTHS)),
-  telemetryPayloadRetentionMinutes: t.Optional(
-    t.Union([
-      t.Null(),
-      t.Union(TELEMETRY_PAYLOAD_RETENTION_MINUTES.map((minutes) => t.Literal(minutes))),
-    ]),
-  ),
   privacyMode: t.Optional(literalUnion(PRIVACY_MODES)),
   tenantConcurrencyLimit: t.Optional(t.Union([t.Null(), t.Number()])),
   thinkingNormalizationEnabled: t.Optional(t.Boolean()),
@@ -234,6 +232,10 @@ export const runtimeUpdateBody = t.Object({
    * rejected here rather than silently clamped on the way in.
    */
   forceDisableCooldown: t.Optional(t.Boolean()),
+  invokeDisabled: t.Optional(t.Boolean()),
+  concurrencyTolerance: t.Optional(
+    t.Union([t.Null(), t.Number({ minimum: 0, maximum: 1024 })]),
+  ),
   upstreamTimeoutSeconds: t.Optional(
     t.Union([t.Null(), t.Number({ minimum: 5, maximum: 600 })]),
   ),

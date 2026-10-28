@@ -1,21 +1,26 @@
+import { randomUUID } from "node:crypto";
 import type { CartethyiaDatabase } from "../persistence/db-handle";
 import { healthEvents } from "../persistence/schema";
 import type { NetworkPoolSelector } from "./pool/selector";
 import type { GatewayError } from "../protocol/gateway-error";
 import { metrics } from "../observability/metrics";
 import { log } from "../observability/logger";
+import { upsertProviderCooldownMarker } from "./pool-cooldown-store";
+import { resolvePoolProviderRateLimitCooldownMs } from "../config/cooldowns";
 
 /**
  * Durable pool rate-limit history.
  *
  * Per-(pool, provider) 429 cooldowns live in `NetworkPoolSelector` (fast,
- * volatile, consulted on every dispatch). This recorder mirrors each flag
- * into the append-only `health_events` table (`entity_kind: "pool"`) — the
- * same merged log the account recorder writes to for accounts — so
- * operators can audit which pool throttled which provider and when. It
- * never touches `network_pools.status`: a single provider's 429 must not
- * flip the whole pool to `cooldown` (that would head-of-line-block every
- * other provider on the pool).
+ * volatile, consulted on every dispatch). This recorder mirrors each flag into
+ * two durable homes: the append-only `health_events` table
+ * (`entity_kind: "pool"`, the same merged log the account recorder writes to
+ * for accounts) for audit, and the `provider_cooldowns` column on the pool row
+ * as the state boot restores — a restart must not make dispatch forget the
+ * egresses the upstream is still refusing. It never touches
+ * `network_pools.status`: a single provider's 429 must not flip the whole pool
+ * to `cooldown` (that would head-of-line-block every other provider on the
+ * pool).
  */
 
 /**
@@ -41,12 +46,14 @@ async function recordPoolCooldownEvent(
   if (last !== undefined && now - last < POOL_COOLDOWN_EVENT_WINDOW_MS) return;
   try {
     await db.insert(healthEvents).values({
+      id: randomUUID(),
       entityKind: "pool",
       networkPoolId: poolId,
       fromStatus: null,
       toStatus: "cooldown",
       reason: `provider ${providerId}: ${reason}`,
       errorCategory: "rate_limit_transient",
+      createdAt: new Date(),
     });
   } catch {
     // Non-fatal: observability writes must never fail dispatch. The
@@ -85,6 +92,12 @@ export function flagPoolBlocked(
   const reason = `Provider ${providerId} refused this egress`;
   void poolSelector
     .flagProviderBlocked(poolId, providerId, reason)
+    .then((entry) =>
+      // Persisted even when the flag was refused (a credential-keyed
+      // provider): the selector returned an inert entry, so the mirror
+      // records nothing a reader would act on.
+      upsertProviderCooldownMarker(db, poolId, providerId, entry),
+    )
     .catch((cause: unknown) => {
       metrics.pool_cooldown_record_failed.inc(1);
       log.warn("pool block flag failed", {
@@ -119,12 +132,14 @@ async function recordPoolBlockEvent(
   error: GatewayError,
 ): Promise<void> {
   await db.insert(healthEvents).values({
+    id: randomUUID(),
     entityKind: "pool",
     networkPoolId: poolId,
     fromStatus: null,
     toStatus: "cooldown",
     reason: `provider ${providerId}: ${reason}${providerCodeSuffix(error)}`,
     errorCategory: "egress_blocked",
+    createdAt: new Date(),
   });
 }
 
@@ -138,8 +153,19 @@ function providerCodeSuffix(error: GatewayError): string {
 const DEFAULT_PROVIDER_COOLDOWN_MS = 15 * 60 * 1000;
 
 /**
+ * The fallback window for a provider-scoped egress cooldown. Upstream `Retry-After`
+ * always wins; the configured default exists because a request-counted free
+ * tier — the one provider that flags at all — stays refused for hours after
+ * the 15-minute guess this function used before.
+ */
+function providerCooldownFallbackMs(): number {
+  return Math.max(resolvePoolProviderRateLimitCooldownMs(), DEFAULT_PROVIDER_COOLDOWN_MS);
+}
+
+/**
  * Records a provider-scoped 429 cooldown: the volatile per-(pool, provider)
- * flag consulted on every dispatch, plus its durable audit row.
+ * flag consulted on every dispatch, its durable audit row, and the durable
+ * state boot restores from.
  *
  * Both paths that reach this decision — the non-streaming attempt loop and
  * the streaming failure path — call this one function, because each write
@@ -161,9 +187,10 @@ export function flagPoolCooldown(
   const retryAfterMs =
     typeof error.details.retryAfterMs === "number"
       ? error.details.retryAfterMs
-      : DEFAULT_PROVIDER_COOLDOWN_MS;
+      : providerCooldownFallbackMs();
   void poolSelector
     .flagProviderCooldown(poolId, providerId, retryAfterMs, reason)
+    .then((entry) => upsertProviderCooldownMarker(db, poolId, providerId, entry))
     .catch((cause: unknown) => {
       metrics.pool_cooldown_record_failed.inc(1);
       log.warn("pool cooldown flag failed", {

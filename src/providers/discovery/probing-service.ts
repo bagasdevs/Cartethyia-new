@@ -1,4 +1,12 @@
-import { captureProviderExchange, type ProviderExchangeCapture } from "../../transport/dispatch/attempt-finalize";
+import {
+  captureProviderExchange,
+  providerRequestMetadataOnly,
+  type ProviderExchangeCapture,
+} from "../../transport/dispatch/attempt-finalize";
+import {
+  captureDepthMaxBytes,
+  providerCaptureMaxBytes,
+} from "../../transport/dispatch/capture-policy";
 import { globalOrOwnedBy } from "../../persistence/tenant-scope";
 /**
  * Provider probing and model-discovery orchestration.
@@ -184,7 +192,7 @@ export class ProviderProbingService {
     const providerWireRow = await this.loadProviderWireRow(providerId);
     const requiresAccount = providerWireRow?.requiresAccount ?? true;
 
-    const { wireFamily, serviceKind, endpointPath, sourceSurface, capabilityProfile } = await resolveProbeTarget({
+    const { wireFamily, serviceKind, endpointPath, sourceSurface, capabilityProfile, outputLimit } = await resolveProbeTarget({
       db: this.db,
       bundledModelCatalog: this.bundledModelCatalog,
       defaultEndpoints: this.defaultEndpoints,
@@ -221,7 +229,7 @@ export class ProviderProbingService {
       };
     }
 
-    const { probeReasoning, payloadCaptureEnabled } = await loadProbePreferences({
+    const { probeReasoning, payloadCapture } = await loadProbePreferences({
       db: this.db,
       tenantId,
       wireFamily,
@@ -245,6 +253,9 @@ export class ProviderProbingService {
       // over capabilities the route actually has (`prompt_caching`, `tools`,
       // `reasoning`), reporting a healthy provider as broken.
       capabilities: capabilityProfile,
+      // The model row's own output ceiling, so a probe with a max-output
+      // ceiling (OpenCode free) shapes with the model's limit, not a guess.
+      ...(outputLimit == null ? {} : { output_limit: outputLimit }),
     };
 
     const probeSignal = AbortSignal.timeout(30_000);
@@ -273,14 +284,19 @@ export class ProviderProbingService {
       };
       // The same wrapper a real dispatch uses, so the probe reads the model the
       // upstream named from the raw bytes rather than from a synthesized event.
+      // Body capture follows the tenant's mode: `metadata` tees the request
+      // line and stage presence without slicing bodies (the same
+      // `captureBody=false` path a live metadata-mode dispatch uses), `full`
+      // tees bodies at the tenant's own depth cap. `none` still wraps — the
+      // reported-model read is dispatch metadata, not payload retention, and
+      // runs regardless of capture mode.
       const probeFetch = createProbeFetch(
-        // Body capture on, unlike a live dispatch: a probe is one-shot and
-        // operator-initiated, so it exists to be inspected. With it off, the
-        // provider-response tee resolved to null and every probe row reported
-        // the middle two stages as absent — a constant, not a measurement,
-        // which made the stage markers useless for the diagnosis they exist
-        // for. The 256 KiB cap in the tee bounds the cost.
-        captureProviderExchange(outbound.fetch, probeCapture, true),
+        captureProviderExchange(
+          outbound.fetch,
+          probeCapture,
+          payloadCapture.mode === "full",
+          providerCaptureMaxBytes(payloadCapture.depth),
+        ),
       );
       try {
         if (serviceKind === "websearch") {
@@ -506,29 +522,54 @@ export class ProviderProbingService {
       ...(usage ? { usage } : {}),
       ...(tokensPerSec !== undefined ? { tokensPerSec } : {}),
     });
-    if (this.telemetryBuffer && payloadCaptureEnabled) {
-      // All four surfaces, so the row's stage markers mean the same thing here
-      // as they do on a live request: which hop actually produced bytes.
-      const providerRequest = probeCapture?.request ?? null;
-      const providerResponse = await probeCapture?.response.catch(() => null) ?? null;
-      await this.payloadCapture
-        .capture({
-          tenantId,
-          requestId,
-          requestBody: capturedRequest,
-          // `events` is what the *client* receives, so it belongs in the client
-          // surface. Passing it as `responseBody` lit the client bit on probes
-          // whose event list was empty, over a body that was never captured.
-          // The legacy alias is explicitly absent here; `null` leaves bit 8 to
-          // be decided by the real client body alone.
-          responseBody: null,
-          ...(events === undefined ? {} : { clientResponseBody: events }),
-          ...(providerRequest === null ? {} : { providerRequestBody: providerRequest }),
-          ...(providerResponse === null ? {} : { providerResponseBody: providerResponse }),
-          scope: "tenant",
-          tenantOptIn: true,
-        })
-        .catch(() => undefined);
+    if (this.telemetryBuffer && payloadCapture.enabled) {
+      if (payloadCapture.mode === "metadata") {
+        // Stage presence only: the provider request line (method, URL,
+        // headers, body_present/body_bytes) is exactly what `metadata` mode
+        // keeps for a live request. No bodies anywhere.
+        const providerRequest = providerRequestMetadataOnly(probeCapture?.request ?? null);
+        if (providerRequest !== null) {
+          await this.payloadCapture
+            .capture({
+              tenantId,
+              requestId,
+              requestBody: null,
+              responseBody: null,
+              providerRequestBody: providerRequest,
+              retentionMs: payloadCapture.retentionMs,
+              scope: "tenant",
+              tenantOptIn: true,
+            })
+            .catch(() => undefined);
+        }
+      } else {
+        // All four surfaces, so the row's stage markers mean the same thing
+        // here as they do on a live request: which hop actually produced bytes.
+        // Depth and retention are the tenant's own, resolved through the same
+        // preference path a dispatched request uses.
+        const providerRequest = probeCapture?.request ?? null;
+        const providerResponse = await probeCapture?.response.catch(() => null) ?? null;
+        await this.payloadCapture
+          .capture({
+            tenantId,
+            requestId,
+            requestBody: capturedRequest,
+            // `events` is what the *client* receives, so it belongs in the
+            // client surface. Passing it as `responseBody` lit the client bit
+            // on probes whose event list was empty, over a body that was never
+            // captured. The legacy alias is explicitly absent here; `null`
+            // leaves bit 8 to be decided by the real client body alone.
+            responseBody: null,
+            ...(events === undefined ? {} : { clientResponseBody: events }),
+            ...(providerRequest === null ? {} : { providerRequestBody: providerRequest }),
+            ...(providerResponse === null ? {} : { providerResponseBody: providerResponse }),
+            maxBytes: captureDepthMaxBytes(payloadCapture.depth),
+            retentionMs: payloadCapture.retentionMs,
+            scope: "tenant",
+            tenantOptIn: true,
+          })
+          .catch(() => undefined);
+      }
     }
 
     const sample = extractSample(events);

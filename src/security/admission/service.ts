@@ -35,6 +35,14 @@ export class ApiKeyAdmissionService {
     ) => Promise<number | null> | number | null = () => null,
     private readonly persistLifetimeUsage?: LifetimeUsagePersister,
     private readonly freshLifetimeConsumed?: FreshLifetimeConsumedReader,
+    /**
+     * Hidden allowance above each key's concurrency limit. Injected rather
+     * than read from the snapshot so the number is operator configuration,
+     * not something a key can carry about itself.
+     */
+    private readonly concurrencyTolerance?: (
+      tenantId: string,
+    ) => Promise<number | null> | number | null,
   ) {
     if (!store) throw new Error("ApiKeyAdmissionService requires an admission store");
   }
@@ -96,6 +104,15 @@ export class ApiKeyAdmissionService {
     const reservationId = `${apiKeyId}:${now}:${crypto.randomUUID()}`;
     const rawTenantLimit = this.tenantConcurrencyProvider(snapshot.tenant_id);
     const tenantLimit = rawTenantLimit instanceof Promise ? await rawTenantLimit : rawTenantLimit;
+    /*
+     * One number, one place. The allowance used to be overridable per key,
+     * so the tenant-wide value was only the answer for a key that had never
+     * been given one — an operator who raised it in Settings could not tell
+     * why one key still refused early, because the override lived in a modal
+     * the Settings page does not show. It is tenant-wide only now.
+     */
+    const rawTolerance = this.concurrencyTolerance?.(snapshot.tenant_id);
+    const tolerance = rawTolerance instanceof Promise ? await rawTolerance : rawTolerance;
 
     try {
       await this.store.reserve({
@@ -113,6 +130,7 @@ export class ApiKeyAdmissionService {
         lifetimeBudget: snapshot.lifetime_token_budget ?? null,
         lifetimeConsumed: snapshot.lifetime_tokens_consumed ?? 0,
         concurrencyLimit: snapshot.max_concurrent ?? null,
+        concurrencyTolerance: tolerance ?? null,
         tenantId: snapshot.tenant_id,
         tenantConcurrencyLimit: tenantLimit,
         // Fresh lifetime reader is invoked by the store only when the counter

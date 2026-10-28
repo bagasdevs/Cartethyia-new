@@ -1,8 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import {
-  captureProviderExchange,
-  providerCaptureMaxBytes,
-} from "../../src/transport/dispatch/attempt-finalize";
+import { providerCaptureMaxBytes } from "../../src/transport/dispatch/capture-policy";
+import { captureProviderExchange } from "../../src/transport/dispatch/attempt-finalize";
 
 describe("provider capture size follows the capture depth", () => {
   // The tee's cap is the most a Provider Request/Response panel can ever
@@ -10,7 +8,9 @@ describe("provider capture size follows the capture depth", () => {
   // depth to Maximum still saw a quarter-megabyte translated request and an
   // empty raw response on any larger exchange.
   test("the cap grows with the depth", () => {
-    expect(providerCaptureMaxBytes("minimum")).toBe(256 * 1024);
+    // Minimum tees a full MiB in `full` mode: the record budget at this depth
+    // is 1 MiB and a 256 KiB tee clipped bodies the record could keep whole.
+    expect(providerCaptureMaxBytes("minimum")).toBe(1024 * 1024);
     expect(providerCaptureMaxBytes("moderate")).toBe(2 * 1024 * 1024);
     expect(providerCaptureMaxBytes("maximum")).toBe(4 * 1024 * 1024);
   });
@@ -130,5 +130,52 @@ describe("provider exchange capture", () => {
       },
     });
     expect(JSON.stringify(capture.request)).not.toContain("******");
+  });
+});
+
+/**
+ * Metadata-mode provider capture: stage presence + size, no content.
+ *
+ * `captureBody=false` used to slice up to `maxBytes` of the translated request
+ * body and JSON.parse it on every attempt — content the tenant explicitly
+ * declined to retain, paid on every dispatch. Now the request line records
+ * `body_present` + `body_bytes` (UTF-8) and the body is never touched.
+ */
+describe("provider exchange capture — metadata mode", () => {
+  test("records presence and UTF-8 size without slicing or parsing the body", async () => {
+    // CJK-heavy body: 3 bytes per code point, so UTF-8 byte accounting is
+    // distinguishable from code-unit accounting (9 vs 3 here).
+    const body = JSON.stringify({ text: "汉汉汉" });
+    const capture = { request: null, response: Promise.resolve(null) };
+    const fetcher = captureProviderExchange(
+      async () => new Response("{}", { headers: { "content-type": "application/json" } }),
+      capture,
+      false,
+      providerCaptureMaxBytes("maximum"),
+    );
+    await fetcher("https://example.test/v1/chat/completions", { method: "POST", body });
+
+    const request = capture.request as unknown as Record<string, unknown>;
+    expect(request["method"]).toBe("POST");
+    expect(request["url"]).toBe("https://example.test/v1/chat/completions");
+    expect(request["body_present"]).toBe(true);
+    expect(request["body_bytes"]).toBe(Buffer.byteLength(body, "utf8"));
+    // No body content retained.
+    expect(request["body"]).toBeUndefined();
+    // Response tee skipped in metadata mode.
+    expect(await capture.response).toBeNull();
+  });
+
+  test("a request with no body records neither presence nor bytes", async () => {
+    const capture = { request: null, response: Promise.resolve(null) };
+    const fetcher = captureProviderExchange(
+      async () => new Response("{}", { headers: { "content-type": "application/json" } }),
+      capture,
+      false,
+    );
+    await fetcher("https://example.test/v1/models", { method: "GET" });
+    const request = capture.request as unknown as Record<string, unknown>;
+    expect(request["body_present"]).toBeUndefined();
+    expect(request["body_bytes"]).toBeUndefined();
   });
 });

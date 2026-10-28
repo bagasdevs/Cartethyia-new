@@ -10,6 +10,7 @@
 import { redisEvalNumber, type RedisClient } from "../../persistence/redis";
 import { resolveInflightTtlSeconds } from "../../config/timeouts";
 import { log } from "../../observability/logger";
+import { providerRateLimitIsIpScoped } from "../../providers/provider-metadata";
 import {
   COOLDOWN_CLEAR_SCRIPT,
   COOLDOWN_FLAG_SCRIPT,
@@ -65,6 +66,21 @@ function poolInflightTtlSeconds(): number {
 export function effectiveConcurrency(limit: number): number {
   if (!Number.isInteger(limit) || limit < 1) return 0;
   return limit;
+}
+
+/**
+ * In-place Fisher–Yates shuffle. The `random` pool strategy uses it to scatter
+ * each selection across the eligible pools instead of always scanning from a
+ * fixed (or cursor-driven) order, so a burst does not clump onto the first
+ * pool and burn it while siblings sit idle.
+ */
+function shuffleArray<T>(items: T[]): void {
+  for (let i = items.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const swap = items[i]!;
+    items[i] = items[j]!;
+    items[j] = swap;
+  }
 }
 
 function normalizedWeight(weight: number | undefined): number {
@@ -257,6 +273,20 @@ export class NetworkPoolSelector {
     return `${poolId}::${providerId.toLowerCase()}`;
   }
 
+  /**
+   * Seeds one cooldown entry into the local map without touching Redis.
+   *
+   * Boot restore is the only writer: it replays the durable markers the
+   * previous process recorded (`network_pools.provider_cooldowns`, see
+   * `pool-cooldown-store.ts`) so dispatch starts remembering the egresses the
+   * upstream is still refusing. Anything whose window already passed is
+   * dropped by `restore…` before this is reached.
+   */
+  hydrateProviderCooldown(entry: ProxyCooldownEntry): void {
+    enforceCooldownLimit(this.state.cooldowns);
+    this.state.cooldowns.set(this.cooldownKey(entry.poolId, entry.providerId), entry);
+  }
+
   async flagProviderCooldown(
     poolId: string,
     providerId: string,
@@ -308,12 +338,32 @@ export class NetworkPoolSelector {
    * The entry uses the same storage as a cooldown so every reader that already
    * skips a cooling pool skips this one too; `reason` is what the console
    * renders to tell an operator-blocked proxy from a throttled one.
+   *
+   * Refuses to retire an egress for a provider whose limits belong to a
+   * credential. An address-scoped verdict only exists for providers that count
+   * requests by egress (`ipScopedRateLimit` — opencode); for everyone else a
+   * refusal belongs to the account that was dialed, so retiring the pool would
+   * sideline an address that is still serving every sibling account. Callers
+   * keep their own guard, and this one is the backstop that makes the rule
+   * impossible to route around from a new call site.
    */
   async flagProviderBlocked(
     poolId: string,
     providerId: string,
     reason = "Upstream refused this egress address",
   ): Promise<ProxyCooldownEntry> {
+    if (!providerRateLimitIsIpScoped(providerId)) {
+      log.warn("[pool-selector] refused to block an egress for a non-IP-scoped provider", {
+        networkPoolId: poolId,
+        providerId,
+      });
+      return {
+        poolId,
+        providerId: providerId.toLowerCase(),
+        until: Date.now(),
+        reason,
+      };
+    }
     const entry = await this.flagProviderCooldown(poolId, providerId, PROVIDER_BLOCK_MS, reason);
     const blocked: ProxyCooldownEntry = { ...entry, blocked: true };
     // Rewrite both copies with the flag: the cooldown write above is shared
@@ -456,6 +506,38 @@ export class NetworkPoolSelector {
   }
 
   /**
+   * Releases a *retired* egress only, leaving a cooldown intact.
+   *
+   * The two are one key, so `clearProviderCooldown` cannot be reused: it would
+   * also drop a live 429 cooldown and hand a spent address back to dispatch.
+   * This is the correction a 429 probe is entitled to make — the address is
+   * answering its own rate limiter, so it was never retired — and nothing more.
+   *
+   * No-op when the marker is a cooldown, and no-op when there is no marker.
+   */
+  async clearProviderBlockedOnly(poolId: string, providerId: string): Promise<void> {
+    const key = this.cooldownKey(poolId, providerId);
+    const local = this.state.cooldowns.get(key);
+    if (local !== undefined) {
+      if (local.blocked !== true) return;
+      this.state.cooldowns.delete(key);
+    }
+    if (!this.redis) return;
+    try {
+      const raw = await this.redis.get(proxyCooldownKey(poolId, providerId));
+      const entry = raw ? parseCooldownEntry(raw) : undefined;
+      // A missing or unparseable marker says nothing about the address, and
+      // deleting a key we cannot read would drop a cooldown this is forbidden
+      // from touching. Only a marker that names itself a block is released.
+      if (entry?.blocked !== true) return;
+      await this.clearRedisCooldown(poolId, providerId);
+    } catch {
+      // The local copy is already corrected; the Redis mirror stays until its
+      // TTL or the next write.
+    }
+  }
+
+  /**
    * Removes one cooldown marker and its index entry in one atomic step.
    *
    * The two writes must not be separate `DEL` + `SREM`: a crash between them
@@ -564,6 +646,26 @@ export class NetworkPoolSelector {
     if (scored.length === 0) return undefined;
 
     if (!this.redis) {
+      if (rotation?.strategy === "random") {
+        // Random scatter: shuffle the eligible pools and take the first one
+        // with a free slot, falling through like the ordered scans do.
+        shuffleArray(scored);
+        for (const candidate of scored) {
+          if (this.getInflight(candidate.poolId) >= candidate.capacity) continue;
+          const slot =
+            providerCapacity === undefined
+              ? this.acquire(candidate.poolId, candidate.capacity)
+              : this.acquireProvider(
+                  candidate.poolId,
+                  providerId,
+                  candidate.capacity,
+                  providerCapacity,
+                );
+          if (!slot.acquired) continue;
+          return { poolId: candidate.poolId, release: slot.release };
+        }
+        return undefined;
+      }
       if (rotation) {
         // Round robin: scan from the tenant cursor; a pool that is full falls
         // through to the next offset (failover). Only a successful admission
@@ -662,7 +764,13 @@ export class NetworkPoolSelector {
     // Original (pre-sort) index = absolute rotation position and
     // deterministic tie-breaking.
     const absoluteIndex = new Map(withCounts.map((candidate, index) => [candidate.poolId, index]));
-    if (rotation) {
+    if (rotation?.strategy === "random") {
+      // Random scatter: shuffle before the admit loop, which still enforces
+      // capacity and fails over to the next pool exactly like the ordered
+      // scans — but the order each request tries is fresh, so a burst does
+      // not gang up on the first pools in a fixed order.
+      shuffleArray(withCounts);
+    } else if (rotation) {
       // Round robin orders strictly by the tenant cursor; the CAS admit below
       // still enforces capacity, so a full pool falls through to the next
       // offset exactly like account failover.
@@ -715,7 +823,7 @@ export class NetworkPoolSelector {
       // to the next pool, which is the whole point of the ceiling: the request
       // moves to an egress that still has room for this provider.
       if (result !== 1) continue;
-      if (rotation) {
+      if (rotation && rotation.strategy !== "random") {
         advanceRotation(
           this.state.rotationCursors,
           rotation.key,

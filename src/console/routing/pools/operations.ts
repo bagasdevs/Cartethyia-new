@@ -2,6 +2,8 @@
 // behind the routes. Depends only on the contracts and the shared helpers;
 // `routes.ts` is the only HTTP surface.
 import { ConsoleDomainError, requireTenantScope } from "../../shared/errors";
+import { providerRateLimitIsIpScoped } from "../../../providers/provider-metadata";
+import { resolvePoolProviderRateLimitCooldownMs } from "../../../config/cooldowns";
 import type { PoolHealthEvent } from "../../../network/pool-health-machine";
 import type { AccessDecision } from "../../../security/access-control";
 import {
@@ -28,6 +30,7 @@ import {
   type NetworkPoolConfig,
   type NetworkPoolRecord,
   type NetworkPoolResponse,
+  type PoolStatus,
   type PoolBatchProbeResult,
   type PoolSpeedTestResult,
   type PoolStrategySetting,
@@ -194,6 +197,130 @@ export function createNetworkPoolOperations(config: NetworkPoolConfig) {
       }
       return { created, skipped };
     },
+    async createPoolBatch(
+      access: AccessDecision | undefined,
+      requests: readonly CreateNetworkPoolRequest[],
+    ): Promise<{ created: NetworkPoolResponse[]; failed: number }> {
+      const a = requireTenantScope(access, "dashboard:write");
+      let failed = 0;
+      const records: NetworkPoolRecord[] = [];
+      for (const request of requests) {
+        try {
+          const normalizedConfig = normalizePoolConfig(request.config);
+          const endpoint = request.endpoint;
+          validateEndpoint(request.kind, endpoint, config.ssrfPolicy);
+          validateTransportConfig(request.kind, normalizedConfig);
+          validatePoolLimits(request.maxInflight, request.weight);
+          records.push({
+            id: crypto.randomUUID(),
+            kind: request.kind,
+            endpoint,
+            maxInflight: request.maxInflight ?? 10,
+            weight: request.weight ?? 100,
+            status: "active",
+            inflight: 0,
+            consecutiveFailures: 0,
+            tenantId: a.tenantId,
+            createdAt: new Date().toISOString(),
+            ...(request.label === undefined ? {} : { label: request.label }),
+            ...(Object.keys(normalizedConfig).length > 0 ? { config: normalizedConfig } : {}),
+            ...(request.credential === undefined ? {} : { credential: request.credential }),
+            ...(request.credential !== undefined ? { hasCredential: true } : {}),
+            ...(typeof request.quotaBytes === "number" ? { quotaBytes: request.quotaBytes } : {}),
+            ...(request.family === undefined ? {} : { family: request.family }),
+          });
+        } catch {
+          failed += 1;
+        }
+      }
+      // All rows land in one statement: a long paste was one round trip per
+      // proxy, which made a 40-line import take minutes.
+      let created: NetworkPoolResponse[] = [];
+      if (records.length > 0) {
+        if (config.store.createMany) {
+          await config.store.createMany(records);
+        } else {
+          for (const record of records) await config.store.create(record);
+        }
+        created = records.map((record) => sanitizePoolResponse(record));
+        await config.auditSink?.record({
+          access: a,
+          action: "network_pool.created",
+          target: created[0]!.id,
+          detail: { count: created.length, failed },
+        });
+        await config.snapshotInvalidator?.invalidate();
+      }
+      return { created, failed };
+    },
+    async deletePoolBatch(
+      access: AccessDecision | undefined,
+      poolIds: readonly string[],
+    ): Promise<{ deleted: number; failed: number }> {
+      const a = requireTenantScope(access, "dashboard:write");
+      let ok = 0;
+      if (config.store.deleteMany) {
+        ok = await config.store.deleteMany(a.tenantId, poolIds);
+      } else {
+        for (const poolId of poolIds) {
+          try {
+            if (await config.store.delete(a.tenantId, poolId)) ok += 1;
+          } catch {
+            // Missing rows are not failures for a bulk delete.
+          }
+        }
+      }
+      // Cooldown markers and cached agents are best-effort here: the rows are
+      // already gone, so a failed cleanup must not report a failed delete.
+      await Promise.all(
+        poolIds.map(async (poolId) => {
+          await config.poolAgentReleaser?.releasePool(poolId, a.tenantId).catch(() => undefined);
+          await config.poolSelector?.clearPoolCooldowns(poolId).catch(() => undefined);
+        }),
+      );
+      await config.auditSink?.record({
+        access: a,
+        action: "network_pool.deleted",
+        target: poolIds[0] ?? "",
+        detail: { count: ok, failed: poolIds.length - ok },
+      });
+      if (ok > 0) await config.snapshotInvalidator?.invalidate();
+      return { deleted: ok, failed: poolIds.length - ok };
+    },
+    async setPoolStatusBatch(
+      access: AccessDecision | undefined,
+      poolIds: readonly string[],
+      status: PoolStatus,
+    ): Promise<{ updated: number }> {
+      const a = requireTenantScope(access, "dashboard:write");
+      let updated = 0;
+      if (config.store.updateManyStatus) {
+        updated = await config.store.updateManyStatus(a.tenantId, poolIds, status);
+      } else {
+        for (const poolId of poolIds) {
+          try {
+            if (await config.store.update(a.tenantId, poolId, { status })) updated += 1;
+          } catch {
+            // Missing rows are not failures for a bulk status change.
+          }
+        }
+      }
+      // Any mutation can invalidate the cached dial agent; the batch releases
+      // each selected pool's agent so the next dispatch rebuilds fresh.
+      await Promise.all(
+        poolIds.map(async (poolId) => {
+          await config.poolAgentReleaser?.releasePool(poolId, a.tenantId).catch(() => undefined);
+        }),
+      );
+      await config.auditSink?.record({
+        access: a,
+        action: "network_pool.updated",
+        target: poolIds[0] ?? "",
+        detail: { status, count: updated },
+      });
+      if (updated > 0) await config.snapshotInvalidator?.invalidate();
+      return { updated };
+    },
     async createPool(
         access: AccessDecision | undefined,
         request: CreateNetworkPoolRequest,
@@ -255,6 +382,15 @@ export function createNetworkPoolOperations(config: NetworkPoolConfig) {
           validateEndpoint(effectiveKind, effectiveEndpoint, config.ssrfPolicy);
           validateTransportConfig(effectiveKind, normalizedConfig);
           request = { ...request, endpoint: effectiveEndpoint, config: normalizedConfig };
+          // A changed endpoint is a different egress address, so its cooldowns
+          // — like its probe verdict — no longer describe this pool. Drop the
+          // durable markers with the volatile ones, or a replaced proxy would
+          // come back online and immediately be skipped because the previous
+          // address's flags were restored at boot.
+          if (request.endpoint !== undefined && request.endpoint !== existing.endpoint) {
+            await config.poolSelector?.clearPoolCooldowns(poolId).catch(() => undefined);
+            await config.store.dropAllProviderCooldownMarkers?.(a.tenantId, poolId);
+          }
         }
         const updated = await config.store.update(
           a.tenantId,
@@ -380,18 +516,61 @@ export function createNetworkPoolOperations(config: NetworkPoolConfig) {
       // still picked a red one": the red was a colour, not a decision.
       //
       // `blocked` retires the egress for this provider, so the next dispatch
-      // skips it. Anything else clears a previous block, because the address is
+      // skips it. `allowed` clears a previous block, because the address is
       // serving again — an operator who replaced a proxy must not have to find
       // a separate button to un-retire it.
+      //
+      // `blocked` retires the egress — but only for a provider whose limits
+      // follow the address. `flagProviderBlocked` refuses everyone else, so the
+      // verdict reported back is what actually happened, not what was asked.
       if (result.status === "blocked") {
-        await config.poolSelector.flagProviderBlocked(
+        const entry = await config.poolSelector.flagProviderBlocked(
           poolId,
           providerId,
           "Upstream refused this egress address",
         );
-        return { ...result, blockedPool: true };
+        if (entry.blocked === true) {
+          // The retirement claim lands in the mirror and the health history
+          // with its provider named, like every other verdict — an enforced
+          // state the operator cannot see is the "colour, not a decision"
+          // failure mode again.
+          await config.store.recordProviderProbeCooldown?.(a.tenantId, poolId, providerId, {
+            until: entry.until,
+            reason: entry.reason,
+            blocked: true,
+          });
+        }
+        return { ...result, blockedPool: entry.blocked === true };
       }
-      await config.poolSelector.clearProviderCooldown(poolId, providerId);
+      // A measured success releases the address — in rotation and in the
+      // durable mirror the next boot restores from.
+      if (result.status === "allowed") {
+        await config.poolSelector.clearProviderCooldown(poolId, providerId);
+        await config.store.dropProviderCooldownMarker?.(a.tenantId, poolId, providerId, false);
+        return { ...result, blockedPool: false };
+      }
+      // `throttled` (429) proves the address is *serving* — its rate limiter
+      // answered — so a stale "retired" claim is corrected. And the throttle
+      // itself is a measurement: the egress just demonstrated it is out of
+      // allowance, which is exactly when dispatch should skip it **and** the
+      // operator sees why. Flag the same (configured) window a dispatch-side
+      // 429 would, in rotation memory *and* in the durable mirror, plus the
+      // health event the activity panel lists. Only a 429 gap was leaving a
+      // rate-limited pool invisible and unflagged.
+      if (result.status === "throttled") {
+        await config.poolSelector.clearProviderBlockedOnly(poolId, providerId);
+        await config.store.dropProviderCooldownMarker?.(a.tenantId, poolId, providerId, true);
+        if (providerRateLimitIsIpScoped(providerId)) {
+          const durationMs = resolvePoolProviderRateLimitCooldownMs();
+          const reason = "Operator probe measured a provider 429";
+          await config.poolSelector.flagProviderCooldown(poolId, providerId, durationMs, reason);
+          await config.store.recordProviderProbeCooldown?.(a.tenantId, poolId, providerId, {
+            until: Date.now() + durationMs,
+            reason,
+          });
+        }
+      }
+      // `unreachable` learned nothing about the address, so nothing changes.
       return { ...result, blockedPool: false };
     },
     /**

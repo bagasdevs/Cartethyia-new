@@ -32,7 +32,8 @@
 import { and, eq, sql } from "drizzle-orm";
 import { gzipSync, gunzipSync } from "node:zlib";
 import { differsFrom } from "../../persistence/dialect";
-import { readTelemetryEvents, TELEMETRY_EVENT_DIR } from "../../observability/event-log";
+import { TELEMETRY_EVENT_DIR } from "../../observability/event-log";
+import { queryTelemetryEvents as querySqlEvents } from "../../observability/event-query";
 import { appendFile, mkdir } from "node:fs/promises";
 import { getTableColumns, type Column, type SQL, type Table } from "drizzle-orm";
 import type { CartethyiaDatabase } from "../../persistence/db-handle";
@@ -294,7 +295,7 @@ export async function exportBackup(
   const reads = tables.map(async (table) =>
     [
       table,
-      table === telemetryEvents ? await exportEventFile(tenantId) : await exportTable(db, table, tenantId),
+      table === telemetryEvents ? await exportEventFile(db, tenantId) : await exportTable(db, table, tenantId),
     ] as const,
   );
   // Preserve the caller's `tables` order when writing into the output maps so
@@ -373,10 +374,12 @@ export function decompressBackup(bytes: Uint8Array): string {
  * backup contract still names. The table is no longer written, so reading it
  * would export nothing.
  */
-async function exportEventFile(tenantId: string): Promise<readonly BackupRow[]> {
-  const events = await readTelemetryEvents();
-  return events
-    .filter((event) => event.tenantId === tenantId)
+async function exportEventFile(db: CartethyiaDatabase, tenantId: string): Promise<readonly BackupRow[]> {
+  // The SQL table is the durable record now, and it is tenant-scoped and
+  // retained by the same rule as the raw files — so the export reads it
+  // instead of scanning every raw file and filtering by tenant afterwards.
+  const page = await querySqlEvents(db, { tenantId, limit: MAX_ROWS_PER_TABLE });
+  return page.events
     .slice(0, MAX_ROWS_PER_TABLE)
     .map((event) => {
       const row: BackupRow = {};
@@ -465,13 +468,15 @@ function createdAtIso(value: unknown): string {
  * so the two sides are comparable regardless of how the driver types them.
  */
 /** Natural keys already present in the event file, so a re-import skips them. */
-async function existingEventFileKeys(rows: readonly BackupRow[]): Promise<Set<string>> {
+async function existingEventFileKeys(db: CartethyiaDatabase, tenantId: string, rows: readonly BackupRow[]): Promise<Set<string>> {
   const wanted = new Set(rows.map((row) => row.request_id).filter((id): id is string => typeof id === "string"));
   if (wanted.size === 0) return new Set();
-  const events = await readTelemetryEvents();
+  // One indexed query for the ids being restored, instead of reading every
+  // raw file to test membership. `id = request_id`, so the unique index serves
+  // this directly.
+  const page = await querySqlEvents(db, { tenantId, requestIds: [...wanted] });
   return new Set(
-    events
-      .filter((event) => wanted.has(event.requestId))
+    page.events
       .map((event) => `${event.tenantId ?? ""}\u0000${event.requestId}\u0000${event.createdAt}`),
   );
 }
@@ -554,6 +559,7 @@ async function insertRows(
     readonly keyOf?: (row: BackupRow) => string;
     readonly conflictTarget?: readonly Column[];
     readonly ignoreConflicts?: boolean;
+    readonly tenantId?: string;
   } = {},
 ): Promise<number> {
   // Normalise rows up front: filter skips, drop empty-value rows (no
@@ -565,6 +571,7 @@ async function insertRows(
       continue;
     }
     const values = toValues(table, row);
+    if (options.tenantId !== undefined && "tenantId" in values) values.tenantId = options.tenantId;
     if (Object.keys(values).length === 0) continue;
     prepared.push(values);
   }
@@ -823,6 +830,7 @@ export async function applyRestore(
           : entry.rows;
       restored[tableName(table)] = await insertRows(scoped, table, rows, {
         ...(ownership.kind === "authored" ? { conflictTarget: ownership.keyColumns } : {}),
+        tenantId,
       });
     }
 
@@ -832,8 +840,12 @@ export async function applyRestore(
       const entry = validation.tables.get(table);
       if (entry === undefined) continue;
       if (table === telemetryEvents) {
-        const existing = await existingEventFileKeys(entry.rows);
-        const fresh = entry.rows.filter((row) => !existing.has(telemetryKey(row)));
+        // The payload rows are remapped to the restoring tenant before the
+        // idempotency filter runs, so the dedupe keys and the appended file
+        // rows are owned by the receiving tenant, not the backup's tenant.
+        const remapped = entry.rows.map((row) => ({ ...row, tenant_id: tenantId }));
+        const existing = await existingEventFileKeys(db, tenantId, entry.rows);
+        const fresh = remapped.filter((row) => !existing.has(telemetryKey(row)));
         await appendRestoredEvents(fresh);
         restored[tableName(table)] = fresh.length;
         skipped[tableName(table)] = entry.rows.length - fresh.length;
@@ -845,11 +857,12 @@ export async function applyRestore(
             telemetryUsageTotals.entityId,
           ],
           ignoreConflicts: true,
+          tenantId,
         });
         restored[tableName(table)] = restoredCount;
         skipped[tableName(table)] = entry.rows.length - restoredCount;
       } else {
-        restored[tableName(table)] = await insertRows(scoped, table, entry.rows);
+        restored[tableName(table)] = await insertRows(scoped, table, entry.rows, { tenantId });
       }
     }
   });

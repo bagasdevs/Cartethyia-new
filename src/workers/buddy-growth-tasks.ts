@@ -27,23 +27,11 @@ import { buddyAccountUid } from "../providers/integrations/buddy/buddy-oauth-sha
 import {
   adoptFirstBuddy,
   agreeBuddyAgreement,
-  BUDDY_REDEEM_TIERS,
-  claimBuddyCompensation,
-  claimBuddyGift,
-  claimBuddyTravel,
-  claimBuddyTrial,
-  departBuddyTravel,
-  drawBuddyLottery,
   readBuddyFirstTask,
   readBuddyInfo,
-  readBuddyLotteryChances,
-  readBuddyRedemption,
-  readBuddyTravelStatus,
-  redeemBuddyStreakTier,
   useBuddyMakeupCard,
   type BuddyGrowthCall,
   type BuddyGrowthResult,
-  type BuddyRedeemTier,
 } from "../providers/integrations/buddy/buddy-growth-shared";
 import { fetchBuddyRequestUsage } from "../providers/integrations/buddy/buddy-usage-shared";
 import { saveBuddyUsageSnapshots } from "../providers/integrations/buddy/buddy-usage-store";
@@ -55,11 +43,7 @@ import type { FetchLike } from "../providers/quota/quota-contracts";
 /** The task names an operator can switch off. */
 export const BUDDY_TASK_NAMES = [
   "buddy-streak",
-  "buddy-redeem",
-  "buddy-lottery",
-  "buddy-travel",
   "buddy-adopt",
-  "buddy-trial",
   "buddy-activity-report",
 ] as const;
 export type BuddyTaskName = (typeof BUDDY_TASK_NAMES)[number];
@@ -263,58 +247,6 @@ export function buddyStreakTask(deps: BuddyTaskDeps) {
 }
 
 /**
- * Milestone redeem: claim the highest tier the streak has unlocked and not yet
- * claimed this month.
- */
-export function buddyRedeemTask(deps: BuddyTaskDeps) {
-  return runTask(deps, "buddy-redeem", async (call) => {
-    const status = await readBuddyRedemption(call);
-    if (status === null) return null;
-    // Highest eligible tier first: tiers are the same reward scaled, and a day
-    // that could claim 28d should not spend itself on 7d.
-    const tier = [...BUDDY_REDEEM_TIERS].reverse().find((candidate) => {
-      const state = status.tiers[candidate];
-      return state === "available" || state === "unknown";
-    }) as BuddyRedeemTier | undefined;
-    if (tier === undefined) return null;
-    return redeemBuddyStreakTier(call, tier);
-  });
-}
-
-/** Lottery: spend every chance the redeemed tier granted. */
-export function buddyLotteryTask(deps: BuddyTaskDeps) {
-  return runTask(deps, "buddy-lottery", async (call) => {
-    const chances = await readBuddyLotteryChances(call);
-    if (chances === null || chances <= 0) return null;
-    // Bounded: a large balance is still only one task slot, and burning it in a
-    // tight loop is exactly the burst the upstream risk-gates on.
-    let last: BuddyGrowthResult | null = null;
-    for (let draw = 0; draw < Math.min(chances, 10); draw += 1) {
-      last = await drawBuddyLottery(call);
-      if (last.state !== "claimed") break;
-    }
-    return last;
-  });
-}
-
-/** Cat travel: depart an idle cat, claim an arrived one. */
-export function buddyTravelTask(deps: BuddyTaskDeps) {
-  return runTask(deps, "buddy-travel", async (call) => {
-    const status = await readBuddyTravelStatus(call);
-    if (status === null) return null;
-    if (status.state === "arrived") {
-      if (status.recordId === null) return null;
-      return claimBuddyTravel(call, status.recordId);
-    }
-    if (status.state === "idle" && !status.dailyLimitReached) {
-      return departBuddyTravel(call);
-    }
-    // In flight, or today's departure already used: an expected state.
-    return null;
-  });
-}
-
-/**
  * First-buddy adoption: accept the agreement, then adopt.
  *
  * Gated on the task actually being offered and unlocked — adopting blind writes
@@ -333,17 +265,6 @@ export function buddyAdoptTask(deps: BuddyTaskDeps) {
   });
 }
 
-/** Trial pack, newcomer gift, and activity compensation — claim if present. */
-export function buddyTrialTask(deps: BuddyTaskDeps) {
-  return runTask(deps, "buddy-trial", async (call) => {
-    const trial = await claimBuddyTrial(call);
-    // The gift and the compensation are independent once-per-account claims;
-    // both answer a business error once taken, which is not a failure here.
-    await claimBuddyGift(call);
-    await claimBuddyCompensation(call);
-    return trial;
-  });
-}
 /**
  * Growth-activity report: the `/v2/report` batch that lights the login streak and
  * scores the daily growth event.

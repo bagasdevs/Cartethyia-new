@@ -31,7 +31,11 @@ export function openUrl(url: string): Promise<void> {
  */
 export function launchBackgroundWithStatus(
   args: readonly string[],
-  options: { readonly signalPath: string; readonly timeoutMs?: number } = { signalPath: "" },
+  options: {
+    readonly signalPath: string;
+    readonly timeoutMs?: number;
+    readonly controllerHandoff?: { readonly token: string; readonly parentPid: number };
+  } = { signalPath: "" },
 ): Promise<string> {
   return new Promise<string>((resolve, reject) => {
     const signalPath = options.signalPath;
@@ -48,7 +52,14 @@ export function launchBackgroundWithStatus(
       else resolve(url ?? "");
     };
 
-    const env = { ...process.env, CARTETHYIA_TRAY_STARTUP_SIGNAL: signalPath };
+    const env = {
+      ...process.env,
+      CARTETHYIA_TRAY_STARTUP_SIGNAL: signalPath,
+      ...(options.controllerHandoff ? {
+        CARTETHYIA_CONTROLLER_TOKEN: options.controllerHandoff.token,
+        CARTETHYIA_CONTROLLER_PARENT_PID: String(options.controllerHandoff.parentPid),
+      } : {}),
+    };
     spawnBackground(args, env);
 
     const timer = setInterval(() => {
@@ -68,7 +79,6 @@ export function launchBackgroundWithStatus(
         // A partially written file is read again on the next tick.
       }
     }, 150);
-    timer.unref?.();
   });
 }
 
@@ -103,7 +113,10 @@ function spawnBackground(args: readonly string[], env: NodeJS.ProcessEnv): void 
   const launcher = resolvePackagePath("scripts", "cli", "tray", "hidden-window.vbs");
   const child = spawn(
     "wscript.exe",
-    ["//nologo", launcher, process.execPath, ...args],
+    // PACKAGE_ROOT first: the VBS sets it as the child's working directory.
+    // `cwd` on this spawn does not reach the grandchild, and wscript.exe hands
+    // its own inherited directory to the child instead.
+    ["//nologo", launcher, PACKAGE_ROOT, process.execPath, ...args],
     { cwd: PACKAGE_ROOT, detached: true, stdio: "ignore", windowsHide: true, env },
   );
   child.unref();

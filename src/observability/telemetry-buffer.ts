@@ -6,6 +6,8 @@ import { DEFAULT_BOUNDS } from "../config/network";
 import { type SourceSurface, type UsageRecord } from "../protocol/canonical-model";
 import { log } from "./logger";
 import { scrubSecrets } from "./redaction";
+import { clientNameFromUserAgent } from "./client-name";
+
 
 /**
  * Buffered durable telemetry writer. Coalesces per-request telemetry into
@@ -103,6 +105,12 @@ function telemetryEventRow(event: TelemetryEventInput) {
   // `cachedInputTokens` stays — `health` aggregates it into the Overview
   // cache-hit rate.
   return {
+    // Stable identity: the request's own id. Retries reuse the materialized
+    // row (the buffer retries the same rows across its five attempts), and
+    // the (tenant_id, request_id) unique boundary makes a re-drain or a
+    // cross-process race converge to one row via ON CONFLICT DO NOTHING
+    // instead of double-charging.
+    id: event.requestId,
     tenantId: event.tenantId,
     requestId: event.requestId,
     // Stamped here, not by the reader. A row without it has no real time, and a
@@ -115,6 +123,8 @@ function telemetryEventRow(event: TelemetryEventInput) {
     endpoint: event.endpoint ?? null,
     apiKeyId: event.apiKeyId ?? null,
     userAgent: event.userAgent ?? null,
+    // Canonical client grouping, stamped once so SQL breakdowns group by it.
+    clientName: clientNameFromUserAgent(event.userAgent),
     clientIp: event.clientIp ?? null,
     providerId: event.providerId ?? null,
     accountId: event.accountId ?? null,
@@ -153,6 +163,9 @@ export interface TelemetryBatchBufferOptions {
   readonly maxBatch?: number;
   readonly maxItems?: number;
   readonly maxBytes?: number;
+  /** Test seam: a deterministic hook before a retry timer is installed. */
+  readonly onRetry?: (attempt: number) => void | Promise<void>;
+  readonly store?: Pick<DrizzleTelemetryStore, "insertEvents">;
 }
 
 /** Cooldown between `[telemetry] failed to record` log lines during a sustained drain outage. */
@@ -166,8 +179,8 @@ const DRAIN_RETRY_MAX_MS = 1_000;
 import { exponentialBackoff, type BackoffOptions } from "../network/backoff";
 
 /** Exponential retry delay for the `attempt`-th retry, clamped to the ceiling. */
-function drainRetryDelayMs(attempt: number): number {
-  const options: BackoffOptions = { baseDelayMs: DRAIN_RETRY_BASE_MS, maxDelayMs: DRAIN_RETRY_MAX_MS };
+function drainRetryDelayMs(attempt: number, baseDelayMs = DRAIN_RETRY_BASE_MS): number {
+  const options: BackoffOptions = { baseDelayMs, maxDelayMs: DRAIN_RETRY_MAX_MS };
   return exponentialBackoff(attempt, options);
 }
 
@@ -192,6 +205,20 @@ export function adaptiveFlushIntervalMs(
   return Math.max(ADAPTIVE_FLUSH_MIN_MS, Math.round(baseMs * (1 - fill)));
 }
 
+/** The telemetry backlog's current shape — see {@link TelemetryBatchBuffer.snapshot}. */
+export interface TelemetryBacklogSnapshot {
+  /** Queued events waiting for the next drain. */
+  readonly items: number;
+  /** Estimated queued bytes. */
+  readonly bytes: number;
+  readonly itemCapacity: number;
+  readonly byteCapacity: number;
+  /** Whether a drain is currently in flight. */
+  readonly flushing: boolean;
+  /** Consecutive fully-failed drains; 0 when healthy. */
+  readonly drainFailureStreak: number;
+}
+
 export class TelemetryBatchBuffer {
   /**
    * One entry per queued event. `bytes` is a conservative enqueue-time
@@ -199,16 +226,17 @@ export class TelemetryBatchBuffer {
    * JSON serialization allocation on every request.
    */
   private readonly queue: Array<{ event: TelemetryEventInput; bytes: number }> = [];
-  private readonly store: DrizzleTelemetryStore;
+  private readonly store: Pick<DrizzleTelemetryStore, "insertEvents">;
   private readonly flushIntervalMs: number;
   private readonly maxBatch: number;
   private readonly maxItems: number;
   private readonly maxBytes: number;
+  private readonly onRetry: ((attempt: number) => void | Promise<void>) | undefined;
   private queuedBytes = 0;
   private timer: ReturnType<typeof setTimeout> | undefined;
   private stopped = false;
   private flushing = false;
-  private flushWait: Promise<void> = Promise.resolve();
+  private flushWait: Promise<boolean> = Promise.resolve(true);
   private lastDrainOutageAt = 0;
   private suppressedDrainOutages = 0;
   /** Consecutive fully-failed drains; drives the cross-drain outage backoff. */
@@ -220,11 +248,12 @@ export class TelemetryBatchBuffer {
     db: CartethyiaDatabase,
     opts: TelemetryBatchBufferOptions = {},
   ) {
-    this.store = new DrizzleTelemetryStore(db);
+    this.store = opts.store ?? new DrizzleTelemetryStore(db);
     this.flushIntervalMs = opts.flushIntervalMs ?? 500;
     this.maxBatch = opts.maxBatch ?? 500;
     this.maxItems = opts.maxItems ?? 10000;
     this.maxBytes = opts.maxBytes ?? DEFAULT_BOUNDS.maxTelemetryQueueBytes;
+    this.onRetry = opts.onRetry;
     this.scheduleNextFlush(this.flushIntervalMs);
   }
 
@@ -246,10 +275,31 @@ export class TelemetryBatchBuffer {
     if (typeof this.timer.unref === "function") this.timer.unref();
   }
 
-  /** Non-blocking; drops the event (and counts it) when the buffer is full by count or bytes. */
+  /**
+   * The backlog's current shape, for gauges and the health surface.
+   *
+   * The buffer already drops on its bounds, but a drop nobody can see is
+   * indistinguishable from "no traffic" — an operator watching the console
+   * during an outage would see flat telemetry and conclude nothing was
+   * happening, when in fact the queue was full and discarding.
+   */
+  snapshot(): TelemetryBacklogSnapshot {
+    return {
+      items: this.queue.length,
+      bytes: this.queuedBytes,
+      itemCapacity: this.maxItems,
+      byteCapacity: this.maxBytes,
+      flushing: this.flushing,
+      // The streak is the interesting one: a single failed drain is noise, a
+      // rising streak means the database is refusing writes and every event
+      // buffered past the cap is being dropped.
+      drainFailureStreak: this.drainFailureStreak,
+    };
+  }
+
   enqueue(event: TelemetryEventInput): void {
     const bytes = estimateTelemetryEventBytes(event);
-    if (this.queue.length >= this.maxItems || this.queuedBytes + bytes > this.maxBytes) {
+    if (this.stopped || this.queue.length >= this.maxItems || this.queuedBytes + bytes > this.maxBytes) {
       metrics.cartethyia_telemetry_dropped_total.inc();
       return;
     }
@@ -266,8 +316,8 @@ export class TelemetryBatchBuffer {
     }
   }
 
-  /** Drains the buffer with a single multi-row insert. Idempotent, and safe
-   *  against concurrent invocation: overlapping callers await the in-flight
+  /** Drains the buffer with a single multi-row insert. Safe against concurrent
+   *  invocation: overlapping callers await the in-flight
    *  drain and then re-enter until the queue is fully empty. Shutdown callers
    *  rely on this loop so they can observe an "empty queue" postcondition
    *  before closing the database pool, instead of returning immediately when
@@ -284,13 +334,16 @@ export class TelemetryBatchBuffer {
       }
       this.flushing = true;
       this.flushWait = (async () => {
+        let completed: boolean;
         try {
-          await this.drain();
+          completed = await this.drain();
         } finally {
           this.flushing = false;
         }
+        return completed;
       })();
-      await this.flushWait;
+      const completed = await this.flushWait;
+      if (!completed) return;
     }
   }
 
@@ -306,7 +359,23 @@ export class TelemetryBatchBuffer {
       clearTimeout(this.timer);
       this.timer = undefined;
     }
-    if (options?.flush) await this.flush();
+    if (options?.flush) {
+      await this.flush();
+    } else if (this.flushing) {
+      // A retry interrupted by stop returns its in-flight batch to the head
+      // of the queue. Await that handoff before accounting for a drop.
+      await this.flushWait;
+    }
+    this.dropRemaining();
+  }
+
+  /** Drops only after shutdown has made the owner/timer unavailable. */
+  private dropRemaining(): void {
+    if (this.queue.length === 0) return;
+    metrics.cartethyia_telemetry_dropped_total.inc(this.queue.length);
+    metrics.cartethyia_telemetry_buffered.inc(-this.queue.length);
+    this.queue.length = 0;
+    this.queuedBytes = 0;
   }
 
   /**
@@ -320,8 +389,8 @@ export class TelemetryBatchBuffer {
     return this.flush();
   }
 
-  private async drain(): Promise<void> {
-    if (this.queue.length === 0) return;
+  private async drain(): Promise<boolean> {
+    if (this.queue.length === 0) return true;
     const batch = this.queue.splice(0, Math.min(this.queue.length, this.maxBatch));
     // Reuse the enqueue-time serialized sizes — no second JSON pass.
     const batchBytes = batch.reduce((sum, item) => sum + item.bytes, 0);
@@ -335,10 +404,23 @@ export class TelemetryBatchBuffer {
         // drains probe the database less and less often. Unref'd so a
         // mid-shutdown backoff cannot hold the event loop open.
         const { promise, resolve } = Promise.withResolvers<void>();
-        const backoff = setTimeout(resolve, drainRetryDelayMs(this.drainFailureStreak + attempt - 1));
+        if (this.stopped) {
+          this.queue.unshift(...batch);
+          this.queuedBytes += batchBytes;
+          return false;
+        }
+        await this.onRetry?.(attempt);
+        const backoff = setTimeout(
+          resolve,
+          drainRetryDelayMs(this.drainFailureStreak + attempt - 1),
+        );
         if (typeof backoff.unref === "function") backoff.unref();
         await promise;
-        if (this.stopped) return;
+        if (this.stopped) {
+          this.queue.unshift(...batch);
+          this.queuedBytes += batchBytes;
+          return false;
+        }
       }
       try {
         await this.store.insertEvents(rows);
@@ -346,7 +428,7 @@ export class TelemetryBatchBuffer {
         this.drainFailureStreak = 0;
         this.drainBlockedUntil = 0;
         metrics.cartethyia_telemetry_buffered.inc(-batch.length);
-        return;
+        return true;
       } catch (error) {
         if (attempt === 0) firstError = error;
         lastError = error;
@@ -358,6 +440,7 @@ export class TelemetryBatchBuffer {
     this.logDrainOutage(lastError, firstError);
     metrics.cartethyia_telemetry_dropped_total.inc(batch.length);
     metrics.cartethyia_telemetry_buffered.inc(-batch.length);
+    return true;
   }
 
   /**

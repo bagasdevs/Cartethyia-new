@@ -1,11 +1,13 @@
 /**
  * Public source and distribution links, in one place.
  *
- * `risunCode/Cartethyia` is the primary repository. GitHub hid it from public
- * view after automated star activity was flagged as manipulation, so
- * `risunCodex/Cartethyia` is published as a mirror with the same history — the
- * split button surfaces both so a reader who cannot reach the primary still
- * has somewhere to go.
+ * `risunCodex/Cartethyia` is the primary repository and the destination of
+ * every public surface — header links, the GitHub badge, and the star/fork
+ * counts. The original `risunCode/Cartethyia` was hidden from public view by
+ * GitHub after automated star activity was flagged as manipulation; it is kept
+ * here as `GITHUB_ALT_REPO` so operators who still have access keep a path to
+ * the historical repository, and so a rename cannot drop that link entirely.
+ * It is offered as a secondary menu entry, never as the visible default.
  *
  * These were declared twice: one copy in the console shell built them from a
  * repo slug, and the share page's badge component carried its own hardcoded URL
@@ -14,19 +16,17 @@
  * at the old project, so every link and every badge resolves from here.
  */
 
-/** The primary repository. Currently hidden from public view by GitHub. */
-export const GITHUB_REPO = "risunCode/Cartethyia";
+/** The primary repository, publicly reachable. */
+export const GITHUB_REPO = "risunCodex/Cartethyia";
 export const GITHUB_REPO_URL = `https://github.com/${GITHUB_REPO}`;
 export const GITHUB_RELEASES_URL = `https://github.com/${GITHUB_REPO}/releases`;
 
 /**
- * The published alternative. Same history, different account, reachable.
- *
- * Star and fork counts are read from this one: the primary's badges would
- * render zero or fail to load while the repository is hidden, and a badge that
- * reports a number the reader cannot act on is worse than no badge.
+ * The hidden original. Same history, different account, kept as a fallback
+ * for anyone who still has access and so a rename does not drop the historical
+ * link entirely.
  */
-export const GITHUB_ALT_REPO = "risunCodex/Cartethyia";
+export const GITHUB_ALT_REPO = "risunCode/Cartethyia";
 export const GITHUB_ALT_REPO_URL = `https://github.com/${GITHUB_ALT_REPO}`;
 export const GITHUB_ALT_RELEASES_URL = `https://github.com/${GITHUB_ALT_REPO}/releases`;
 
@@ -58,21 +58,21 @@ export interface SourceLink {
 /**
  * The split button's menu, primary destination first.
  *
- * The alternative leads because the primary is hidden: leading with a
- * link that may not load defeats the purpose of offering a choice.
+ * The primary leads: it is the repository the badge counts and the one a
+ * reader should land on. The alternative follows as a labelled mirror.
  */
 export const SOURCE_LINKS: readonly SourceLink[] = [
-  {
-    id: "github-alt",
-    label: "GitHub (alt)",
-    href: GITHUB_ALT_REPO_URL,
-    hint: "Mirror — star, fork, and releases",
-  },
   {
     id: "github",
     label: "GitHub",
     href: GITHUB_REPO_URL,
     hint: "Primary repository",
+  },
+  {
+    id: "github-alt",
+    label: "GitHub (alt)",
+    href: GITHUB_ALT_REPO_URL,
+    hint: "Historical mirror — original account",
   },
   {
     id: "gitlab",

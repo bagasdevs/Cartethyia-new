@@ -6,7 +6,7 @@ import { parseToolDefinition } from "../dialects";
 import { canContainToolResult } from "../../../protocol/canonical-model";
 import { MessagesLedgerError } from "./errors";
 import { finiteNumber, stringValue } from "../../../protocol/codecs";
-import { LEVEL_TO_BUDGET } from "../../translation/thinking";
+import { LEVEL_TO_BUDGET } from "../../../protocol/translation/thinking";
 
 export interface MessagesParseOptions {
   /** Explicit Claude model generation (for example `4.6` or `4.7`). */
@@ -145,8 +145,10 @@ export function parseBlock(value: unknown): ContentPart {
     const thinking = stringValue(value.thinking) ? value.thinking : "";
     return {
       kind: "reasoning",
+      // Readable thinking lives in `payload` only. Duplicating it into
+      // `summary` too emitted the same text twice on surfaces that carry both
+      // channels (Responses `reasoning_text` + `reasoning_summary_text`).
       payload: thinking,
-      summary: thinking,
       ...(stringValue(value.signature) ? { signature: value.signature } : {}),
     };
   }

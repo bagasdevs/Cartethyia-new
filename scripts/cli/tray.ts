@@ -1,15 +1,15 @@
-import { isNewerRelease } from "../../src/console/updates/version-compare";
 import { resolvePackagePath } from "../../src/config/package-paths";
 import { resolvePort } from "../../src/config/runtime";
-import { ensureDrainToken } from "./instance";
+import { ensureDrainToken, attachGateway, stopAttachedGateway, type RunningGateway } from "./instance";
 import { startGateway } from "./gateway";
 import { stopGateway } from "./gateway";
-import { readInstalledVersion, readLatestPublishedVersion } from "./version";
+import { readInstalledVersion } from "./version";
 import { reportTrayStartup } from "./startup-signal";
 import { createTray } from "./tray/index";
 import { openUrl } from "./background";
 import { exportBackup, resetConsoleAccount } from "./admin";
-import { printUpdateInstructions } from "./update";
+import { acquireController, inheritedControllerHandoff } from "./controller";
+import { restoreControllerAfterFailedHandoff } from "./controller";
 
 /**
  * Runs the gateway with a tray icon. The tray is platform-specific (`tray/`):
@@ -32,26 +32,63 @@ import { printUpdateInstructions } from "./update";
 const TRAY_HEALTH_POLL_MS = 10_000;
 
 /**
- * Consecutive misses to forgive before a dead gateway closes the tray.
+ * How long the gateway must be unreachable before the tray closes.
  *
- * One refusal is not a stopped gateway — a probe can lose a race with startup
- * or a slow request — and closing the icon on one would make startup feel
- * random.
+ * A count of consecutive misses was the wrong shape: a gateway that is
+ * answering, but slowly, misses every probe exactly like a gateway that is
+ * gone. Under load — a large prompt, a synchronous GC — `/health` cannot
+ * answer inside the probe timeout, so three polls in a row missed and the tray
+ * closed itself while the gateway was still serving. `carte --tray` looked
+ * fine only because it starts idle and never carries that load.
+ *
+ * Bounded by wall-clock instead: a gateway that is truly gone stops being
+ * reachable immediately and stays that way, so it still closes the tray
+ * promptly, while a gateway that is merely busy keeps answering often enough
+ * to reset the clock. The window is long enough to span a request that runs
+ * to the deadline.
  */
-const TRAY_HEALTH_MISSES_BEFORE_CLOSE = 3;
+const TRAY_HEALTH_UNREACHABLE_BEFORE_CLOSE_MS = 120_000;
+
+/**
+ * How long one health probe waits before counting as a miss.
+ *
+ * Short probes are the other half of the same bug: `/health` is served by the
+ * same process that is busy streaming a response, so a 2 s budget failed on a
+ * busy gateway that was perfectly healthy. This is far longer than a healthy
+ * answer takes and far shorter than the poll interval, so it cannot overlap
+ * the next probe.
+ */
+const TRAY_HEALTH_PROBE_TIMEOUT_MS = 15_000;
 
 export async function startTray(): Promise<void> {
+  const handoff = inheritedControllerHandoff();
+  const controller = acquireController("tray", handoff);
+  const releaseController = (): void => controller.release();
+  const failedHandoff = (): void => {
+    if (handoff) restoreControllerAfterFailedHandoff(handoff);
+  };
+  process.once("exit", failedHandoff);
+  process.once("exit", releaseController);
+  try {
+    await runTray();
+  } finally {
+    process.removeListener("exit", failedHandoff);
+    controller.release();
+    process.removeListener("exit", releaseController);
+  }
+}
+
+async function runTray(): Promise<void> {
   const port = resolvePort();
   const drainToken = ensureDrainToken();
   const dashboardUrl = `http://127.0.0.1:${port}/console`;
-  const repositoryUrl = "https://github.com/risunCode/cartethyia";
+  const releasesUrl = "https://github.com/risunCodex/Cartethyia/releases";
   const currentVersion = await readInstalledVersion();
 
   let gateway: Bun.Subprocess | null = null;
+  let adoptedGateway: RunningGateway | null = null;
   let closing = false;
-  let busy = false;
   let resetArmed = false;
-  let latestVersion: string | null = null;
   let closePromise: Promise<void> | undefined;
 
   const tray = createTray({
@@ -64,7 +101,11 @@ export async function startTray(): Promise<void> {
     ),
     tooltip: `Cartethyia ${currentVersion}`,
     items: [
-      { kind: "action", id: "update", title: `Cartethyia ${currentVersion} \u00b7 checking\u2026`, enabled: true },
+      // Version row is informational; clicking it opens the releases page so
+      // the operator can decide for themselves. No background check: the tray
+      // used to poll the registry on open and the result was a cue the user
+      // did not ask for.
+      { kind: "action", id: "version", title: `Cartethyia ${currentVersion}`, enabled: true },
       { kind: "separator" },
       { kind: "action", id: "console", title: `Open Console \u00b7 ${dashboardUrl}` },
       { kind: "action", id: "reset", title: "Reset console password" },
@@ -83,52 +124,23 @@ export async function startTray(): Promise<void> {
       const current: Bun.Subprocess | null = gateway;
       gateway = null;
       if (current) await stopGateway(current, port, drainToken);
+      else if (adoptedGateway !== null) await stopAttachedGateway(adoptedGateway, drainToken);
       await tray.close();
       process.exitCode = exitCode;
     })();
     return closePromise;
   };
 
-  const refreshVersion = async (): Promise<void> => {
-    const fetched = await readLatestPublishedVersion();
-    if (closing) return;
-    latestVersion = fetched;
-    if (fetched === null) {
-      tray.update("update", `Cartethyia ${currentVersion} \u00b7 check for updates`, true);
-      return;
-    }
-    const newer = isNewerRelease(currentVersion, fetched);
-    tray.update(
-      "update",
-      newer
-        ? `Cartethyia ${currentVersion} \u00b7 update to ${fetched}`
-        : `Cartethyia ${currentVersion} \u00b7 up to date`,
-      // Always clickable: the row opens the repository, and only offers the
-      // update command when there is something newer.
-      true,
-    );
-  };
-
-  const runUpdate = async (): Promise<void> => {
-    if (busy) return;
-    busy = true;
-    const latest = await readLatestPublishedVersion();
-    await close();
-    printUpdateInstructions(currentVersion, latest);
-    // The tray has no terminal of its own, so these instructions are only
-    // visible when it was started from one. Hold that terminal open long
-    // enough to copy the command, then exit.
-    await new Promise<void>((resolve) => setTimeout(resolve, 180_000));
-    process.exit(0);
-  };
-
   async function handleSelect(id: string): Promise<void> {
     if (closing) return;
     if (id === "exit") return void (await close());
     if (id === "console") return void (await openUrl(dashboardUrl));
+    if (id === "version") return void (await openUrl(releasesUrl));
     if (id === "backup") {
       const result = await exportBackup(port, drainToken);
-      if (result !== null) {
+      if ("error" in result) {
+        console.error(result.error);
+      } else {
         console.log(
           `Backup written to ${result.path} (${(result.bytes / 1024).toFixed(1)} KiB). Telemetry is not included.`,
         );
@@ -148,14 +160,6 @@ export async function startTray(): Promise<void> {
       await resetConsoleAccount(port, drainToken);
       return;
     }
-    if (id === "update") {
-      // Nothing to install: the row is the way to the repository instead.
-      if (latestVersion === null || !isNewerRelease(currentVersion, latestVersion)) {
-        await openUrl(repositoryUrl);
-        return;
-      }
-      await runUpdate();
-    }
   }
 
   process.once("SIGINT", () => void close());
@@ -169,16 +173,19 @@ export async function startTray(): Promise<void> {
     // down too and "Hide to tray" left nothing serving. `stopGateway` drains
     // over HTTP before it ever reaches for `kill()`, so detaching costs the
     // exit path nothing: the tray can still stop the gateway on Exit.
-    gateway = await startGateway(port, drainToken, { detached: true });
+    adoptedGateway = await attachGateway(port, drainToken);
+    if (adoptedGateway === null) gateway = await startGateway(port, drainToken, { detached: true });
     // The launcher that spawned this tray is blocked on a signal file: it
     // cannot read our stdio, because the tray is detached. Without this write
     // it waits out its 60 s deadline and reports a failure for a tray that is
     // running fine.
     reportTrayStartup({ status: "ready", url: dashboardUrl });
     console.log(`Cartethyia is running at ${dashboardUrl}`);
-    void refreshVersion();
 
-    let misses = 0;
+    // The timestamp of the last probe the gateway actually answered, not a
+    // miss counter: a busy gateway answers sometimes, and that must reset the
+    // clock rather than being averaged away with its own silences.
+    let lastSeenAliveAt = Date.now();
     // A detached child's `exited` never settles on Windows, so the old
     // `await current.exited` would have parked here forever and the tray would
     // never notice the gateway going away. Poll its health endpoint instead:
@@ -187,16 +194,17 @@ export async function startTray(): Promise<void> {
     // is up reads as up regardless of who spawned it.
     while (!closing) {
       await Bun.sleep(TRAY_HEALTH_POLL_MS);
-      if (closing || gateway === null) continue;
+      if (closing || gateway === null && adoptedGateway === null) continue;
       const alive = await fetch(`http://127.0.0.1:${port}/health`, {
-        signal: AbortSignal.timeout(2_000),
+        signal: AbortSignal.timeout(TRAY_HEALTH_PROBE_TIMEOUT_MS),
       }).then((response) => response.ok).catch(() => false);
       if (alive) {
-        misses = 0;
+        lastSeenAliveAt = Date.now();
         continue;
       }
-      misses += 1;
-      if (misses < TRAY_HEALTH_MISSES_BEFORE_CLOSE) continue;
+      // Only a gateway that has been unreachable for the whole window is
+      // treated as gone. One slow answer inside it is enough to start over.
+      if (Date.now() - lastSeenAliveAt < TRAY_HEALTH_UNREACHABLE_BEFORE_CLOSE_MS) continue;
       gateway = null;
       console.error("Cartethyia stopped answering; the tray is closing.");
       await close(1);

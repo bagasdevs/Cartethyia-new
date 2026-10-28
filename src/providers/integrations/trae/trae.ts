@@ -1,12 +1,12 @@
 // Trae adapter.
 //
 // Realm-aware: `trae` (intl) and `traecn` (CN) share this code but nothing of
-// the address, the authorization scheme, or the roster. The intl deployment
-// additionally gates on the *current* client version, which is why the version
-// here comes from `getTraeVersion()` (a live resolver) rather than a constant.
+// the address or the roster. Both realms authenticate with
+// `Authorization: Cloud-IDE-JWT <token>` per the Trae 1.107.1 bundle.
 
 import { GatewayError } from "../../../protocol/gateway-error";
-import type { CanonicalEvent, CanonicalRequest, CanonicalStopReason } from "../../../protocol/canonical-model";
+import type { CanonicalEvent, CanonicalMessage, CanonicalRequest, CanonicalStopReason } from "../../../protocol/canonical-model";
+import type { UsageRecord } from "../../../protocol/canonical-model";
 import { usageFromProvider } from "../../provider-usage";
 import {
   readCredentialSecret,
@@ -16,8 +16,9 @@ import {
   type ProviderId,
 } from "../../provider-contracts";
 import { mapUpstreamHttpError } from "../../../transport/failure-policy";
-import { getTraeVersion } from "../../operations/client-versions";
 import { abortGatewayError, createUpstreamDeadlineLifecycle } from "../../operations/upstream-deadline";
+import { resolvePromptCacheKey } from "../../operations/session-resolution";
+import { estimateTraeSessionCache } from "./trae-cache";
 import { TRAE_CN_MODELS, TRAE_INTL_MODELS, traeMaxContextWindow } from "./trae-catalog";
 import { buildTraeHeaders } from "./trae-headers";
 import {
@@ -92,14 +93,6 @@ class TraeAdapter implements ProviderAdapter {
   readonly provider_id: ProviderId;
   private readonly realm: TraeRealm;
   private readonly fetchFn: typeof fetch;
-  /**
-   * Maps a frame's `index` to the call id seen for it.
-   *
-   * Argument fragments arrive without the id, so the association has to be
-   * remembered between frames rather than read from the fragment itself.
-   */
-  readonly #toolCallIds = new Map<string, string>();
-
   constructor(options: TraeAdapterOptions = {}) {
     this.provider_id = (options.providerId ?? TRAE_PROVIDER_ID) as ProviderId;
     this.realm = options.realm ?? "intl";
@@ -124,11 +117,22 @@ class TraeAdapter implements ProviderAdapter {
     const outboundFetch =
       (context.outbound_fetch as unknown as typeof fetch | undefined) ?? this.fetchFn;
 
-    // intl refuses a stale client version with 4015, so the resolved version is
-    // part of every request rather than a startup detail.
-    const version = getTraeVersion();
     const auth = traeAuth(secret, context.credential.account_id);
-    const body = buildTraeChatBody(modelId, request, this.realm);
+    /**
+     * Trae keeps upstream prompt-cache state keyed by the request's
+     * `session_id`. The canonical request rarely carries one (surfaces do not
+     * populate it), so without this the body always omitted `session_id` and
+     * upstream treated every turn as a fresh context — `cached_tokens: 0`
+     * even for byte-identical prefixes. Resolve the same session/cache key the
+     * other adapters use (caller key → inbound session headers → opening-turn
+     * hash) and thread it through.
+     */
+    const sessionId = request.session_id ?? resolvePromptCacheKey(request, context);
+    const body = buildTraeChatBody(modelId, request, this.realm, sessionId);
+    // The cache estimator is scoped per (session, model): upstream cache keys
+    // are model-specific, so two models sharing a conversation id must not
+    // treat each other's identical prefixes as hits.
+    const cacheSessionKey = sessionId === undefined ? undefined : `${modelId}:${sessionId}`;
     /**
      * The endpoint follows the model, not the provider.
      *
@@ -144,7 +148,6 @@ class TraeAdapter implements ProviderAdapter {
       realm: this.realm,
       token: auth.token,
       uid: auth.uid,
-      clientVersion: version,
       stream: true,
     });
 
@@ -173,6 +176,8 @@ class TraeAdapter implements ProviderAdapter {
         response.body as ReadableStream<Uint8Array>,
         lifecycle.signal,
         request.model,
+        cacheSessionKey,
+        request.messages,
       );
     } catch (err: unknown) {
       const abortError = abortGatewayError(lifecycle, err, context.abort_signal);
@@ -187,11 +192,16 @@ class TraeAdapter implements ProviderAdapter {
     body: ReadableStream<Uint8Array>,
     _signal: AbortSignal,
     requestModel: string,
+    sessionId?: string,
+    messages?: readonly CanonicalMessage[],
   ): AsyncIterable<CanonicalEvent> {
     let seq = 1;
     yield { type: "response_start", sequence_number: seq++, model: requestModel } as CanonicalEvent;
     let stopReason: CanonicalStopReason = "stop";
     let usage: Record<string, unknown> | undefined;
+    // Tool ids are scoped to one stream. Argument-only frames from a later
+    // request must never inherit an earlier request's id at the same index.
+    const toolCallIds = new Map<string, string>();
     /**
      * Tool calls arrive fragmented across frames and the id is not repeated.
      *
@@ -212,8 +222,12 @@ class TraeAdapter implements ProviderAdapter {
         continue;
       }
       if (frame.event === "error") {
-        const data = frame.data as { message?: unknown };
-        const message = typeof data.message === "string" ? data.message : "Trae stream error";
+        const data = frame.data as { message?: unknown; code?: unknown };
+        const message = typeof data.message === "string" && data.message.length > 0
+          ? data.message
+          : typeof data.code === "number" || typeof data.code === "string"
+            ? `Trae stream error (upstream code ${data.code})`
+            : "Trae stream error";
         throw new GatewayError("platform_unavailable", 502, message, {}, "upstream");
       }
       if (typeof frame.data !== "object" || frame.data === null) continue;
@@ -245,7 +259,7 @@ class TraeAdapter implements ProviderAdapter {
             content: { kind: "reasoning", payload: null, summary: flatReasoning },
           } as CanonicalEvent;
         }
-        yield* this.#toolCallDeltas(record["tool_calls"], announced, () => seq++);
+        yield* this.#toolCallDeltas(record["tool_calls"], announced, toolCallIds, () => seq++);
         if (typeof record["finish_reason"] === "string") {
           stopReason = STOP_REASONS[record["finish_reason"] as string] ?? "stop";
         }
@@ -277,23 +291,33 @@ class TraeAdapter implements ProviderAdapter {
         } as CanonicalEvent;
       }
       if (typeof payload["finish_reason"] === "string") {
-        stopReason = STOP_REASONS[payload["finish_reason"]] ?? "stop";
+        stopReason = STOP_REASONS[payload["finish_reason"] as string] ?? "stop";
       }
+      yield* this.#toolCallDeltas(payload["tool_calls"], announced, toolCallIds, () => seq++);
       if (typeof payload["usage"] === "object" && payload["usage"] !== null) {
         usage = payload["usage"] as Record<string, unknown>;
       }
     }
 
-    if (usage !== undefined) {
-      yield* this.#usageEvent(usage, seq++);
+    // Assess the raw usage exactly once per request, then reuse the result for
+    // both the `usage` event and the terminal. Assessing twice would let the
+    // terminal see the `usage` event's own history entry and misreport a cache
+    // hit on the very first request.
+    const assessed = usage === undefined ? undefined : this.#assessUsage(usage, sessionId, messages);
+    if (assessed !== undefined) {
+      yield { type: "usage", sequence_number: seq++, usage: assessed } as unknown as CanonicalEvent;
     }
     // The canonical terminal is `terminal`; a stream that ends without one is
-    // read as "the upstream never reported a result".
+    // read as "the upstream never reported a result". The assessed usage is
+    // carried on the terminal itself (matching the other adapters) so the
+    // non-streaming path records the real token counts instead of falling back
+    // to the request estimate.
     yield {
       type: "terminal",
       sequence_number: seq,
       state: "complete",
       stop_reason: stopReason,
+      ...(assessed === undefined ? {} : { usage: assessed }),
     } as unknown as CanonicalEvent;
   }
 
@@ -311,6 +335,7 @@ class TraeAdapter implements ProviderAdapter {
   async *#toolCallDeltas(
     raw: unknown,
     announced: Set<string>,
+    toolCallIds: Map<string, string>,
     nextSeq: () => number,
   ): AsyncIterable<CanonicalEvent> {
     if (!Array.isArray(raw)) return;
@@ -326,7 +351,7 @@ class TraeAdapter implements ProviderAdapter {
       const slot = `idx:${index}`;
 
       if (declaredId.length > 0) {
-        this.#toolCallIds.set(slot, declaredId);
+        toolCallIds.set(slot, declaredId);
         // The closing frame repeats a known id with no payload; emitting it
         // again would append a duplicate empty call.
         if (announced.has(declaredId)) continue;
@@ -338,11 +363,11 @@ class TraeAdapter implements ProviderAdapter {
           name: name ?? "",
           arguments_delta: "",
         } as CanonicalEvent;
-        continue;
+        if (args.length === 0) continue;
       }
 
       if (args.length === 0) continue;
-      const id = this.#toolCallIds.get(slot);
+      const id = toolCallIds.get(slot);
       if (id === undefined) continue;
       yield {
         type: "tool_call_delta",
@@ -362,11 +387,20 @@ class TraeAdapter implements ProviderAdapter {
    * usage event is correct in that case — emitting zeros would record a
    * request that cost nothing.
    */
-  async *#usageEvent(usage: Record<string, unknown>, seq: number): AsyncIterable<CanonicalEvent> {
+  /** Normalizes + cache-assesses one raw upstream usage frame, if any. */
+  #assessUsage(
+    usage: Record<string, unknown> | undefined,
+    sessionId?: string,
+    messages?: readonly CanonicalMessage[],
+  ): UsageRecord | undefined {
+    if (usage === undefined) return undefined;
     const record = usageFromProvider(usage);
-    if (record === undefined) return;
-    yield { type: "usage", sequence_number: seq, usage: record } as unknown as CanonicalEvent;
+    if (record === undefined) return undefined;
+    // Trae's agent surface never reports prompt-cache hits; for repeated
+    // prefixes we estimate them locally (see trae-cache.ts).
+    return estimateTraeSessionCache(record, sessionId, messages);
   }
+
 }
 
 export function createTraeAdapter(options: TraeAdapterOptions = {}): ProviderAdapter {
@@ -400,7 +434,10 @@ export async function discoverTraeModels(input: {
   readonly providerId?: string;
   /** Account region, so the listing is asked of the host that serves it. */
   readonly region?: string;
-}): Promise<readonly { id: string; ctx: number | undefined }[]> {
+}): Promise<readonly {
+  id: string;
+  ctx: number | undefined;
+}[]> {
   const headers = buildTraeHeaders({
     realm: input.realm,
     token: input.token,

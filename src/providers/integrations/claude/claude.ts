@@ -49,7 +49,7 @@ import { getClaudeCliVersion, adoptClaudeCliVersion, getClaudeSdkVersion } from 
 import { adoptRequiredVersion } from "../../operations/client-version-resolver";
 import { getOrCreateInstallId } from "../shared/install-id";
 import { canonicalToClaudeMessagesPayload } from "../../../protocol/request/messages";
-import { applyParamQuirks } from "../../../transport/translation/quirks";
+import { applyParamQuirks } from "../../../protocol/translation/quirks";
 import { CLAUDE_BILLING_HEADER_PREFIX, endpointUrl } from "../../../protocol/codecs";
 import { sendClaudeMessagesRequest } from "../../../protocol/upstream/send-claude-messages";
 import {
@@ -484,14 +484,13 @@ export class ClaudeAdapter implements ProviderAdapter {
         type: "text",
         text: createClaudeBillingText(firstUserText(request), retryCliVersion),
       };
-      const parsedBody = JSON.parse(requestBody) as Record<string, unknown>;
-      const existingSystem = Array.isArray(parsedBody["system"])
-        ? (parsedBody["system"] as unknown[])
+      const existingSystem = Array.isArray(payload["system"])
+        ? (payload["system"] as unknown[])
         : [];
       const retryBody = isClaudeCodeOAuth
         ? patchClaudeCchBody(
             JSON.stringify({
-              ...parsedBody,
+              ...payload,
               system: [
                 retryBilling,
                 ...existingSystem.filter(

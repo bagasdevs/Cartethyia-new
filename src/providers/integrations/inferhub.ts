@@ -3,6 +3,7 @@
 // stays bespoke; the chat leg is a declarative spec row.
 import type { ProviderDispatchTarget, ProviderAdapter, ProviderDispatchContext } from "../provider-contracts";
 import type { ModelDefinition } from "../provider-model-definition";
+import type { ProviderModelDiscovery } from "../discovery/discovery-types";
 import { providerBaseUrl } from "../provider-metadata";
 import { defineModel, isResponsesNativeModelId } from "../provider-model-definition";
 import { createApiKeyAdapter, type ApiKeyProviderSpec } from "../configured-provider";
@@ -10,8 +11,9 @@ import type { FetchLike, ProviderQuotaResult } from "../quota/quota-contracts";
 import { probeApiKeyConnectivity } from "../quota/quota-support";
 import type { CanonicalEvent, CanonicalRequest, ContentPart } from "../../protocol/canonical-model";
 import { GatewayError } from "../../protocol/gateway-error";
-import { applyParamQuirks } from "../../transport/translation/quirks";
+import { applyParamQuirks } from "../../protocol/translation/quirks";
 import { buildClaudeMessagesRequest, filterClaudeCustomHeaders } from "./shared/claude-messages";
+import { resolveInboundSessionId } from "../operations/session-resolution";
 import { isRecord } from "../../protocol/codecs";
 import { sendClaudeMessagesRequest } from "../../protocol/upstream/send-claude-messages";
 
@@ -92,6 +94,46 @@ export const INFERHUB_BASE_URL = providerBaseUrl("inferhub");
 export const INFERHUB_PROVIDER_ID = "inferhub" as const;
 
 /**
+ * Live `/v1/models` discovery for InferHub.
+ *
+ * The generic OpenAI discovery loader classifies a model as `responses` only
+ * when `isResponsesNativeModelId` matches and otherwise says `chat`, so every
+ * Claude-backed InferHub id came back `chat` — and the chat wire strips
+ * thinking and native tool_use server-side. The wire family is therefore
+ * re-derived here from the id, the same way the offline catalog does it, with
+ * Claude ids forced onto Messages.
+ */
+export function inferhubModelDiscovery(): () => Promise<ProviderModelDiscovery> {
+  return async () => async (input) => {
+    // dynamic-import: the OpenAI `/models` fetcher is the same module every
+    // discovery-backed provider loads lazily, and a static import here would
+    // pull it into every process that touches InferHub metadata.
+    const { fetchOpenAICompatibleModels } = await import("../discovery/openai-model-discovery");
+    const models = await fetchOpenAICompatibleModels({
+      baseUrl: input.baseUrl,
+      providerId: INFERHUB_PROVIDER_ID,
+      headers: { authorization: `Bearer ${input.credential}` },
+      ...(input.fetcher ? { fetcher: input.fetcher } : {}),
+    });
+    // A `config_read` key is rejected by the inference host with 403, and any
+    // other failure leaves `models` null. Neither means "InferHub has no
+    // models" — the committed list is a valid answer, so probing keeps working
+    // instead of failing the whole refresh with "no usable models".
+    const source: readonly ModelDefinition[] =
+      models === null || models.length === 0 ? INFERHUB_MODELS : models;
+    return source.map((model) =>
+      isInferhubClaudeModel(model.modelId)
+        ? {
+            ...model,
+            wireFamily: "messages" as const,
+            endpointPath: "/v1/messages",
+          }
+        : model,
+    );
+  };
+}
+
+/**
  * Chat + Responses legs of InferHub. Claude-backed models are routed to
  * `InferhubMessagesAdapter` by wire family instead (see
  * `createInferhubAdapter`), so this spec declares chat + responses.
@@ -99,85 +141,159 @@ export const INFERHUB_PROVIDER_ID = "inferhub" as const;
  * `POST /v1/responses` (native reasoning + tool_use survive; the chat wire
  * answers too but strips reasoning server-side).
  */
+/**
+ * InferHub pins a conversation to one upstream provider for as long as
+ * `X-Session-Id` stays the same, which is what keeps the prompt cache warm
+ * across turns (the pin lapses after roughly ten minutes idle). The id is the
+ * client's own session when it sends one and a stable affinity key derived from
+ * the opening turn otherwise — never a per-request random value, which would
+ * re-pin on every turn and defeat the header.
+ */
+function inferhubSessionHeaders(
+  context: ProviderDispatchContext,
+  request?: CanonicalRequest,
+): Record<string, string> {
+  const sessionId = resolveInboundSessionId(context, request);
+  return sessionId === undefined ? {} : { "X-Session-Id": sessionId };
+}
+
 const INFERHUB_CHAT_SPEC: ApiKeyProviderSpec = {
   provider_id: INFERHUB_PROVIDER_ID,
   endpoint_paths_by_wire_family: { responses: "/responses" },
+  buildExtraHeaders: (context, request) => inferhubSessionHeaders(context, request),
 };
 
-/** InferHub — full marketplace catalog from your paste (80+ models, 4 providers ag/cc/cb/cbcn/cx/ocg/ali/mimo/zai). Context sizes via websearch (Claude 1M/200k, Gemini 1M). */
+/**
+ * Offline fallback, used only when a live `/v1/models` read fails or returns
+ * nothing — a `config_read` key is rejected by the inference host with 403, so
+ * a failed discovery is common and is not "InferHub has no models".
+ *
+ * Every context, output, modality and reasoning scale below is copied from the
+ * upstream's own `/api/catalog` row rather than guessed, because a wrong limit
+ * is worse than a missing one: an overstated context window is rejected by the
+ * provider at request time, and an understated one truncates silently.
+ *
+ * Only `ag/` and `cc/` are listed. The marketplace republishes its whole roster
+ * (270 rows across 21 upstreams) and moves faster than a committed array can,
+ * so a wider hand-kept list would be stale the moment it was written.
+ */
 const INFERHUB_MODELS_RAW: readonly {
   id: string;
-  contextLimit: number;
-  outputLimit: number;
+  /** Null when the upstream states no window; `defineModel` marks it estimated. */
+  contextLimit: number | null;
+  outputLimit: number | null;
+  /** Upstream `modalities`. A row without `image` must not advertise vision. */
+  readonly modalities?: readonly ("text" | "image" | "video")[];
+  /** Upstream `reasoningLevels`; absent means the model exposes no scale. */
+  readonly reasoningLevels?: readonly string[];
 }[] = [
-  // ag/ — Antigravity (4 models) — sonnet 251k per request
-  { id: "ag/claude-sonnet-4-6", contextLimit: 251000, outputLimit: 64000 },
-  { id: "ag/gemini-3.7-flash-high", contextLimit: 1048576, outputLimit: 65536 },
-  { id: "ag/gemini-3.8-flash-high", contextLimit: 1048576, outputLimit: 65536 },
-  { id: "ag/gemini-pro-agent", contextLimit: 1048576, outputLimit: 65536 },
-  // cc/ — Claude Code (10 models)
-  { id: "cc/claude-fable-5", contextLimit: 1000000, outputLimit: 128000 },
-  { id: "cc/claude-fable-5-1", contextLimit: 1000000, outputLimit: 128000 },
-  { id: "cc/claude-haiku-4-5", contextLimit: 200000, outputLimit: 64000 },
-  { id: "cc/claude-opus-4-6", contextLimit: 1000000, outputLimit: 128000 },
-  { id: "cc/claude-opus-4-7", contextLimit: 1000000, outputLimit: 128000 },
-  { id: "cc/claude-opus-4-8", contextLimit: 1000000, outputLimit: 128000 },
-  { id: "cc/claude-opus-5", contextLimit: 1000000, outputLimit: 128000 },
-  { id: "cc/claude-sonnet-4-5", contextLimit: 200000, outputLimit: 64000 },
-  // 128K: Sonnet 4.6 is in the 1M/128K generation, the same as the Opus 4.6
-  // row directly above it and every other 4.6+ row here.
-  { id: "cc/claude-sonnet-4-6", contextLimit: 1000000, outputLimit: 128000 },
-  { id: "cc/claude-sonnet-5", contextLimit: 1000000, outputLimit: 128000 },
-  // cb/ — CodeBuddy (12 models)
-  { id: "cb/claude-opus-4.6", contextLimit: 1000000, outputLimit: 128000 },
-  { id: "cb/claude-opus-4.7-1m", contextLimit: 1000000, outputLimit: 64000 },
-  { id: "cb/claude-opus-5", contextLimit: 1000000, outputLimit: 128000 },
-  { id: "cb/deepseek-v4.1-flash", contextLimit: 1000000, outputLimit: 384000 },
-  { id: "cb/gemini-3.1-pro", contextLimit: 1048576, outputLimit: 65536 },
-  { id: "cb/glm-5.2", contextLimit: 1000000, outputLimit: 131072 },
-  { id: "cb/glm-5.3", contextLimit: 1000000, outputLimit: 131072 },
-  { id: "cb/gpt-5.6-luna", contextLimit: 1050000, outputLimit: 128000 },
-  { id: "cb/gpt-5.6-sol", contextLimit: 1050000, outputLimit: 128000 },
-  { id: "cb/gpt-5.6-terra", contextLimit: 1050000, outputLimit: 128000 },
-  { id: "cb/kimi-k3", contextLimit: 1048576, outputLimit: 131072 },
-  { id: "cb/minimax-m3", contextLimit: 512000, outputLimit: 80000 },
-  // cbcn/ — CodeBuddy CN
-  { id: "cbcn/deepseek-v4-flash", contextLimit: 1000000, outputLimit: 384000 },
-  { id: "cbcn/deepseek-v4-pro", contextLimit: 1000000, outputLimit: 384000 },
-  { id: "cbcn/glm-5.2", contextLimit: 1000000, outputLimit: 131072 },
-  { id: "cbcn/glm-5.3", contextLimit: 1000000, outputLimit: 131072 },
-  { id: "cbcn/glm-5.3-flash", contextLimit: 1000000, outputLimit: 131072 },
-  { id: "cbcn/kimi-k2.6", contextLimit: 262144, outputLimit: 262144 },
-  { id: "cbcn/kimi-k2.7", contextLimit: 128000, outputLimit: 8192 },
-  { id: "cbcn/kimi-k3", contextLimit: 1048576, outputLimit: 131072 },
-  { id: "cbcn/minimax-m2.7", contextLimit: 204800, outputLimit: 131072 },
-  { id: "cbcn/minimax-m3", contextLimit: 512000, outputLimit: 80000 },
-  // cx/ — Codex 
-  { id: "cx/gpt-5.6-luna", contextLimit: 1050000, outputLimit: 128000 },
-  { id: "cx/gpt-5.6-sol", contextLimit: 1050000, outputLimit: 128000 },
-  { id: "cx/gpt-5.6-terra", contextLimit: 1050000, outputLimit: 128000 },
-  { id: "cx/gpt-6-astra", contextLimit: 1050000, outputLimit: 128000 },
-  // ocg/ — OpenCode Go 
-  { id: "ocg/deepseek-v4-flash-0731", contextLimit: 1000000, outputLimit: 384000 },
-  { id: "ocg/deepseek-v4-pro", contextLimit: 1000000, outputLimit: 384000 },
-  { id: "ocg/glm-5.2", contextLimit: 1000000, outputLimit: 131072 },
-  { id: "ocg/glm-5.3", contextLimit: 1000000, outputLimit: 131072 },
-  { id: "ocg/glm-5.3-flash", contextLimit: 1000000, outputLimit: 131072 },
-  // ali/ — Alibaba 
-  { id: "ali/deepseek-v4.1-flash", contextLimit: 1000000, outputLimit: 384000 },
-  { id: "ali/deepseek-v4-flash-0731", contextLimit: 1000000, outputLimit: 384000 },
-  { id: "ali/deepseek-v4-pro-0813", contextLimit: 1048576, outputLimit: 384000 },
-  { id: "ali/glm-5.2", contextLimit: 1000000, outputLimit: 131072 },
-  { id: "ali/kimi-k2.7-code", contextLimit: 262144, outputLimit: 262144 },
-  { id: "ali/kimi-k3", contextLimit: 1048576, outputLimit: 131072 },
-  { id: "ali/qwen3.8-max", contextLimit: 991000, outputLimit: 65536 },
-  // mimo/ — MiMo (2 models)
-  { id: "mimo/mimo-v2.5", contextLimit: 1048576, outputLimit: 131072 },
-  { id: "mimo/mimo-v2.5-pro", contextLimit: 1048576, outputLimit: 131072 },
-  // zai/ — Z.AI 
-  { id: "zai/glm-5.2", contextLimit: 1000000, outputLimit: 131072 },
-  { id: "zai/glm-5.3", contextLimit: 1000000, outputLimit: 131072 },
-  { id: "zai/glm-5.3-flash", contextLimit: 1000000, outputLimit: 131072 },
+  // ag/ — Antigravity. Every row: 1M context, text+image input, text output.
+  { id: "ag/claude-opus-4-6-thinking", contextLimit: 1000000, outputLimit: 128000, modalities: ["text", "image"] },
+  { id: "ag/claude-opus-5-5", contextLimit: 1000000, outputLimit: 128000, modalities: ["text", "image"], reasoningLevels: ["low", "medium", "high"] },
+  { id: "ag/claude-sonnet-4-6", contextLimit: 1000000, outputLimit: 64000, modalities: ["text", "image"] },
+  { id: "ag/claude-sonnet-5-5", contextLimit: 1000000, outputLimit: 128000, modalities: ["text", "image"], reasoningLevels: ["low", "medium", "high"] },
+  { id: "ag/gemini-3.8-flash-high", contextLimit: 1000000, outputLimit: 65536, modalities: ["text", "image"], reasoningLevels: ["low", "medium", "high"] },
+  { id: "ag/gemini-4-argon", contextLimit: 1000000, outputLimit: 65536, modalities: ["text", "image"], reasoningLevels: ["low", "medium", "high"] },
+  // cc/ — Claude Code. Haiku 4-5 and Opus 4-5 are the 200k-context rows.
+  { id: "cc/claude-fable-5", contextLimit: 1000000, outputLimit: 128000, modalities: ["text", "image"] },
+  { id: "cc/claude-fable-5-1", contextLimit: 1000000, outputLimit: 128000, modalities: ["text", "image"] },
+  { id: "cc/claude-haiku-4-5", contextLimit: 200000, outputLimit: 64000, modalities: ["text", "image"], reasoningLevels: ["none", "low", "medium", "high"] },
+  { id: "cc/claude-haiku-5-5", contextLimit: 1000000, outputLimit: 128000, modalities: ["text", "image"], reasoningLevels: ["none", "low", "medium", "high"] },
+  { id: "cc/claude-opus-4-5", contextLimit: 200000, outputLimit: 64000, modalities: ["text", "image"], reasoningLevels: ["none", "low", "medium", "high"] },
+  { id: "cc/claude-opus-4-6", contextLimit: 1000000, outputLimit: 128000, modalities: ["text", "image"], reasoningLevels: ["none", "low", "medium", "high"] },
+  { id: "cc/claude-opus-4-7", contextLimit: 1000000, outputLimit: 128000, modalities: ["text", "image"], reasoningLevels: ["none", "low", "medium", "high"] },
+  { id: "cc/claude-opus-4-8", contextLimit: 1000000, outputLimit: 128000, modalities: ["text", "image"], reasoningLevels: ["none", "low", "medium", "high"] },
+  { id: "cc/claude-opus-5", contextLimit: 1000000, outputLimit: 128000, modalities: ["text", "image"], reasoningLevels: ["none", "low", "medium", "high"] },
+  { id: "cc/claude-opus-5-5", contextLimit: 1000000, outputLimit: 128000, modalities: ["text", "image"], reasoningLevels: ["low", "medium", "high"] },
+  { id: "cc/claude-sonnet-4-6", contextLimit: 1000000, outputLimit: 128000, modalities: ["text", "image"], reasoningLevels: ["none", "low", "medium", "high"] },
+  { id: "cc/claude-sonnet-5", contextLimit: 1000000, outputLimit: 128000, modalities: ["text", "image"], reasoningLevels: ["none", "low", "medium", "high"] },
+  { id: "cc/claude-sonnet-5-5", contextLimit: 1000000, outputLimit: 128000, modalities: ["text", "image"], reasoningLevels: ["low", "medium", "high"] },
+  // cb/
+  { id: "cb/claude-opus-4.6", contextLimit: 1000000, outputLimit: 128000, modalities: ["text","image"] },
+  { id: "cb/claude-opus-4.7-1m", contextLimit: 1000000, outputLimit: 128000, modalities: ["text","image"] },
+  { id: "cb/deepseek-v4.1-flash", contextLimit: 1000000, outputLimit: 393216, modalities: ["text","image"] },
+  { id: "cb/gemini-2.5-flash-image", contextLimit: null, outputLimit: null, modalities: ["text","image"] },
+  { id: "cb/gemini-3.1-pro", contextLimit: 1000000, outputLimit: 65536, modalities: ["text","image","video"], reasoningLevels: ["low","high"] },
+  { id: "cb/glm-5.3", contextLimit: 1000000, outputLimit: 48000, modalities: ["text"], reasoningLevels: ["low","high","max"] },
+  { id: "cb/glm-5.3-flash", contextLimit: 1000000, outputLimit: 48000, modalities: ["text"], reasoningLevels: ["low","high","max"] },
+  { id: "cb/gpt-5.3-codex", contextLimit: 272000, outputLimit: 128000, modalities: ["text","image"], reasoningLevels: ["low","medium","high"] },
+  { id: "cb/kimi-k3.1-pro", contextLimit: 1000000, outputLimit: 32000, modalities: ["text","image"], reasoningLevels: ["low","high","max"] },
+  { id: "cb/minimax-m3.1-flash", contextLimit: 1000000, outputLimit: 128000, modalities: ["text","image"], reasoningLevels: ["low","medium","high","xhigh","max"] },
+  // cbcn/
+  { id: "cbcn/deepseek-v4-pro", contextLimit: 1000000, outputLimit: 393216, modalities: ["text","image"] },
+  { id: "cbcn/deepseek-v4.1-flash", contextLimit: 1000000, outputLimit: 128000, modalities: ["text","image"] },
+  { id: "cbcn/glm-5.3", contextLimit: 1000000, outputLimit: 48000, modalities: ["text","image"], reasoningLevels: ["low","high","max"] },
+  { id: "cbcn/glm-5.3-flash", contextLimit: 1000000, outputLimit: 48000, modalities: ["text","image"], reasoningLevels: ["low","high","max"] },
+  { id: "cbcn/hy4-preview", contextLimit: 1000000, outputLimit: 64000, modalities: ["text","image"] },
+  { id: "cbcn/kimi-k2.8-preview", contextLimit: 1000000, outputLimit: 32000, modalities: ["text","image"], reasoningLevels: ["none","low","high","max"] },
+  { id: "cbcn/kimi-k3.1-pro", contextLimit: 1000000, outputLimit: 32000, modalities: ["text","image"], reasoningLevels: ["low","high","max"] },
+  { id: "cbcn/minimax-m3.1-flash", contextLimit: 1000000, outputLimit: 128000, modalities: ["text","image"], reasoningLevels: ["low","medium","high","xhigh","max"] },
+  // cmc/
+  { id: "cmc/MiniMaxAI/MiniMax-M3", contextLimit: 1000000, outputLimit: 262144, modalities: ["text"] },
+  { id: "cmc/Qwen/Qwen3.7-Max", contextLimit: 1000000, outputLimit: null, modalities: ["text"] },
+  { id: "cmc/Qwen/Qwen3.7-Plus", contextLimit: 1000000, outputLimit: null, modalities: ["text"] },
+  { id: "cmc/Qwen/Qwen3.8-Flash", contextLimit: 1000000, outputLimit: 131072, modalities: ["text"] },
+  { id: "cmc/Qwen/Qwen3.8-Max", contextLimit: 1000000, outputLimit: 131072, modalities: ["text"] },
+  { id: "cmc/deepseek/deepseek-v4-flash", contextLimit: 1000000, outputLimit: 393216, modalities: ["text"], reasoningLevels: ["none","low","high","max"] },
+  { id: "cmc/deepseek/deepseek-v4-pro", contextLimit: 1000000, outputLimit: 393216, modalities: ["text"], reasoningLevels: ["none","low","high","max"] },
+  { id: "cmc/deepseek/deepseek-v4.1-flash", contextLimit: 1000000, outputLimit: 393216, modalities: ["text"], reasoningLevels: ["none","low","high","max"] },
+  { id: "cmc/deepseek/deepseek-v4.1-flash-fast", contextLimit: 1000000, outputLimit: 393216, modalities: ["text"], reasoningLevels: ["none","low","high","max"] },
+  { id: "cmc/gpt-5.6-luna", contextLimit: 1050000, outputLimit: null, modalities: ["text"] },
+  { id: "cmc/gpt-6-luna", contextLimit: 1050000, outputLimit: null, modalities: ["text"] },
+  { id: "cmc/meituan/LongCat-2.0", contextLimit: 1048576, outputLimit: null, modalities: ["text"] },
+  { id: "cmc/meta/muse-spark-1.2", contextLimit: 1000000, outputLimit: null, modalities: ["text"] },
+  { id: "cmc/meta/muse-spark-1.2-contributor", contextLimit: 1000000, outputLimit: null, modalities: ["text"] },
+  { id: "cmc/meta/muse-spark-1.3", contextLimit: 1000000, outputLimit: null, modalities: ["text"] },
+  { id: "cmc/meta/muse-spark-1.3-contributor", contextLimit: 1000000, outputLimit: null, modalities: ["text"] },
+  { id: "cmc/mistral/mistral-large-4", contextLimit: 524288, outputLimit: 262144, modalities: ["text"] },
+  { id: "cmc/moonshotai/Kimi-K2.6", contextLimit: 262144, outputLimit: null, modalities: ["text"] },
+  { id: "cmc/moonshotai/Kimi-K2.7-Code", contextLimit: 262144, outputLimit: null, modalities: ["text"] },
+  { id: "cmc/moonshotai/Kimi-K2.7-Code-Highspeed", contextLimit: 262144, outputLimit: null, modalities: ["text"] },
+  { id: "cmc/moonshotai/Kimi-K3", contextLimit: 1000000, outputLimit: null, modalities: ["text"], reasoningLevels: ["low","high","max"] },
+  { id: "cmc/moonshotai/Kimi-K3.1-Pro", contextLimit: 1000000, outputLimit: null, modalities: ["text"], reasoningLevels: ["low","high","max"] },
+  { id: "cmc/tencent/hy4-preview", contextLimit: 1048576, outputLimit: 64000, modalities: ["text"] },
+  { id: "cmc/xai/grok-4.5", contextLimit: 500000, outputLimit: null, modalities: ["text"] },
+  { id: "cmc/xai/grok-4.6", contextLimit: 500000, outputLimit: null, modalities: ["text"] },
+  { id: "cmc/xai/grok-4.7", contextLimit: 500000, outputLimit: null, modalities: ["text"] },
+  { id: "cmc/xiaomi/mimo-v2.6-flash", contextLimit: 1000000, outputLimit: 131072, modalities: ["text"] },
+  { id: "cmc/xiaomi/mimo-v2.6-pro", contextLimit: 1000000, outputLimit: 131072, modalities: ["text"] },
+  { id: "cmc/z-ai/glm-5.3-flashx", contextLimit: 1000000, outputLimit: 128000, modalities: ["text"], reasoningLevels: ["low","high","max"] },
+  { id: "cmc/zai-org/GLM-5.2", contextLimit: 1000000, outputLimit: 128000, modalities: ["text"], reasoningLevels: ["high","max"] },
+  { id: "cmc/zai-org/GLM-5.3", contextLimit: 1000000, outputLimit: 128000, modalities: ["text"], reasoningLevels: ["low","high","max"] },
+  // grok/
+  { id: "grok/grok-4.5", contextLimit: 500000, outputLimit: null, modalities: ["text","image"], reasoningLevels: ["low","medium","high"] },
+  { id: "grok/grok-4.6", contextLimit: 500000, outputLimit: null, modalities: ["text"] },
+  { id: "grok/grok-4.7", contextLimit: 500000, outputLimit: null, modalities: ["text"] },
+  { id: "grok/grok-4.7-build-fast", contextLimit: 500000, outputLimit: null, modalities: ["text"], reasoningLevels: ["low","medium","high","xhigh"] },
+  // mm/
+  { id: "mm/MiniMax-M3.1-Flash", contextLimit: 1000000, outputLimit: 524288, modalities: ["text","image"], reasoningLevels: ["low","medium","high","xhigh","max"] },
+  // mmcn/
+  { id: "mmcn/MiniMax-M3.1-Flash", contextLimit: 1000000, outputLimit: 524288, modalities: ["text","image"], reasoningLevels: ["low","medium","high","xhigh","max"] },
+  // cx/
+  { id: "cx/gpt-5.6-luna", contextLimit: 272000, outputLimit: 128000, modalities: ["text","image"], reasoningLevels: ["none","low","medium","high","xhigh","max"] },
+  { id: "cx/gpt-5.6-sol", contextLimit: 272000, outputLimit: 128000, modalities: ["text","image"], reasoningLevels: ["none","low","medium","high","xhigh","max"] },
+  { id: "cx/gpt-5.6-terra", contextLimit: 272000, outputLimit: 128000, modalities: ["text","image"], reasoningLevels: ["none","low","medium","high","xhigh","max"] },
+  { id: "cx/gpt-6-astra", contextLimit: 272000, outputLimit: 128000, modalities: ["text","image"], reasoningLevels: ["low","medium","high","xhigh","max"] },
+  { id: "cx/gpt-6-luna", contextLimit: 272000, outputLimit: 128000, modalities: ["text","image"], reasoningLevels: ["none","low","medium","high","xhigh","max"] },
+  { id: "cx/gpt-6-sol", contextLimit: 272000, outputLimit: 128000, modalities: ["text","image"], reasoningLevels: ["none","low","medium","high","xhigh","max"] },
+  { id: "cx/gpt-6.1-sol", contextLimit: 500000, outputLimit: 128000, modalities: ["text","image"], reasoningLevels: ["low","medium","high","xhigh","max"] },
+  { id: "cx/gpt-image-2-codex", contextLimit: null, outputLimit: null, modalities: ["text"] },
+  // ocg/
+  { id: "ocg/deepseek-v4.1-flash", contextLimit: 1000000, outputLimit: 393216, modalities: ["text","image"] },
+  // ali/
+  { id: "ali/deepseek-v4-flash-0731", contextLimit: 1000000, outputLimit: 393216, modalities: ["text"] },
+  { id: "ali/deepseek-v4-pro-0813", contextLimit: 1000000, outputLimit: 393216, modalities: ["text"] },
+  { id: "ali/deepseek-v4.1-flash", contextLimit: 1000000, outputLimit: 393216, modalities: ["text","image"] },
+  { id: "ali/deepseek-v4.1-flash-1017", contextLimit: 1000000, outputLimit: 393216, modalities: ["text","image"] },
+  { id: "ali/glm-5.3", contextLimit: 1000000, outputLimit: 128000, modalities: ["text"], reasoningLevels: ["low","high","max"] },
+  { id: "ali/kimi-k2.7-code", contextLimit: 262144, outputLimit: null, modalities: ["text","image"] },
+  // alicn/
+  { id: "alicn/deepseek-v4-flash-0731", contextLimit: 1000000, outputLimit: 393216, modalities: ["text"] },
+  { id: "alicn/deepseek-v4-pro-0813", contextLimit: 1000000, outputLimit: 393216, modalities: ["text"] },
+  { id: "alicn/deepseek-v4.1-flash", contextLimit: 1000000, outputLimit: 393216, modalities: ["text","image"] },
+  { id: "alicn/deepseek-v4.1-flash-1017", contextLimit: 1000000, outputLimit: 393216, modalities: ["text","image"] },
+  { id: "alicn/glm-5.3", contextLimit: 1000000, outputLimit: 128000, modalities: ["text"], reasoningLevels: ["low","high","max"] },
+  { id: "alicn/kimi-k2.7-code", contextLimit: 262144, outputLimit: null, modalities: ["text","image"] },
 ] as const;
 /**
  * Claude-backed inferhub models (`*claude-*` across `ag/`/`cb/`/`cc/`) speak
@@ -238,6 +354,11 @@ export class InferhubMessagesAdapter implements ProviderAdapter {
       endpointPath: candidate.endpoint_path,
       mutatePayload: ensureInferhubMessagesTextBreakpoints,
     });
+    // Same conversation pin as the chat leg, applied after the shared Claude
+    // header builder rather than through `customHeaders`: that field is
+    // credential-derived (it is filtered and round-trips per account), and a
+    // per-conversation value does not belong in it.
+    Object.assign(outbound.headers, inferhubSessionHeaders(context, request));
     yield* sendClaudeMessagesRequest(
       outbound.url,
       outbound.headers,
@@ -310,8 +431,15 @@ export const INFERHUB_MODELS: readonly ModelDefinition[] = INFERHUB_MODELS_RAW.m
     id: e.id,
     ctx: e.contextLimit,
     out: e.outputLimit,
-    vision: true,
-    reasoning: true,
+    // Vision follows the upstream's own `modalities` rather than a blanket
+    // true: a row that does not accept images must not advertise that it does.
+    vision: e.modalities?.includes("image") ?? false,
+    // Reasoning is driven by the scale the upstream publishes. A model with no
+    // `reasoningLevels` at all exposes no effort control, so claiming it would
+    // let the console offer an effort the provider ignores.
+    ...(e.reasoningLevels !== undefined && e.reasoningLevels.length > 0
+      ? { reasoning: true, reasoningEfforts: e.reasoningLevels }
+      : { reasoning: false }),
     // Claude-backed models resolve to messages rows so thinking blocks and
     // native tool_use survive; the chat wire strips both server-side.
     // GPT-5/6 + o-series resolve to responses rows for the same reason.

@@ -90,10 +90,9 @@ export const CONFIG_SPEC = {
   CARTETHYIA_SERVER_MAX_BODY_BYTES: {
     kind: "int",
     // A 500K-token context is roughly 2 MB of text, so 4 MB admits every real
-    // request while halving the worst-case hold. Worst-case retained bytes
-    // across the process is `PROCESS_CONCURRENCY_CAP × this`, so on a 1 GB box
-    // the product should stay within about 40% of the limit; an operator with
-    // larger payloads raises this.
+    // request while halving the worst-case hold. How many may be in flight is
+    // admission's job, so an operator with larger payloads raises this and
+    // sets the ceiling in Settings.
     default: 4 * 1024 * 1024,
     min: 1024,
     max: Number.MAX_SAFE_INTEGER,
@@ -110,6 +109,27 @@ export const CONFIG_SPEC = {
     min: 0,
     max: 600_000,
   },
+  // Optional ceiling on in-flight requests per process. Left unset, the limit
+  // is derived from the memory limit and the body ceiling (see
+  // config/resources.ts): 2 GiB/4 MiB → 64, 512 MiB/4 MiB → 16, 256 MiB/16 MiB
+  // → 2. Set it to admit more than memory alone would allow — which is the
+  // operator's call, and is reported rather than corrected — or less, to keep
+  // a slow upstream from being handed more concurrency than it can serve.
+  // Optional-int, not int-with-a-zero-default: "unset" and "explicitly zero"
+  // must not be the same thing. Zero is not a valid ceiling, so a default of 0
+  // would need a second sentinel to mean "derive".
+  // Slack above each key's concurrency limit. Effective ceiling is
+  // limit + tolerance; only requests past it are refused.
+  CARTETHYIA_CONCURRENCY_TOLERANCE: { kind: "optional-int", min: 0, max: 1024 },
+  // How many gateway processes serve this deployment, and which one this is.
+  // Count > 1 requires Linux, CARTETHYIA_DB_MODE=full, and a REACHABLE Redis —
+  // checked at boot, because a half-configured multi-process deploy starts
+  // fine and then enforces every per-key limit N times over. Lite stays
+  // single-process: two processes on one SQLite file corrupt it.
+  CARTETHYIA_PROCESS_COUNT: { kind: "int", default: 1, min: 1, max: 16 },
+  // Which process this is (0 – count-1). Mandatory when count > 1: a process
+  // that does not know its index cannot own a shard of anything.
+  CARTETHYIA_PROCESS_INDEX: { kind: "int", default: 0, min: 0, max: 15 },
   // Optional secret for the operator drain endpoint (`POST /admin/drain`). When
   // set, a process can be stopped gracefully on platforms where a catchable
   // signal cannot be delivered to it (notably Windows, where `process.kill` of
@@ -117,6 +137,7 @@ export const CONFIG_SPEC = {
   // requires a loopback peer and a timing-safe token match; unset = the route
   // does not exist.
   CARTETHYIA_DRAIN_TOKEN: { kind: "optional-text" },
+  CARTETHYIA_INSTALL_ID_DIR: { kind: "optional-text" },
 
   // Network policy (trusted proxy + SSRF)
   TRUSTED_PROXY_CIDRS: { kind: "list" },
@@ -130,9 +151,12 @@ export const CONFIG_SPEC = {
     min: 1,
     max: Number.MAX_SAFE_INTEGER,
   },
-  // Opt-in forced garbage collection. Off by default: see
-  // `observability/runtime-metrics.ts` — a forced collection is not
-  // reclamation, and the synchronous form stalls concurrent requests.
+  // Opt-in forced garbage collection under memory pressure. Off by default:
+  // see `observability/runtime-metrics.ts` — a forced collection is not
+  // reclamation, and a collection that runs while requests are in flight adds
+  // a latency spike. This gates the pressure path only; idle reclaim runs
+  // unconditionally, because reclaiming when nothing is in flight stalls
+  // nothing.
   CARTETHYIA_FORCED_GC: { kind: "flag" },
   // How often runtime gauges (memory + bounded-collection sizes) are sampled.
   CARTETHYIA_RUNTIME_METRICS_INTERVAL_MS: {
@@ -151,37 +175,13 @@ export const CONFIG_SPEC = {
   /**
    * How long a day's telemetry is kept, in days.
    *
-   * The retention unit is the whole day: a day's event file and its index are
-   * deleted together, and the current day is never touched. Past this age an
-   * individual request no longer exists anywhere, so its detail is gone —
-   * totals, breakdowns and spend are unaffected, because the index keeps
-   * running sums rather than the rows.
+   * Whole raw event files past this age are removed. No summary or compacted
+   * form replaces the individual requests.
    *
    * This is the knob that decides how long the request list, per-request
    * filters, and the detail drawer stay complete.
    */
   CARTETHYIA_TELEMETRY_RETENTION_DAYS: { kind: "int", default: 30, min: 3, max: 365 },
-  /**
-   * Age at which a request's detail is described as no longer stored.
-   *
-   * Retention itself is `CARTETHYIA_TELEMETRY_RETENTION_DAYS`; this only words
-   * the operator-facing message shown when a request that old is asked for.
-   */
-  CARTETHYIA_TELEMETRY_COMPACT_AFTER_DAYS: { kind: "int", default: 7, min: 1, max: 365 },
-  /**
-   * How often each day's index is brought up to date, in minutes.
-   *
-   * Bringing an index up to date means folding the bytes appended since the
-   * last pass — not re-reading the day. Reads fold before they answer too, so
-   * raising this does not make the numbers stale; it only leaves the on-disk
-   * index further behind, and the next read pays for the remainder.
-   */
-  CARTETHYIA_TELEMETRY_COMPACT_INTERVAL_MINUTES: {
-    kind: "int",
-    default: 60,
-    min: 5,
-    max: 1440,
-  },
   CARTETHYIA_TELEMETRY_PAYLOAD_MAX_BYTES: {
     kind: "int",
     default: 16 * 1024 * 1024,
@@ -241,6 +241,18 @@ export const CONFIG_SPEC = {
   },
   CARTETHYIA_ACCOUNT_COOLDOWN_ESCALATION_MAX_MS: { kind: "int", default: 3_600_000, min: 0, max: 86_400_000 },
   CARTETHYIA_POOL_COOLDOWN_MS: { kind: "int", default: 120_000, min: 0, max: 86_400_000 },
+  /**
+   * A provider-scoped egress cooldown (a 429 the pool itself earned) when the
+   * upstream named no window. Default 1h: an egress that exhausted a
+   * request-counted allowance stays refused long past minute 15, and a short
+   * default sent the pool back into rotation to be refused again.
+   */
+  CARTETHYIA_POOL_PROVIDER_RATE_LIMIT_COOLDOWN_MS: {
+    kind: "int",
+    default: 3_600_000,
+    min: 0,
+    max: 86_400_000,
+  },
   CARTETHYIA_ACCOUNT_AUTH_REJECTED_COOLDOWN_MS: { kind: "int", default: 300_000, min: 0, max: 86_400_000 },
   CARTETHYIA_ACCOUNT_POLICY_BLOCK_COOLDOWN_MS: { kind: "int", default: 300_000, min: 0, max: 86_400_000 },
   CARTETHYIA_ACCOUNT_DISABLED_RECOVERY_MS: { kind: "int", default: 86_400_000, min: 0, max: 604_800_000 },
@@ -251,24 +263,6 @@ export const CONFIG_SPEC = {
 
   // Security (encryption key, public origin, abuse ceiling)
   IP_RATE_MAX_PER_WINDOW: { kind: "int", default: 240, min: 1, max: Number.MAX_SAFE_INTEGER },
-  // Invalid-model attempts inside the sliding window that ban the client
-  // address, how long an attempt stays countable, and how long the ban lasts.
-  // A valid request does not reset the window.
-  CARTETHYIA_MODEL_STRIKE_THRESHOLD: { kind: "int", default: 10, min: 1, max: 100 },
-  CARTETHYIA_MODEL_STRIKE_WINDOW_MS: { kind: "int", default: 1_800_000, min: 1_000, max: 86_400_000 },
-  CARTETHYIA_MODEL_BAN_TTL_MS: { kind: "int", default: 21_600_000, min: 1_000, max: 604_800_000 },
-  /**
-   * The longest ban the console will record, however long a request asks for.
-   * The "Permanent" choice is a very long TTL rather than an unbounded one,
-   * and this is what keeps a typo in a duration from parking a caller for a
-   * decade.
-   */
-  CARTETHYIA_MODEL_BAN_MAX_TTL_MS: {
-    kind: "int",
-    default: 604_800_000,
-    min: 1_000,
-    max: 604_800_000,
-  },
   CARTETHYIA_ENCRYPTION_KEY: {
     kind: "required",
     error:

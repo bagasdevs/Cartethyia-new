@@ -30,6 +30,8 @@ export const queryKeys = {
     flatAll: ["console", "providers", "models-flat-all"] as const,
     accounts: (providerId: string | undefined) =>
       ["console", "providers", providerId, "accounts"] as const,
+    usageMatrix: (providerId: string | undefined) =>
+      ["console", "providers", providerId, "usage-matrix"] as const,
     routing: (providerId: string | undefined) =>
       ["console", "providers", providerId, "routing"] as const,
     accountInflight: (providerId: string | undefined) =>
@@ -60,9 +62,6 @@ export const queryKeys = {
     sharedKeyActivity: (parentKeyId: string, childKeyId: string) =>
       ["console", "api-keys", parentKeyId, "shared-keys", childKeyId, "activity"] as const,
   },
-  modelBans: {
-    all: ["console", "model-bans"] as const,
-  },
   settings: {
 
     runtime: ["console", "settings", "runtime"] as const,
@@ -85,5 +84,14 @@ export const queryKeys = {
     all: ["console", "quota"] as const,
     account: (accountId: string) => ["console", "quota", "account", accountId] as const,
     resets: (accountId: string) => ["console", "quota", "account", accountId, "resets"] as const,
+  },
+  /**
+   * InferHub market data. Deliberately has **no** `refetchInterval` anywhere it
+   * is used: price and availability are read when an operator opens a page, not
+   * polled in the background.
+   */
+  inferhub: {
+    summary: ["console", "inferhub", "summary"] as const,
+    models: (prefix?: string) => ["console", "inferhub", "models", prefix ?? "all"] as const,
   },
 } as const;

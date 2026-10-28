@@ -17,6 +17,48 @@ import {
   toTraeAgentBody,
 } from "../../src/providers/integrations/trae/trae-protocol";
 import type { CanonicalRequest } from "../../src/protocol/canonical-model";
+import { createTraeAdapter } from "../../src/providers/integrations/trae/trae";
+import type {
+  ProviderDispatchContext,
+  ProviderDispatchTarget,
+} from "../../src/providers/provider-contracts";
+
+const AGENT_TARGET: ProviderDispatchTarget = {
+  provider_id: "trae",
+  model_id: "deepseek-v4-pro-0813",
+  wire_family: "chat",
+  endpoint_path: TRAE_AGENT_CHAT_PATH,
+  capabilities: {},
+};
+
+function dispatchContext(frames: readonly Record<string, unknown>[]): ProviderDispatchContext {
+  const body = frames
+    .map((frame) => `event: ${frame["event"]}\ndata: ${JSON.stringify(frame["data"])}\n\n`)
+    .join("");
+  return {
+    outbound_fetch: (async () => new Response(body, { status: 200 })) as unknown as typeof fetch,
+    deadline: Date.now() + 60_000,
+    abort_signal: new AbortController().signal,
+    credential: {
+      credential_id: "c1",
+      provider_id: "trae",
+      account_id: "1",
+      credential_kind: "oauth",
+      secret: new TextEncoder().encode("token"),
+    },
+    user_agent: "test",
+  } as unknown as ProviderDispatchContext;
+}
+
+async function agentEvents(frames: readonly Record<string, unknown>[]) {
+  const events = [];
+  for await (const event of createTraeAdapter().dispatch(
+    request(),
+    AGENT_TARGET,
+    dispatchContext(frames),
+  )) events.push(event);
+  return events;
+}
 
 function request(overrides: Partial<CanonicalRequest> = {}): CanonicalRequest {
   return {
@@ -53,6 +95,24 @@ describe("trae realms", () => {
     // authenticate you", while the SG core streams normally.
     expect(TRAE_REGION_CORE_HOSTS["sg"]).toBe("https://coresg-normal.trae.ai");
     expect(TRAE_REGION_CORE_HOSTS["us"]).toBe("https://core-normal.traeapi.us");
+  });
+
+  test("intl defaults to SG, with US still reachable", () => {
+    // The default is SG, not US. Region routing is a property of the account, so
+    // this decides only accounts whose region was never captured — and SG
+    // serves the wider international roster. US is demoted to a fallback rather
+    // than removed: a genuinely US-provisioned account with no stored region
+    // still needs somewhere to land.
+    expect(TRAE_REALMS.intl.core).toBe("https://coresg-normal.trae.ai");
+    expect(TRAE_REALMS.intl.core).toBe(TRAE_REGION_CORE_HOSTS["sg"] ?? "<missing>");
+    expect(traeCoreCandidates("intl")).toContain("https://core-normal.traeapi.us");
+  });
+
+  test("an intl account with no stored region is not sent to US first", () => {
+    // The behavior that actually changed: `traeCoreForAccount` falls through to
+    // the realm default when the account carries no region, so the empty-region
+    // case must resolve to SG.
+    expect(traeCoreCandidates("intl")[0]).toBe("https://coresg-normal.trae.ai");
   });
 
   test("the realms do not share a core host", () => {
@@ -166,12 +226,12 @@ describe("buildTraeHeaders", () => {
     expect(headers["x-ide-token"]).toBe("t");
   });
 
-  test("intl overrides to Bearer and sends the client version", () => {
-    // intl answers 4015 without the current version on these headers.
-    const headers = buildTraeHeaders({ realm: "intl", token: "t", uid: "1", clientVersion: "3.6.0" });
-    expect(headers["Authorization"]).toBe("Bearer t");
-    expect(headers["x-ide-version"]).toBe("3.6.0");
-    expect(headers["x-app-version"]).toBe("3.6.0");
+  test("intl uses the same Cloud-IDE-JWT scheme as CN", () => {
+    // Trae 1.107.1 bundle: both realms send Cloud-IDE-JWT, not Bearer.
+    const headers = buildTraeHeaders({ realm: "intl", token: "t", uid: "1" });
+    expect(headers["Authorization"]).toBe("Cloud-IDE-JWT t");
+    expect(headers["x-ide-version"]).toBeUndefined();
+    expect(headers["x-app-version"]).toBeUndefined();
     expect(headers["User-Agent"]).toBe("TraeClient/TTNet");
   });
 
@@ -185,9 +245,9 @@ describe("buildTraeHeaders", () => {
       realm: "cn",
       token: "t",
       uid: "1",
-      extra: { "x-ide-token": "other", "X-Request-Id": null },
+      extra: { "X-App-Id": "other", "X-Request-Id": null },
     });
-    expect(headers["x-ide-token"]).toBe("other");
+    expect(headers["X-App-Id"]).toBe("other");
     expect(headers["X-Request-Id"]).toBeUndefined();
   });
 });
@@ -297,6 +357,26 @@ describe("buildTraeChatBody", () => {
 
   test("an empty model name is refused", () => {
     expect(() => buildTraeChatBody("", request(), "intl")).toThrow();
+  });
+
+  test("a resolved session id is carried as session_id", () => {
+    const body = buildTraeChatBody("gpt-5.5", request(), "intl", "ses_abc123");
+    expect(body.session_id).toBe("ses_abc123");
+  });
+
+  test("the caller's session id wins over the resolved one", () => {
+    const body = buildTraeChatBody(
+      "gpt-5.5",
+      request({ session_id: "caller-ses" }),
+      "intl",
+      "resolved-ses",
+    );
+    expect(body.session_id).toBe("caller-ses");
+  });
+
+  test("no session id means no session_id field", () => {
+    const body = buildTraeChatBody("gpt-5.5", request(), "intl");
+    expect("session_id" in body).toBe(false);
   });
 });
 
@@ -436,5 +516,85 @@ describe("trae stream framing", () => {
     for await (const frame of parseTraeSse(streamOf(frames))) parsed.push(frame);
     expect(parsed).toHaveLength(1);
     expect((parsed[0]?.data as { response: string }).response).toBe("OK");
+  });
+});
+
+describe("trae Agent tool streams", () => {
+  test("an SSE error without a message preserves the upstream code", async () => {
+    await expect(agentEvents([{ event: "error", data: { code: 4015, message: "" } }]))
+      .rejects.toThrow("Trae stream error (upstream code 4015)");
+  });
+
+  test("an opening tool frame keeps arguments delivered beside the id", async () => {
+    const events = await agentEvents([
+      { event: "output", data: { tool_calls: [{ id: "call-1", index: 0, function_call: { name: "read", arguments: '{"path":"a.ts"}' } }] } },
+    ]);
+    const deltas = events.filter((event) => event.type === "tool_call_delta");
+    expect(deltas).toHaveLength(2);
+    expect(deltas.map((event) => event.type === "tool_call_delta" ? event.arguments_delta : ""))
+      .toEqual(["", '{"path":"a.ts"}']);
+  });
+
+  test("nested chunk tool calls use the same translation as flat frames", async () => {
+    const events = await agentEvents([
+      { event: "output", data: { chunk: { tool_calls: [{ id: "call-1", index: 0, function_call: { name: "read", arguments: "{}" } }] } } },
+    ]);
+    expect(events.some((event) => event.type === "tool_call_delta")).toBe(true);
+  });
+
+  test("the terminal event carries the assessed usage", async () => {
+    // Non-streaming dispatch reads usage off the terminal event; without it the
+    // request is reconciled to the estimate. The same session must hit the
+    // cache estimator, so a repeated prefix reports cached tokens.
+    const adapter = createTraeAdapter();
+    const frames = (usage: Record<string, unknown>) => [
+      { event: "output", data: { response: "hai" } },
+      { event: "token_usage", data: usage },
+    ];
+    const session = "ses-terminal-usage";
+    const requestWithSession = (content: string) =>
+      request({ session_id: session, messages: [{ role: "user", content: [{ kind: "text", text: content }] }] });
+
+    // First call: no history yet → cached unavailable, terminal usage present.
+    const first = [];
+    for await (const event of adapter.dispatch(
+      requestWithSession("halo"),
+      AGENT_TARGET,
+      dispatchContext(frames({ prompt_tokens: 45, completion_tokens: 10, total_tokens: 55 })),
+    )) first.push(event);
+    const t1 = first.find((e) => e.type === "terminal") as { usage?: { input_tokens: number } };
+    expect(t1?.usage?.input_tokens).toBe(45);
+    expect((t1?.usage as { cached_input_tokens?: number | string })?.cached_input_tokens).toBe("unavailable");
+
+    // Second call, identical prefix → cached estimate applies on the terminal.
+    const second = [];
+    for await (const event of adapter.dispatch(
+      requestWithSession("halo"),
+      AGENT_TARGET,
+      dispatchContext(frames({ prompt_tokens: 45, completion_tokens: 12, total_tokens: 57 })),
+    )) second.push(event);
+    const t2 = second.find((e) => e.type === "terminal") as {
+      usage?: { input_tokens: number; cached_input_tokens: number; uncached_input_tokens: number };
+    };
+    expect(t2?.usage?.cached_input_tokens).toBe(45);
+    expect(t2?.usage?.uncached_input_tokens).toBe(0);
+  });
+
+  test("tool ids from one request never resolve fragments in the next request", async () => {
+    const adapter = createTraeAdapter();
+    const collect = async (frames: readonly Record<string, unknown>[]) => {
+      const events = [];
+      for await (const event of adapter.dispatch(request(), AGENT_TARGET, dispatchContext(frames))) {
+        events.push(event);
+      }
+      return events;
+    };
+    await collect([
+      { event: "output", data: { tool_calls: [{ id: "old-call", index: 0, function_call: { name: "read" } }] } },
+    ]);
+    const events = await collect([
+      { event: "output", data: { tool_calls: [{ index: 0, function_call: { arguments: "stale" } }] } },
+    ]);
+    expect(events.some((event) => event.type === "tool_call_delta")).toBe(false);
   });
 });

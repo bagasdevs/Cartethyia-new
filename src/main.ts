@@ -4,7 +4,13 @@ import "./boot/elysia-typebox-bridge";
 import { createGatewayApp, createGatewayShell } from "./boot/app";
 import { bootstrap } from "./boot/lifecycle";
 import type { CartethyiaBoot } from "./boot/lifecycle";
-import { resolveDrainToken, resolveIdleTimeout, resolveMaxBodyBytes, resolvePort } from "./config/runtime";
+import {
+  resolveDrainToken,
+  resolveIdleTimeout,
+  resolveMaxBodyBytes,
+  resolvePort,
+  resolveProcessTopology,
+} from "./config/runtime";
 import { Manifest } from "elysia";
 import { log } from "./observability/logger";
 
@@ -43,9 +49,14 @@ const app = boot
       telemetryBuffer: boot.deps.telemetryBuffer,
       resolveOAuthRefresher: boot.deps.resolveOAuthRefresher,
       oauthRefreshService: boot.deps.oauthRefreshService,
-      modelStrikes: boot.deps.modelStrikes,
       maxBodyBytes: resolveMaxBodyBytes(),
       scheduledTasks: boot.deps.scheduledTasks,
+      // The sampler is constructed in the dependency graph and already
+      // sampling on its own interval; without passing it here the app cannot
+      // bind its in-flight source, so `cartethyia_process_in_flight` stays
+      // pinned at the constructor's `() => 0` placeholder forever while the
+      // registry it was meant to read reports real flights.
+      runtimeMetricsSampler: boot.deps.runtimeMetricsSampler,
       shutdownCoordinator: boot.shutdownCoordinator,
       // Signal-free graceful stop for platforms where a catchable signal cannot
       // be delivered (Windows). Off unless `CARTETHYIA_DRAIN_TOKEN` is set.
@@ -66,7 +77,6 @@ const app = boot
         redis: boot.deps.redis,
         oauthRefreshService: boot.deps.oauthRefreshService,
         admissionService: boot.deps.admissionService,
-        modelStrikes: boot.deps.modelStrikes,
         readRoutingAccountInflight: boot.deps.readRoutingAccountInflight,
         // The same three writers the shutdown coordinator drains, so a manual
         // flush from the console does exactly what a graceful stop would do
@@ -108,6 +118,16 @@ function shutdown(signal: "SIGINT" | "SIGTERM", reason: "SIGINT" | "SIGTERM" | "
 }
 
 if (boot) {
+  // `bun --hot` re-runs this module against the cached boot object; stop the
+  // previous listener before rebinding so a reload does not stack two servers
+  // on the same port.
+  if (boot.server && typeof boot.server.stop === "function") {
+    try {
+      boot.server.stop();
+    } catch {
+      // Best-effort on reload; the bind below would fail loudly if it stuck.
+    }
+  }
   boot.server = app.listen(
     {
       port,
@@ -116,10 +136,12 @@ if (boot) {
       // indefinitely. 60 s aligns with the DB pool idle timeout so all
       // long-idle resources reap together.
       idleTimeout: resolveIdleTimeout(),
-      // Enable Bun's SO_REUSEPORT load-balancing so multi-worker deploys
-      // (or a second omp process) can share the same port without a
-      // reverse proxy in front. Silent no-op on platforms that lack it.
-      reusePort: true,
+      // SO_REUSEPORT load-balancing, so several processes can share the port
+      // without a reverse proxy. Tied to the declared topology rather than
+      // left always-on: with one process declared, enabling it lets an
+      // unrelated process on the same port silently take half the traffic —
+      // which is worse than a bind error, because nothing reports it.
+      reusePort: resolveProcessTopology().multiProcess,
       // 8 MiB cap on request bodies keeps a rogue client from allocating
       // gigabytes of memory in the ingress path before validation rejects.
       maxRequestBodySize: resolveMaxBodyBytes(),
@@ -137,6 +159,12 @@ if (boot) {
   // the lease sweep and the health sweep should not run before the listener
   // exists to serve traffic.
   boot.deps.scheduledTasks.start();
+  // Warm the route snapshot before the first request lands: the first /v1/*
+  // request otherwise pays the full catalog build synchronously (ten+ SELECTs).
+  // A failure here is a soft miss — the next request rebuilds as before.
+  void boot.deps.snapshotService.getSnapshot().catch((error: unknown) => {
+    log.warn("[startup] initial route snapshot warm failed", error as Error);
+  });
   if (!globalThis.__cartethyiaSignalsRegistered) {
     globalThis.__cartethyiaSignalsRegistered = true;
     process.on("SIGINT", () => shutdown("SIGINT"));

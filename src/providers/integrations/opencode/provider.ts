@@ -9,6 +9,7 @@ import type { ApiKeyProviderSpec } from "../../configured-provider";
 import { resolveOpenCodeUnavailableFree } from "../../../config/providers";
 import { buildOpenCodeHeaders } from "./fingerprint";
 import { OPENCODE_TOOL_DEFINITIONS } from "./tool-definitions";
+import { injectOpenCodePrompt } from "./prompt";
 /**
  * OpenCode's three API-key tiers, all served from `opencode.ai`:
  *
@@ -19,8 +20,10 @@ import { OPENCODE_TOOL_DEFINITIONS } from "./tool-definitions";
  * - `opencode-go` (OpenCode Go): billed API-key route on the separate
  *   `/zen/go/v1` base — a bundled, higher-tier model set.
  *
- * Free and Zen dispatch on `/inference/v1`, NOT `/zen/v1`. The catalog is the
- * other way round: `/zen/v1/models` publishes the listing while
+ * Free and Zen dispatch on the `/inference` origin using the 2.1 family
+ * segment: `/inference/openai/v1/...` for chat/responses and
+ * `/inference/anthropic/v1/messages?beta=true` for Anthropic. The catalog is
+ * the other way round: `/zen/v1/models` publishes the listing while
  * `/inference/v1/models` answers 404. A replay that hit `/inference/v1` directly
  * returned 200 while the gateway kept failing, because every model row carried
  * an explicit `/zen/v1` endpoint — which outranks the per-provider wire-family
@@ -30,8 +33,28 @@ import { OPENCODE_TOOL_DEFINITIONS } from "./tool-definitions";
  * (`x-opencode-*` correlation IDs, `user-agent: opencode`). Go is
  * intentionally API-key-only.
  */
-/** Dispatch base for the Free and Zen tiers. */
-const ZEN_PATH_PREFIX = "/inference/v1";
+/**
+ * The v2 upstream path for a wire family on the `/inference` origin, matching
+ * the reference implementation's `v2EndpointPath`: the 2.1 client
+ * groups `/inference` routes by provider family, so chat/responses sit under
+ * `/openai/v1/...` and Anthropic under `/anthropic/v1/messages?beta=true`.
+ * Go keeps the flat `/zen/go/v1/...` shape.
+ */
+function zenEndpoint(wireFamily: string): string {
+  if (wireFamily === "messages") return "/inference/anthropic/v1/messages?beta=true";
+  const protocol = wireFamily === "responses" ? "responses" : "chat/completions";
+  return `/inference/openai/v1/${protocol}`;
+}
+
+/**
+ * The System One decision endpoint on the `/inference` origin. Verified live:
+ * System One does NOT take the v2 family segment — `/inference/openai/v1/systemone`
+ * answers 404 while the flat `/inference/v1/systemone` answers 200 with a valid
+ * `{state, questions}` body.
+ */
+function zenSystemoneEndpoint(): string {
+  return "/inference/v1/systemone";
+}
 const GO_PATH_PREFIX = "/zen/go/v1";
 
 /**
@@ -121,7 +144,10 @@ export function isFreeTierZenModel(modelId: string): boolean {
   // id rather than the prefixed one.
   const bare = modelId.slice(modelId.indexOf("/") + 1);
   if (unavailableFreeZenIds().includes(bare)) return false;
-  return bare.endsWith("-free") || KNOWN_FREE_ZEN_IDS.includes(bare);
+  // The reference gateway's name rule admits any id containing "free" (any
+  // case) in addition to the suffix convention; the explicit lists keep the
+  // measured exclusions and the one free id that carries no marker.
+  return bare.endsWith("-free") || KNOWN_FREE_ZEN_IDS.includes(bare) || bare.toLowerCase().includes("free");
 }
 
 /**
@@ -156,6 +182,7 @@ function opencodeDesktopHeaders(
       undefined,
       context.conversation_affinity,
       context.request_headers?.["x-opencode-project"],
+      context.request_headers?.["x-opencode-session-id"],
     ),
     // The gate reads the anonymous sentinel: a free dispatch with no
     // Authorization is refused regardless of headers, tools, or session shape.
@@ -230,7 +257,6 @@ const FREE_AGENT_TOOL_SCHEMA = {
   required: [] as string[],
 } as const;
 
-
 function ensureFreeAgentRequest(request: CanonicalRequest): CanonicalRequest {
   const present: Record<string, true> = {};
   for (const tool of request.tools ?? []) present[tool.name] = true;
@@ -250,8 +276,6 @@ function ensureFreeAgentRequest(request: CanonicalRequest): CanonicalRequest {
     tools: [...(request.tools ?? []), ...missing],
   };
 }
-
-
 
 function completeOpenCodeToolSchemas(payload: Record<string, unknown>): void {
   if (!Array.isArray(payload.tools)) return;
@@ -330,6 +354,34 @@ function clampOpenCodeTools(payload: Record<string, unknown>, request: Canonical
   if (kept.length > OPENCODE_MAX_TOOLS) return;
   payload["tools"] = [...kept, ...rest.slice(0, OPENCODE_MAX_TOOLS - kept.length)];
 }
+/**
+ * The completion ceiling a 2.x client puts on every v2 chat body, matching the
+ * reference gateway's `v2CompletionLimit`. The upstream's free gate expects the
+ * same ceiling; an explicit `max_tokens`/`max_completion_tokens` from the
+ * caller always wins.
+ */
+const OPENCODE_V2_COMPLETION_LIMIT = 32_000;
+
+/** The key order a 2.x client's JSON.stringify emits for a chat body. */
+const V2_CHAT_KEY_ORDER = ["model", "messages", "tools", "stream", "stream_options", "max_completion_tokens"] as const;
+
+/**
+ * Reorders a chat payload's keys to the 2.x client's byte layout: the skeleton
+ * keys first in the client's order, then every remaining key sorted. Values are
+ * untouched; JSON.stringify preserves this insertion order, so the serialized
+ * body matches the reference gateway's `marshalV2ChatBody`.
+ */
+function reorderV2ChatKeys(payload: Record<string, unknown>): void {
+  const keys = [
+    ...V2_CHAT_KEY_ORDER.filter((key) => key in payload),
+    ...Object.keys(payload).filter((key) => !(V2_CHAT_KEY_ORDER as readonly string[]).includes(key)).sort(),
+  ];
+  const next: Record<string, unknown> = {};
+  for (const key of keys) next[key] = payload[key];
+  for (const key of Object.keys(payload)) delete payload[key];
+  Object.assign(payload, next);
+}
+
 function opencodeSpec(providerId: "opencode" | "opencode-zen" | "opencode-go"): ApiKeyProviderSpec {
   // Free-tier gate facts (verified live 2026-10-14 against opencode.ai/zen/v1):
   // a request for a free model with stream:false is ALWAYS refused with 403
@@ -355,19 +407,42 @@ function opencodeSpec(providerId: "opencode" | "opencode-zen" | "opencode-go"): 
       if (candidate.wire_family === "responses") {
         payload.store = false;
       }
-      if (candidate.wire_family === "chat" && request.stream) {
-        payload.stream_options = {
-          ...(typeof payload.stream_options === "object" && payload.stream_options !== null
-            ? (payload.stream_options as Record<string, unknown>)
-            : {}),
-          include_usage: true,
-        };
-      }
-      // Free model: force the upstream stream flag regardless of what the
-      // caller asked for. The gate refuses stream:false on free models with
-      // 403 FreeTierError; here it only patches the wire body, never the
+      // Free model: match the reference gateway's free-tier shaping 1:1 —
+      // the official CLI system prompt, the v2 completion ceiling, the
+      // include_usage flag, and the forced upstream stream. The gate refuses
+      // tool-less, non-streaming, or non-agent-shaped free dispatches with 403
+      // FreeTierError; here it only patches the wire body, never the
       // client-visible stream contract.
-      if (isFreeTierZenModel(candidate.model_id)) payload.stream = true;
+      if (isFreeTierZenModel(candidate.model_id)) {
+        if (candidate.wire_family === "chat") {
+          // The wire encoder injects the v2 ceiling (32000) as the default
+          // max_completion_tokens when the caller set no limit. Treat that
+          // sentinel as "unset" so the model's own declared output ceiling can
+          // take its place; an explicit user limit is never touched.
+          const isV2Default =
+            payload["max_completion_tokens"] === OPENCODE_V2_COMPLETION_LIMIT &&
+            payload["max_tokens"] === undefined;
+          if (isV2Default || (payload["max_completion_tokens"] === undefined && payload["max_tokens"] === undefined)) {
+            const ceiling =
+              typeof candidate.output_limit === "number" && candidate.output_limit > 0
+                ? candidate.output_limit
+                : OPENCODE_V2_COMPLETION_LIMIT;
+            payload["max_completion_tokens"] = ceiling;
+          }
+          payload.stream_options = {
+            ...(typeof payload.stream_options === "object" && payload.stream_options !== null
+              ? (payload.stream_options as Record<string, unknown>)
+              : {}),
+            include_usage: true,
+          };
+        }
+        const family = candidate.wire_family;
+        if (family === "chat" || family === "responses" || family === "messages") {
+          injectOpenCodePrompt(payload, family);
+        }
+        payload.stream = true;
+        if (candidate.wire_family === "chat") reorderV2ChatKeys(payload);
+      }
     },
     // OpenCode Free is a genuinely public, unauthenticated endpoint: no
     // credential is ever forwarded, whatever the account configuration says.
@@ -404,6 +479,8 @@ export async function discoverOpenCodeFreeModels(options: {
   readonly baseUrl: string;
   readonly fetcher?: typeof fetch;
 }): Promise<readonly ModelDefinition[] | null> {
+  // dynamic-import: cycle break -- the discovery helper imports this file's
+  // OPENCODE_FREE_SPEC to decide its request shape.
   const { fetchOpenAICompatibleModels } = await import("../../discovery/openai-model-discovery");
   const listed = await fetchOpenAICompatibleModels({
     baseUrl: options.baseUrl,
@@ -425,7 +502,7 @@ export async function discoverOpenCodeFreeModels(options: {
         ...systemoneLimits(),
         freeTier: true,
         serviceKind: "systemone" as const,
-        endpointPath: `${ZEN_PATH_PREFIX}/systemone`,
+        endpointPath: zenSystemoneEndpoint(),
       };
     });
 }
@@ -437,12 +514,12 @@ export async function discoverOpenCodeFreeModels(options: {
 // OpenCode row understates this model's 1M context limit, so keep the corrected
 // limit explicit for both tiers that serve it.
 const sharedZenChat: readonly ModelDefinition[] = [
-  defineModel({ id: "big-pickle", providerId: "opencode", wireFamily: "chat", endpoint: `${ZEN_PATH_PREFIX}/chat/completions`, vision: true, reasoning: true }),
+  defineModel({ id: "big-pickle", providerId: "opencode", wireFamily: "chat", endpoint: zenEndpoint("chat"), vision: true, reasoning: true }),
   defineModel({
     id: "mimo-v2.6-flash-free",
     providerId: "opencode",
     wireFamily: "chat",
-    endpoint: `${ZEN_PATH_PREFIX}/chat/completions`,
+    endpoint: zenEndpoint("chat"),
     ctx: 1_000_000,
     out: 32_000,
     vision: true,
@@ -479,7 +556,7 @@ const systemoneZen = (id: string, free: boolean): ModelDefinition =>
     providerId: "opencode",
     serviceKind: "systemone",
     wireFamily: "chat",
-    endpoint: `${ZEN_PATH_PREFIX}/systemone`,
+    endpoint: zenSystemoneEndpoint(),
     ctx: SYSTEMONE_LIMITS.context,
     out: SYSTEMONE_LIMITS.output,
     toolCall: false,
@@ -508,8 +585,8 @@ export const OPENCODE_FREE_MODELS: readonly ModelDefinition[] = [
 
 export const OPENCODE_ZEN_MODELS: readonly ModelDefinition[] = [
   ...sharedZenChat,
-  defineModel({ id: "muse-spark-1.2", providerId: "opencode", wireFamily: "responses", endpoint: `${ZEN_PATH_PREFIX}/responses`, vision: true, reasoning: true, reasoningEfforts: MUSE_SPARK_REASONING_EFFORTS }),
-  defineModel({ id: "muse-spark-1.3", providerId: "opencode", wireFamily: "responses", endpoint: `${ZEN_PATH_PREFIX}/responses`, vision: true, reasoning: true, reasoningEfforts: MUSE_SPARK_REASONING_EFFORTS }),
+  defineModel({ id: "muse-spark-1.2", providerId: "opencode", wireFamily: "responses", endpoint: zenEndpoint("responses"), vision: true, reasoning: true, reasoningEfforts: MUSE_SPARK_REASONING_EFFORTS }),
+  defineModel({ id: "muse-spark-1.3", providerId: "opencode", wireFamily: "responses", endpoint: zenEndpoint("responses"), vision: true, reasoning: true, reasoningEfforts: MUSE_SPARK_REASONING_EFFORTS }),
   systemoneZen("jev-1.13", false),
 ];
 

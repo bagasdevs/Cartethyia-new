@@ -16,6 +16,15 @@ export interface CompatibilityProfile {
   /** Whether requests to OpenAI/Anthropic-compatible upstream should send official CLI headers. Defaults to true. */
   readonly cli_identity?: boolean;
   /**
+   * Direct egress for this provider uses the runtime-native fetch instead of
+   * the Node-stack pinned agent. Some upstreams meter per client transport
+   * fingerprint — OpenCode's anonymous free tier refuses the Node agent with
+   * 429 FreeUsageLimitError while accepting the native fetch byte-for-byte
+   * (verified live). The SSRF resolve/validate pass still runs for every hop;
+   * only the socket-level address pin is traded away.
+   */
+  readonly preferNativeFetch?: boolean;
+  /**
    * Opts this provider into the gateway identity (`user-agent:
    * `Cartethyia/<version>`) instead of official CLI cloaking. Explicit only:
    * Codex/Claude-Code-shaped traffic can never take this path, and unsetting
@@ -124,6 +133,12 @@ const RAW_BUNDLED_PROVIDER_METADATA = [
     requiresAccount: true,
     bespokeWire: true,
     hasAdapterUserAgent: true,
+    // Always direct. Cursor's upstream is reached over its own HTTP/2 path and
+    // an egress proxy in front of it breaks the connection shape the upstream
+    // expects, so proxying is not a discovery an operator should have to make
+    // after the first failures. Only the initial value: an explicit `skipProxy`
+    // patch still wins.
+    defaultSkipProxy: true,
     credentialUrl: "https://cursor.com",
     credentialHint: "Sign in with Cursor or import a Cursor API key.",
   },
@@ -317,6 +332,14 @@ const RAW_BUNDLED_PROVIDER_METADATA = [
   },
   { id: "bai", displayName: "B.AI", baseUrl: "https://api.b.ai/v1", credentialUrl: "https://b.ai" },
   {
+    id: "inception",
+    displayName: "Inception Labs",
+    // Version-rooted: the chat wire lives below the `/v1` root, so the
+    // declared path is `/chat/completions` (same rule as Groq/DeepInfra).
+    baseUrl: "https://api.inceptionlabs.ai/v1",
+    credentialUrl: "https://platform.inceptionlabs.ai/dashboard/api-keys",
+  },
+  {
     id: "larprouter",
     displayName: "LarRouter",
     baseUrl: "https://larprouter.com/v1",
@@ -377,7 +400,12 @@ const RAW_BUNDLED_PROVIDER_METADATA = [
     credentialUrl: `${QODER_REALMS.cn.website}/account/integrations`,
     credentialHint: "Paste a Personal Access Token (pt-...) from the Qoder CN integrations page, or sign in with your Qoder China account.",
   },
-  { id: "trae", displayName: "Trae", baseUrl: `${TRAE_REALMS.intl.core}${TRAE_CHAT_PATH}`, hasAdapterUserAgent: true, defaultSkipProxy: true, credentialUrl: "https://www.trae.ai/", credentialHint: "Paste a Trae account export (accessToken + refreshToken) or the raw access token from an international Trae account." },
+  // Proxied by default, unlike most providers here. Trae applies account-level
+  // ban/detection heuristics to the request origin, and a direct egress makes
+  // every account in the pool share one identifiable address — the proxy is
+  // what keeps a pool from being flagged as a whole. Direct remains available
+  // as an explicit `skipProxy` patch for an operator who wants it.
+  { id: "trae", displayName: "Trae", baseUrl: `${TRAE_REALMS.intl.core}${TRAE_CHAT_PATH}`, hasAdapterUserAgent: true, credentialUrl: "https://www.trae.ai/", credentialHint: "Paste a Trae account export (accessToken + refreshToken) or the raw access token from an international Trae account." },
   // A separate provider, not a region flag on `trae`: the China deployment has
   // its own core host, authorization scheme, and model roster, and a CN account
   // dispatched to the intl host is refused rather than degraded.
@@ -619,16 +647,20 @@ export function providerBaseUrl(providerId: string): string {
 export const PROVIDER_COMPATIBILITY_PROFILES: Record<string, CompatibilityProfile> = {
   opencode: {
     endpoint_paths_by_wire_family: {
-      chat: "/inference/v1/chat/completions",
-      responses: "/inference/v1/responses",
+      chat: "/inference/openai/v1/chat/completions",
+      responses: "/inference/openai/v1/responses",
     },
+    // Direct egress must use the native fetch: the anonymous free tier refuses
+    // the Node-stack agent with 429 FreeUsageLimitError (verified live).
+    preferNativeFetch: true,
     model_wire_families: [{ pattern: "^muse-spark", wire_family: "responses" }],
   },
   "opencode-zen": {
     endpoint_paths_by_wire_family: {
-      chat: "/inference/v1/chat/completions",
-      responses: "/inference/v1/responses",
+      chat: "/inference/openai/v1/chat/completions",
+      responses: "/inference/openai/v1/responses",
     },
+    preferNativeFetch: true,
     model_wire_families: [{ pattern: "^muse-spark", wire_family: "responses" }],
   },
   "opencode-go": {

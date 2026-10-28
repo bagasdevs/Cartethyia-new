@@ -221,7 +221,7 @@ export type PoolStatus = (typeof POOL_STATUSES)[number];
  * direct callers against the same list (mirrors `POOL_STATUSES`). Values must
  * stay aligned with the `pool_routing_strategy` enum in `schema.ts`.
  */
-export const POOL_ROUTING_STRATEGIES = ["least_loaded", "round_robin"] as const;
+export const POOL_ROUTING_STRATEGIES = ["least_loaded", "round_robin", "random"] as const;
 export type PoolRoutingStrategyValue = (typeof POOL_ROUTING_STRATEGIES)[number];
 
 export interface PoolStrategySetting {
@@ -351,12 +351,22 @@ export interface NetworkPoolStore {
   list(tenantId: string): Promise<readonly NetworkPoolRecord[]>;
   get(tenantId: string, poolId: string): Promise<NetworkPoolRecord | undefined>;
   create(record: NetworkPoolRecord): Promise<void>;
+  /** Inserts many rows in one statement; returns how many landed. */
+  createMany?(records: readonly NetworkPoolRecord[]): Promise<number>;
   update(
     tenantId: string,
     poolId: string,
     patch: Partial<NetworkPoolRecord>,
   ): Promise<NetworkPoolRecord | undefined>;
+  /** Marks many rows `deleted`; returns how many matched. */
+  updateManyStatus?(
+    tenantId: string,
+    poolIds: readonly string[],
+    status: NetworkPoolRecord["status"],
+  ): Promise<number>;
   delete(tenantId: string, poolId: string): Promise<boolean>;
+  /** Deletes many rows in one statement; returns how many matched. */
+  deleteMany?(tenantId: string, poolIds: readonly string[]): Promise<number>;
   healthCheck(tenantId: string, poolId: string): Promise<HealthCheckResult>;
   /** Measures download throughput through the pool; never throws for a slow
    * or refused transfer — a failed measurement is itself the result. */
@@ -379,6 +389,36 @@ export interface NetworkPoolStore {
   ): Promise<PoolProviderProbeResult>;
   listHealthEvents(tenantId: string, poolId: string): Promise<readonly PoolHealthEvent[]>;
   recover(tenantId: string, poolId: string): Promise<boolean>;
+  /**
+   * Drops the durable provider-cooldown markers on one pool row — the mirror
+   * the selector restores from at boot. The in-memory/Redis state is cleared
+   * separately by the selector; this keeps the two from drifting after a
+   * restart. `onlyBlocked` limits the drop to retired-egress markers, mirroring
+   * `clearProviderBlockedOnly`: a 429 probe may prove an address was never
+   * retired but must not release its live cooldown. Optional (and a no-op in
+   * tests without a backing row store).
+   */
+  dropProviderCooldownMarker?(
+    tenantId: string,
+    poolId: string,
+    providerId: string,
+    onlyBlocked: boolean,
+  ): Promise<void>;
+  /** Drops every provider's marker on one row (disable/replace paths). */
+  dropAllProviderCooldownMarkers?(tenantId: string, poolId: string): Promise<void>;
+  /**
+   * Writes a probe-measured 429 into the durable mirror and the pool's health
+   * history. The probe is the only writer that can *flag* a cooldown from the
+   * control plane — its 429 is a fresh measurement of the same condition a
+   * dispatch-side 429 records, so it lands in both stores and appears as
+   * activity. Optional; absent in tests without a backing row store.
+   */
+  recordProviderProbeCooldown?(
+    tenantId: string,
+    poolId: string,
+    providerId: string,
+    marker: { until: number; reason: string; blocked?: boolean },
+  ): Promise<void>;
   /** Per-tenant pool-group selection strategy; an absent row reads as
    * `DEFAULT_POOL_STRATEGY`. */
   getStrategy(tenantId: string): Promise<PoolStrategySetting>;

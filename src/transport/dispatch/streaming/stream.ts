@@ -43,12 +43,13 @@ import type { AdmissionLease } from "../../../security/admission/contracts";
 import type { NetworkPoolSelector } from "../../../network/pool/selector";
 import type { TelemetryBatchBuffer } from "../../../observability/telemetry-buffer";
 import type { ProviderExchangeCapture } from "../attempt-finalize";
+import { captureProviderExchange } from "../attempt-finalize";
 import {
-  captureProviderExchange,
   providerCaptureMaxBytes,
   resolveCaptureDepthForRequest,
+  resolveCaptureModeForRequest,
   shouldCaptureProviderBodyForRequest,
-} from "../attempt-finalize";
+} from "../capture-policy";
 import { resolveTenantImageClampMaxBytes } from "../../request/tenant-preferences";
 import { proxySuccessHeaders, buildUpstreamDispatchContext } from "../upstream";
 import type { AttemptLeaseOwnership } from "../leases";
@@ -179,6 +180,14 @@ export async function dispatchStreamingAttempt(input: StreamingDispatchInput): P
     prepared.authorization.snapshot.tenant_id,
     state,
   );
+  // Resolved once, before the pipeline exists: the pipeline's diagnostics are
+  // gated on it from construction, so `none`/`metadata` tenants never pay the
+  // transcript serialization or the client-response copy for any event.
+  const captureMode = await resolveCaptureModeForRequest(
+    deps.db,
+    prepared.authorization.snapshot.tenant_id,
+    state,
+  );
   const wrappedOutboundFetch = outboundFetch
     ? captureProviderExchange(
         outboundFetch,
@@ -211,14 +220,6 @@ export async function dispatchStreamingAttempt(input: StreamingDispatchInput): P
     ...(candidate.user_agent === undefined ? {} : { userAgent: candidate.user_agent }),
     ...(wrappedOutboundFetch ? { outboundFetch: wrappedOutboundFetch } : {}),
     ...(outboundFetch ? { outboundAttachmentFetch: outboundFetch } : {}),
-    ...(deps.networkBindingFactory
-      ? {
-          outboundWebSocket: deps.networkBindingFactory.webSocket(
-            networkPoolId,
-            prepared.authorization.snapshot.tenant_id,
-          ),
-        }
-      : {}),
     ...(deps.networkBindingFactory
       ? {
           outboundHttp2: deps.networkBindingFactory.http2Bidi(
@@ -276,6 +277,7 @@ export async function dispatchStreamingAttempt(input: StreamingDispatchInput): P
         ? { response_id: `msg-${crypto.randomUUID()}`, model: candidate.model_id }
         : streamOptions,
     recoverableResponsesPrelude,
+    { captureMode },
   );
   const finalizer = new StreamFinalizer(
     {
@@ -400,6 +402,13 @@ export async function dispatchStreamingAttempt(input: StreamingDispatchInput): P
             }
             sawUpstreamActivity = true;
             if (pipeline.enqueueEvent(result.value, controller)) return;
+            // The guard terminated the stream early: stop consuming. Pulling
+            // on would keep the runaway upstream alive and bill tokens the
+            // client was already told are not coming.
+            if (pipeline.loopDetected) {
+              await finalizer.finalizeStream(controller);
+              return;
+            }
           }
         } catch (err) {
           finalizer.clearStallWatchdog();

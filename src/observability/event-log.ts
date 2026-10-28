@@ -2,6 +2,7 @@ import { open, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { resolveTelemetryRetentionDays } from "../config/telemetry";
 import { resolveDataDir } from "../persistence/db-mode";
+import { hourStamp } from "../shared/time";
 
 /**
  * Per-request telemetry lives in hourly JSONL files, not in Postgres. The
@@ -10,7 +11,7 @@ import { resolveDataDir } from "../persistence/db-mode";
  * `telemetry_events` table.
  */
 /**
- * Where hourly event files and their compacted summaries live.
+ * Where raw hourly event files live.
  *
  * Resolved from the configured data directory, never relative to the working
  * directory: the gateway can be started from anywhere, and a relative path
@@ -19,26 +20,6 @@ import { resolveDataDir } from "../persistence/db-mode";
  * the files were written somewhere else entirely.
  */
 export const TELEMETRY_EVENT_DIR = join(resolveDataDir(), "telemetry-events");
-
-/**
- * The source file an event lands in: one per closed `windowMinutes` bucket.
- *
- * The name is the bucket's own start (`YYYY-MM-DDTHH-MM`), so both the writer
- * and the compactor derive it from a timestamp and cannot disagree. It is also
- * what makes "is this window closed?" a name comparison rather than a read.
- */
-export function windowFileName(at: Date, windowMinutes: number): string {
-  // `2026-10-22T05-15.jsonl`: ISO to the minute with the colon replaced, so the
-  // name sorts chronologically and needs no separate timestamp column.
-  return `${bucketStart(at, windowMinutes).toISOString().slice(0, 16).replace(":", "-")}.jsonl`;
-}
-
-/** The start of the window containing `at`, floored to `windowMinutes`. */
-export function bucketStart(at: Date, windowMinutes: number): Date {
-  const ms = Math.max(1, Math.floor(windowMinutes)) * 60_000;
-  return new Date(Math.floor(at.getTime() / ms) * ms);
-}
-
 
 export interface TelemetryEventRecord {
   readonly id: string;
@@ -142,10 +123,6 @@ function normalize(raw: Record<string, unknown>): TelemetryEventRecord | undefin
 function eventFileHour(file: string): string {
   const stamp = file.endsWith(".events.jsonl") ? `${file.slice(0, 10)}T00` : file.slice(0, 13);
   return stamp;
-}
-
-function hourStamp(date: Date): string {
-  return date.toISOString().slice(0, 13).replaceAll(":", "-");
 }
 
 /** Chunk size for the streaming scan: one line can be long, a file cannot. */
@@ -326,8 +303,7 @@ export async function queryTelemetryEvents(query: EventQuery): Promise<Telemetry
   // The lower bound is the retention window, not just `since`: a caller that
   // asks for all time still must not scan files that have already been aged
   // out, and one that passes no `since` at all must not read every file ever
-  // written. Files older than retention are gone or compacted; either way they
-  // are not here.
+  // written. Retention removes whole raw files; no summary is substituted.
   const retentionFloor = hourStamp(
     new Date(Date.now() - resolveTelemetryRetentionDays() * 24 * 60 * 60_000),
   );
@@ -361,8 +337,8 @@ export async function queryTelemetryEvents(query: EventQuery): Promise<Telemetry
   // A single-row lookup: stop at the first (newest) match instead of parsing
   // the whole retention window.
   const oneRow = query.requestId !== undefined || query.id !== undefined;
-  // With one file per day, a plain page of the newest rows would otherwise
-  // parse the whole day to return fifty lines. When nothing filters on
+  // With one file per hour, a plain page of the newest rows does not need to
+  // parse the whole retention window to return fifty lines. When nothing filters on
   // content — no status, no key, no account — the newest rows are the last
   // lines, so they are read backwards from the end and the scan stops once the
   // page is full.

@@ -10,11 +10,29 @@ test("in-flight snapshot tracks requests and distinct client IPs until cleanup",
 
   first.startProviderFlight();
   second.startProviderFlight();
-  expect(store.inFlightSnapshot()).toEqual({ inFlight: 2, uniqueIps: 1 });
+  expect(store.inFlightSnapshot()).toMatchObject({ inFlight: 2, uniqueIps: 1 });
 
   first.cleanup();
-  expect(store.inFlightSnapshot()).toEqual({ inFlight: 1, uniqueIps: 1 });
+  expect(store.inFlightSnapshot()).toMatchObject({ inFlight: 1, uniqueIps: 1 });
 
   second.cleanup();
-  expect(store.inFlightSnapshot()).toEqual({ inFlight: 0, uniqueIps: 0 });
+  expect(store.inFlightSnapshot()).toMatchObject({ inFlight: 0, uniqueIps: 0 });
+});
+
+test("a request that never starts a flight is never counted", () => {
+  const store = new ProxyRequestStateStore();
+  const state = store.initialize(new Request("http://localhost/v1/chat/completions"), Date.now(), 60_000);
+  state.clientIdentity = { address: "192.0.2.1", source: "tcp-peer" };
+
+  // Registered but never dispatched: the gauge counts provider flights, not
+  // raw registrations, so this stays invisible until dispatch happens.
+  expect(store.inFlightSnapshot()).toMatchObject({ inFlight: 0, uniqueIps: 0 });
+
+  state.startProviderFlight();
+  expect(store.inFlightSnapshot()).toMatchObject({ inFlight: 1, uniqueIps: 1 });
+  state.extendDeadline(60_000);
+  expect(store.inFlightSnapshot()).toMatchObject({ inFlight: 1, uniqueIps: 1 });
+
+  state.cleanup();
+  expect(store.inFlightSnapshot()).toMatchObject({ inFlight: 0, uniqueIps: 0 });
 });

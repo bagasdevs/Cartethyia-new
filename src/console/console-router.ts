@@ -26,11 +26,11 @@ import type { NetworkPoolSelector } from "../network/pool/selector";
 import type { TelemetryBatchBuffer } from "../observability/telemetry-buffer";
 import type { OAuthRefreshService } from "../providers/authentication/oauth-refresh-service";
 import type { ApiKeyAdmissionService } from "../security/admission/service";
-import type { ModelStrikeService } from "../security/model-abuse";
 import type { RedisClient } from "../persistence/redis";
 import { CliToolMappingStore } from "./cli-tools/store";
 import { CliToolService } from "./cli-tools/service";
 import { DrizzleCliToolSecretSource } from "./cli-tools/secret-source";
+import type { ShareLinkStore } from "../persistence/stores/share-store";
 import type { ProviderRegistry } from "../providers/provider-registry";
 import type { BundledProviderCatalog } from "../providers/operations/provider-catalog-service";
 import type { ValidatedNetworkBindingFactory } from "../network/pool/resolver";
@@ -65,13 +65,13 @@ export interface ConsoleApiCompositionDeps {
   readonly networkBindingFactory: ValidatedNetworkBindingFactory;
   readonly redis: RedisClient | undefined;
   readonly oauthRefreshService: OAuthRefreshService;
-  readonly admissionService: Pick<ApiKeyAdmissionService, "purgeKey">;
   /**
-   * Graduated model-abuse strikes: list and lift bans from the console.
-   * Optional so reduced compositions (route-only shell, console stubs) stay
-   * valid; absent means the `/model-bans` routes are not mounted.
+   * Share-link store shared with the public share router, so both surfaces
+   * wrap the same table through one instance. Optional: absent means the
+   * console builds its own store from `db`.
    */
-  readonly modelStrikes?: Pick<ModelStrikeService, "listBans" | "unban" | "ban">;
+  readonly shareStore?: ShareLinkStore;
+  readonly admissionService: Pick<ApiKeyAdmissionService, "purgeKey">;
   readonly readRoutingAccountInflight?:
     | ((
         providerId: string,
@@ -190,11 +190,11 @@ export function createConsoleRouter(deps: ConsoleApiCompositionDeps): Elysia {
     poolSelector,
     telemetryBuffer,
     ...(deps.stateStore ? { stateStore: deps.stateStore } : {}),
+    ...(deps.shareStore ? { shareStore: deps.shareStore } : {}),
     providerRegistry: deps.providerRegistry,
     bundledModelCatalog: deps.bundledModelCatalog,
     networkBindingFactory: deps.networkBindingFactory,
     admissionService: deps.admissionService,
-    ...(deps.modelStrikes ? { modelStrikes: deps.modelStrikes } : {}),
     readRoutingAccountInflight: deps.readRoutingAccountInflight,
     ...(deps.flushBuffers ? { flushBuffers: deps.flushBuffers } : {}),
     credentialService,

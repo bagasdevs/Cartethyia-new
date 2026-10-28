@@ -1,59 +1,93 @@
 import type { CartethyiaDatabase } from "../persistence/db-handle";
 import { DrizzleTelemetryStore } from "../persistence/stores/telemetry-store";
-import { prunePayloadFrames, writePayloadFrame } from "./payload-store";
+import { PayloadBacklogFullError, prunePayloadFrames, writePayloadFrame } from "./payload-store";
 import { resolveTelemetryPayloadMaxBytes } from "../config/telemetry";
+import { metrics } from "./metrics";
 import { preferencesReaderFor } from "../persistence/tenant-preferences";
 import type {
   TelemetryPayloadDepth,
   TelemetryPayloadMode,
-  TelemetryPayloadRetentionMinutes,
 } from "../console/settings/contracts";
 export type CaptureScope = "tenant" | "debug_session" | "operator_flag";
 
 /**
  * How long a captured payload frame lives when the deployment has not chosen.
  *
+ * An hour, not fifteen minutes: a frame is the only record of what a request
+ * actually sent and received, and the window is when an operator can still go
+ * back and read it. Fifteen minutes is shorter than the time between noticing
+ * a bad response and opening the drawer, so the frame was already gone by the
+ * time someone looked for it. The cost is disk, which the Data Management
+ * panel reports and a tenant can reclaim on demand.
+ *
  * Exported so surfaces that report on disk usage quote the same window the
  * capture path enforces, rather than a second copy of the default that would
  * drift the first time this one changes.
  */
 export function payloadRetentionMs(): number {
-  const raw = Number(process.env.CARTETHYIA_TELEMETRY_PAYLOAD_RETENTION_MS ?? 15 * 60_000);
-  if (!Number.isFinite(raw) || raw < 1_000 || raw > MAX_PAYLOAD_RETENTION_MS) return 15 * 60_000;
+  const raw = Number(process.env.CARTETHYIA_TELEMETRY_PAYLOAD_RETENTION_MS ?? DEFAULT_PAYLOAD_RETENTION_MS);
+  if (!Number.isFinite(raw) || raw < 1_000 || raw > MAX_PAYLOAD_RETENTION_MS) return DEFAULT_PAYLOAD_RETENTION_MS;
   return Math.floor(raw);
 }
 
 /**
- * The longest payload retention a tenant may ask for: seven days.
+ * The fallback window, exported so a test can assert the default without
+ * pinning the number.
  *
- * Two things depend on this being a hard ceiling rather than a suggestion.
- *
- * The prune pass deletes a frame file it cannot parse once the file's last
- * write is older than the retention window — that bound is the only thing that
- * makes a damaged file reclaimable at all. A tenant allowed to keep frames for
- * a year while the prune assumed an hour would have live frames deleted out
- * from under them.
- *
- * The disk-usage panel counts a frame as reclaimable once its file is older
- * than the same window. Without a ceiling it would offer a reclaim button for
- * frames that are still live, and the operator would press it and see
- * "nothing to reclaim".
+ * A literal in a test is a veto on changing policy: the assertion fails the
+ * moment the default moves, so the number stops being a choice and becomes
+ * whatever the test happened to be written against.
  */
+export const DEFAULT_PAYLOAD_RETENTION_MS = 60 * 60_000;
+
+/** Upper bound for a deployment-level retention override, not a tenant setting. */
 export const MAX_PAYLOAD_RETENTION_MS = 7 * 24 * 60 * 60_000;
 
-/** Milliseconds one tenant's chosen retention resolves to. */
-export function retentionMsFor(minutes: number | null | undefined): number {
-  if (minutes === null || minutes === undefined) return payloadRetentionMs();
-  if (!Number.isFinite(minutes)) return payloadRetentionMs();
-  return Math.min(Math.max(1_000, Math.floor(minutes * 60_000)), MAX_PAYLOAD_RETENTION_MS);
+/**
+ * Truncates a string to at most `maxBytes` UTF-8 bytes without splitting a
+ * code point.
+ *
+ * The budget contract everywhere in this module is **bytes**, not UTF-16 code
+ * units: `.length` on a CJK-heavy body counts one per character while the same
+ * text costs three bytes on the wire and on disk, so a "1 MiB" cap kept ~3 MiB
+ * of CJK content and dropped 3× more Latin content than the operator asked
+ * for. Slicing at a raw byte boundary can split a multi-byte sequence; this
+ * helper backs up to the last complete sequence so the truncated text stays
+ * valid.
+ */
+export function truncateUtf8(value: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  const totalBytes = Buffer.byteLength(value, "utf8");
+  if (totalBytes <= maxBytes) return value;
+  const sliced = Buffer.from(value, "utf8").subarray(0, maxBytes);
+  // Walk back from the cut (at most 3 bytes: the longest UTF-8 sequence is 4
+  // bytes) to the lead byte of the sequence the cut landed inside, then drop
+  // that whole sequence. A cut that lands between sequences stays put.
+  for (let back = 0; back < 4 && sliced.length - back > 0; back += 1) {
+    const byte = sliced[sliced.length - back - 1]!;
+    if ((byte & 0xc0) !== 0x80) {
+      // This is a lead byte (or ASCII): the sequence it starts has n bytes.
+      const sequenceLength =
+        byte >= 0xf0 ? 4 : byte >= 0xe0 ? 3 : byte >= 0xc0 ? 2 : 1;
+      // The cut is `back` bytes into this sequence. If the sequence does not
+      // fully fit within the slice, drop the whole sequence.
+      if (back + 1 < sequenceLength) {
+        return sliced.subarray(0, sliced.length - back - 1).toString("utf8");
+      }
+      return sliced.toString("utf8");
+    }
+    // Continuation byte: the lead byte is further back.
+  }
+  // Degenerate slice of only continuation bytes: nothing complete to keep.
+  return "";
 }
 
 /**
  * Settings-gated payload capture. Request-event metadata is always retained;
  * tenants opt into drawer capture through Settings → Privacy: `metadata`
  * keeps only the Proxy→Provider request line, `full` keeps redacted bodies
- * at the tenant's chosen depth, and both live for the tenant's chosen
- * retention. Fail-closed on error.
+ * at the tenant's chosen depth. Their lifetime is the tenant's Request detail
+ * window, or the deployment default when unset. Fail-closed on error.
  */
 export async function resolvePayloadCapture(
   db: CartethyiaDatabase,
@@ -72,7 +106,11 @@ export async function resolvePayloadCapture(
     const prefs = await preferencesReaderFor(db).readPreferences(tenantId);
     const mode = prefs?.telemetryPayloads;
     const depth = prefs?.telemetryPayloadDepth;
-    const retention = prefs?.telemetryPayloadRetentionMinutes;
+    const minutes = prefs?.telemetryWindowMinutes;
+    const retentionMs =
+      typeof minutes === "number" && Number.isFinite(minutes) && minutes > 0
+        ? Math.min(MAX_PAYLOAD_RETENTION_MS, Math.floor(minutes * 60_000))
+        : payloadRetentionMs();
     return {
       ok: true,
       mode: mode === "full" || mode === "metadata" || mode === "none" ? mode : "none",
@@ -86,7 +124,7 @@ export async function resolvePayloadCapture(
               : depth === "full"
                 ? "maximum"
                 : "minimum",
-      retentionMs: retentionMsFor(retention as TelemetryPayloadRetentionMinutes | undefined),
+      retentionMs,
     };
   } catch {
     // A preference read that fails must not invent capture. Off keeps nothing.
@@ -135,7 +173,9 @@ export type PayloadCaptureState =
   /** The preference read failed, and capture fails closed. */
   | "skipped_preference_read_failed"
   /** The storage write failed after the decision to capture. */
-  | "failed_write";
+  | "failed_write"
+  /** The payload writer's backlog was at its bound, so the frame was dropped. */
+  | "failed_backlog";
 
 export interface PayloadCaptureInput {
   tenantId: string;
@@ -150,8 +190,7 @@ export interface PayloadCaptureInput {
    */
   maxBytes?: number;
   /**
-   * How long this frame lives, in ms. Defaults to the tenant's chosen
-   * retention, then the deployment default. Bounded by
+   * Retention for this capture; normally the deployment default. Bounded by
    * {@link MAX_PAYLOAD_RETENTION_MS} either way.
    */
   retentionMs?: number;
@@ -295,6 +334,8 @@ export function buildPayloadRecord(
   const kept: unknown[] = [];
   let accounted = 0;
   const truncatedKeys = new Set<keyof StoredPayload>();
+  // A fully-dropped body's own byte size, for the marker the drawer renders.
+  const truncatedOriginalBytes = new Map<keyof StoredPayload, number>();
   /**
    * Whether a surface kept a *body* — not whether it is merely non-null.
    *
@@ -311,13 +352,21 @@ export function buildPayloadRecord(
       continue;
     }
     const text = JSON.stringify(body);
-    if (accounted + text.length > maxBytes) {
+    // Accounted in UTF-8 bytes: the cap is a storage budget, and the bytes a
+    // body costs on disk are its UTF-8 size. Code-unit accounting under-counts
+    // multi-byte content ~3x (CJK) and over-allocates Latin content.
+    const textBytes = Buffer.byteLength(text, "utf8");
+    if (accounted + textBytes > maxBytes) {
+      // Same drop-then-marker rule as before — only the accounting basis is
+      // now bytes. A partial head would be raw JSON text where the drawer
+      // renders a structured panel, so the body is kept whole or marked.
       truncatedKeys.add(key);
+      truncatedOriginalBytes.set(key, textBytes);
       stored[key] = null;
       serialized.push("null");
       continue;
     }
-    accounted += text.length;
+    accounted += textBytes;
     stored[key] = body;
     serialized.push(text);
     kept.push(body);
@@ -332,7 +381,7 @@ export function buildPayloadRecord(
     _original_bytes: originalBytes,
     _hint: "Truncated by the capture cap — raise Settings → Telemetry payloads → Capture depth to keep more.",
   });
-  for (const key of truncatedKeys) stored[key] = marker(accounted);
+  for (const key of truncatedKeys) stored[key] = marker(truncatedOriginalBytes.get(key) ?? 0);
   return {
     request_id: input.requestId ?? null,
     captured_at: now,
@@ -385,7 +434,12 @@ export class TelemetryPayloadCapture {
     this.store = new DrizzleTelemetryStore(db);
   }
 
-  async capture(input: PayloadCaptureInput): Promise<{ id: string; expiresAt: Date }> {
+  async capture(input: PayloadCaptureInput): Promise<{
+    id: string;
+    expiresAt: Date;
+    /** Terminal capture state for the request row (`failed_backlog` on a dropped frame). */
+    payloadCaptureState?: PayloadCaptureState;
+  }> {
     if (!isCaptureAllowed(input)) {
       throw Object.assign(new Error("payload capture not opted in"), {
         code: "capture_not_opted_in",
@@ -402,14 +456,33 @@ export class TelemetryPayloadCapture {
       input.maxBytes ?? resolveTelemetryPayloadMaxBytes(),
       retentionMs,
     );
-    const reference = await writePayloadFrame(record, record.expires_at, record._serialized
-      ? {
-          requestId: record.request_id,
-          capturedAt: record.captured_at.toISOString(),
-          signals: record.signals,
-          bodies: record._serialized,
-        }
-      : undefined);
+    let reference;
+    try {
+      reference = await writePayloadFrame(record, record.expires_at, record._serialized
+        ? {
+            requestId: record.request_id,
+            capturedAt: record.captured_at.toISOString(),
+            signals: record.signals,
+            bodies: record._serialized,
+          }
+        : undefined);
+    } catch (error) {
+      if (error instanceof PayloadBacklogFullError) {
+        // The writer's backlog is at its bound: the frame is dropped here,
+        // counted, and surfaced on the request as its own terminal state —
+        // distinct from a storage failure, because "the disk is slow" and
+        // "capture burst past the backlog bound" need different fixes. No
+        // `telemetry_payloads` row is inserted: a row without a frame would
+        // read as a corrupt reference.
+        metrics.cartethyia_payload_backlog_dropped_total.inc(1);
+        return {
+          id: "",
+          expiresAt: record.expires_at,
+          payloadCaptureState: "failed_backlog",
+        };
+      }
+      throw error;
+    }
     // Typed columns only — bodies live in the frame file. The schema has no
     // jsonb body column, so a body cannot be written to Postgres here.
     return this.store.insertPayload({

@@ -3,12 +3,7 @@ import type { ProviderDispatchContext, ProviderId, ProviderAdapter } from "../..
 import { GatewayError } from "../../protocol/gateway-error";
 import type { CanonicalEvent } from "../../protocol/canonical-model";
 import { resolveCredentialForAccount } from "../../providers/operations/provider-credential-service";
-import type { OAuthTokenRefresher } from "../../providers/authentication/oauth-refresh-service";
-import type { OAuthRefreshService } from "../../providers/authentication/oauth-refresh-service";
-import type { ValidatedNetworkBindingFactory } from "../../network/pool/resolver";
 import type { ByokUpstreamHost } from "../../providers/operations/provider-catalog-service";
-import type { CartethyiaDatabase } from "../../persistence/db-handle";
-import type { RouteSnapshotService } from "../routing/route-model";
 import { chatAdapter } from "../surface/chat/adapter";
 import { responsesAdapter } from "../surface/responses/adapter";
 import { messagesAdapter } from "../surface/messages/adapter";
@@ -21,10 +16,6 @@ import {
   resolveTenantImageClampMaxBytes,
 } from "../request/tenant-preferences";
 import { metrics } from "../../observability/metrics";
-import type { NetworkPoolSelector } from "../../network/pool/selector";
-import type { TelemetryBatchBuffer } from "../../observability/telemetry-buffer";
-import { ProxyRequestStateStore } from "../request/state";
-import type { ProxyRequestPreparer } from "../request/preparer";
 import { repriceUsage } from "../../providers/provider-usage";
 import {
   captureProviderExchange,
@@ -32,33 +23,25 @@ import {
   completionContext,
   estimatedUsage,
   parseCapturedBody,
+  terminalFailure,
+} from "./attempt-finalize";
+import {
   providerCaptureMaxBytes,
   resolveCaptureDepthForRequest,
   shouldCaptureProviderBodyForRequest,
-  terminalFailure,
-} from "./attempt-finalize";
+} from "./capture-policy";
 import { runAttemptLoop } from "./attempt-loop";
-import { projectForRoute, routeCapabilitiesFor } from "../translation/capabilities";
+import { projectForRoute, routeCapabilitiesFor } from "../../protocol/translation/capabilities";
 import { dispatchStreamingAttempt } from "./streaming/stream";
 import type { ProviderContinuationScope } from "../../providers/provider-contracts";
 import type { PreparedProxyRequest } from "../request/preparer";
 
-export interface ProviderProxyHandlerDeps {
-  readonly db: CartethyiaDatabase;
-  readonly providerAdapters: ReadonlyMap<string, ProviderAdapter>;
-  /** Preferred over `providerAdapters`: resolves an adapter on demand and caches it. */
-  readonly resolveProviderAdapter?: (providerId: string) => Promise<ProviderAdapter | undefined>;
-  readonly stateStore: ProxyRequestStateStore;
-  readonly proxyPreparer?: ProxyRequestPreparer;
-  readonly networkBindingFactory?: ValidatedNetworkBindingFactory;
+import type { GatewayHandlerDeps } from "./handler-deps";
+
+export type ProviderProxyHandlerDeps = GatewayHandlerDeps & {
   /** Live lookup of a provider's SSRF-validated upstream host. */
   readonly byokUpstreamHosts?: { readonly get: (providerId: string) => ByokUpstreamHost | undefined };
-  readonly poolSelector?: NetworkPoolSelector;
-  readonly snapshotService?: RouteSnapshotService;
-  readonly telemetryBuffer?: TelemetryBatchBuffer;
-  readonly resolveOAuthRefresher?: (providerId: string) => Promise<OAuthTokenRefresher | undefined>;
-  readonly oauthRefreshService?: OAuthRefreshService;
-}
+};
 
 /**
  * The continuation scope one dispatch carries.
@@ -198,9 +181,7 @@ export async function handleProviderProxyRequest(
             provider_id: candidate.provider_id as ProviderId,
             credential_kind: "none" as const,
           };
-      const adapter = deps.resolveProviderAdapter
-        ? await deps.resolveProviderAdapter(candidate.provider_id)
-        : deps.providerAdapters.get(candidate.provider_id);
+      const adapter = await deps.resolveProviderAdapter?.(candidate.provider_id);
       if (!adapter)
         throw new GatewayError("admission_unavailable", 503, "provider adapter not registered");
       if (!isBundledProviderId(candidate.provider_id)) {
@@ -281,9 +262,6 @@ export async function handleProviderProxyRequest(
                 prepared.authorization.snapshot.tenant_id,
               ),
             }
-          : {}),
-        ...(deps.networkBindingFactory
-          ? { outboundWebSocket: deps.networkBindingFactory.webSocket(networkPoolId, prepared.authorization.snapshot.tenant_id) }
           : {}),
         ...(deps.networkBindingFactory
           ? {

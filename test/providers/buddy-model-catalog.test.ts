@@ -20,9 +20,17 @@ function luna(rows: readonly ModelDefinition[]) {
 }
 
 describe("live Buddy CLI models on the shared roster", () => {
-  test("omits GPT-6 Astra from both international catalogs", () => {
+  test("publishes GPT-6 Astra on both international catalogs", () => {
+    // It is in the live CLI roster of /v3/config, so omitting it made a
+    // servable model invisible. Asserted with the limits upstream declares
+    // rather than merely asserted present, so a silent limit drift fails here.
     for (const rows of [CODEBUDDY_MODELS, WORKBUDDY_MODELS]) {
-      expect(rows.some((model) => model.modelId === "gpt-6-astra")).toBe(false);
+      const row = rows.find((model) => model.modelId === "gpt-6-astra");
+      expect(row).toBeDefined();
+      expect(row?.contextLimit).toBe(1_000_000);
+      expect(row?.outputLimit).toBe(128_000);
+      expect(row?.reasoning).toBe(true);
+      expect(row?.toolCall).toBe(true);
     }
   });
 
@@ -59,11 +67,18 @@ describe("live Buddy CLI models on the shared roster", () => {
     }
   });
 
-  test("omits the backend-selected aliases and kimi-k3.1", () => {
-    // These ids are not models a client should be offered: the four aliases
-    // resolve server-side, and kimi-k3.1 is not served. `auto` stays, and is
-    // no longer rewritten onto `default-model`.
-    for (const id of ["balanced-model", "default-model", "fast-model", "primary-model", "kimi-k3.1"]) {
+  test("publishes the named tiers, keeps default-model server-selected, omits kimi-k3.1", () => {
+    // `fast-model`, `balanced-model` and `primary-model` are first-class rows in
+    // the live CLI roster with published limits, so they belong in the catalog.
+    // `default-model` is different: it is the id `auto` is rewritten onto at
+    // dispatch (`BUDDY_AUTO_TARGET`), so publishing it would offer a client an
+    // id it never needs to send. `kimi-k3.1` is not in the roster at all.
+    for (const id of ["fast-model", "balanced-model", "primary-model"]) {
+      for (const rows of [CODEBUDDY_MODELS, WORKBUDDY_MODELS]) {
+        expect(rows.some((model) => model.modelId === id)).toBe(true);
+      }
+    }
+    for (const id of ["default-model", "kimi-k3.1"]) {
       for (const rows of [CODEBUDDY_MODELS, WORKBUDDY_MODELS]) {
         expect(rows.some((model) => model.modelId === id)).toBe(false);
       }
@@ -86,10 +101,11 @@ describe("gpt-6-luna on the buddy roster", () => {
   test("cb publishes it at the shared context window", () => {
     const row = luna(CODEBUDDY_MODELS);
     expect(row).toBeDefined();
-    // 1,050,000 is what `gpt-6.1-sol` carries on this roster, and what the
-    // bundled base catalog records for `gpt-6-luna`. Asserting against the
-    // sibling row rather than a literal keeps the two from drifting apart.
-    expect(row?.contextLimit).toBe(1_050_000);
+    // 1,000,000 is what /v3/config publishes for `gpt-6-luna` (and for every
+    // gpt-6 sibling). It was recorded as 1,050,000, a number no endpoint
+    // reports; asserting the sibling as the source of truth would have kept
+    // that error self-consistent instead of catching it.
+    expect(row?.contextLimit).toBe(1_000_000);
     expect(row?.outputLimit).toBe(128_000);
   });
 
@@ -127,11 +143,16 @@ describe("gpt-6-luna on the buddy roster", () => {
     expect(luna(CODEBUDDY_CN_MODELS)).toBeUndefined();
   });
 
-  test("CodeBuddy CN publishes the newly fetched CLI models and drops the removed model", () => {
+  test("CodeBuddy CN publishes the live CLI roster and drops the legacy fallback rows", () => {
+    // `uto` was here only because the reference's CN fallback table carried it;
+    // the CN /v3/config roster does not publish it. The legacy block is gone, so
+    // the CN catalog is exactly what upstream serves — 19 chat rows plus the
+    // image generation row.
     const rows = [
-      ["uto", 256_000, 32_000],
       ["space-bunny", 1_000_000, 128_000],
       ["step-5-preview", 1_000_000, 64_000],
+      ["kimi-k3-1", 1_000_000, 32_000],
+      ["minimax-m2.7", 200_000, 48_000],
     ] as const;
     for (const [modelId, contextLimit, outputLimit] of rows) {
       const row = CODEBUDDY_CN_MODELS.find((model) => model.modelId === modelId);
@@ -139,7 +160,13 @@ describe("gpt-6-luna on the buddy roster", () => {
       expect(row?.contextLimit).toBe(contextLimit);
       expect(row?.outputLimit).toBe(outputLimit);
     }
-    expect(CODEBUDDY_CN_MODELS.some((model) => model.modelId === "hy4-preview-x")).toBe(false);
+    for (const removed of ["uto", "hy4-preview-x", "hunyuan-chat", "glm-4.6", "default"]) {
+      expect(CODEBUDDY_CN_MODELS.some((model) => model.modelId === removed)).toBe(false);
+    }
+    // The one row that is published but not a chat model: kept as generation.
+    expect(
+      CODEBUDDY_CN_MODELS.find((model) => model.modelId === "hunyuan-image-alpha")?.serviceKind,
+    ).toBe("imageGeneration");
   });
 
   test("WorkBuddy CN uses exactly the CodeBuddy CN catalog with its own endpoint", () => {
@@ -169,21 +196,18 @@ describe("measured context windows", () => {
     }
   });
 
-  test("kimi-k2.8-preview is published at the measured 1,048,576 context", () => {
-    for (const rows of [CODEBUDDY_MODELS, WORKBUDDY_MODELS, CODEBUDDY_CN_MODELS]) {
+  test("kimi-k2.8-preview is published at each realm's measured context", () => {
+    // The two realms genuinely differ and always did: intl publishes
+    // 1,048,576/65,536 while CN publishes 1,000,000/64,000. Asserting one pair
+    // across all three catalogs only passed because CN's row was a copy of the
+    // intl numbers, so it encoded the bug rather than the fact.
+    for (const rows of [CODEBUDDY_MODELS, WORKBUDDY_MODELS]) {
       const row = rows.find((model) => model.modelId === "kimi-k2.8-preview");
       expect(row?.contextLimit).toBe(1_048_576);
       expect(row?.outputLimit).toBe(65_536);
     }
-  });
-
-  test("hy3-preview and deep-model are published", () => {
-    for (const rows of [CODEBUDDY_MODELS, WORKBUDDY_MODELS]) {
-      const preview = rows.find((model) => model.modelId === "hy3-preview");
-      expect(preview?.contextLimit).toBe(262_144);
-      expect(preview?.outputLimit).toBe(64_000);
-      expect(preview?.reasoningEfforts).toEqual(["low", "high"]);
-      expect(rows.some((model) => model.modelId === "deep-model")).toBe(true);
-    }
+    const cn = CODEBUDDY_CN_MODELS.find((model) => model.modelId === "kimi-k2.8-preview");
+    expect(cn?.contextLimit).toBe(1_000_000);
+    expect(cn?.outputLimit).toBe(64_000);
   });
 });

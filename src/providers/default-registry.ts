@@ -1,3 +1,7 @@
+// dynamic-import-ok: lazy provider registry. Every entry is a
+// `() => await import("./integrations/<name>/...")` so loading a provider
+// pays only when the first request routes to it. Static imports here would
+// drag every integration into memory at process start.
 import {
   GENERIC_API_KEY_SPECS,
 } from "./configured-openai-providers";
@@ -234,6 +238,11 @@ export const PROVIDER_CAPABILITIES = {
     loadModels: async () => (await import("./integrations/codex/codex")).CODEX_MODELS,
     loadAuthentication: oauthCapability(() => import("./integrations/codex/codex-oauth"), "codexOAuthClient", { withRefresher: true }),
     loadQuotaCollector: quotaCapability(() => import("./integrations/codex/codex-quota"), "fetchCodexQuota"),
+    loadModelDiscovery: async () => async ({ credential, fetcher }) =>
+      (await import("./integrations/codex/codex")).discoverCodexModels({
+        credential,
+        ...(fetcher === undefined ? {} : { fetcher }),
+      }),
   },
   grok: {
     loadAdapter: async () => (await import("./integrations/grok/grok")).grokAdapter,
@@ -357,10 +366,11 @@ export const PROVIDER_CAPABILITIES = {
     // catalog row behind it.
     // Dispatch base, not the catalog base: `/zen/v1/models` publishes the
     // listing while `/inference/v1/models` answers 404, and a byte-exact replay
-    // against `/inference/v1` returned 200 where `/zen/v1` did not.
+    // against `/inference/v1` returned 200 where `/zen/v1` did not. The wire
+    // paths are the 2.1 family-segment shapes on the `/inference` origin.
     endpointPathsByWireFamily: {
-      chat: "/inference/v1/chat/completions",
-      responses: "/inference/v1/responses",
+      chat: "/inference/openai/v1/chat/completions",
+      responses: "/inference/openai/v1/responses",
     },
     loadAdapter: async () => createApiKeyAdapter((await import("./integrations/opencode/provider")).OPENCODE_FREE_SPEC),
     loadModels: async () => (await import("./integrations/opencode/provider")).OPENCODE_FREE_MODELS,
@@ -377,8 +387,8 @@ export const PROVIDER_CAPABILITIES = {
   },
   "opencode-zen": {
     endpointPathsByWireFamily: {
-      chat: "/inference/v1/chat/completions",
-      responses: "/inference/v1/responses",
+      chat: "/inference/openai/v1/chat/completions",
+      responses: "/inference/openai/v1/responses",
     },
     loadAdapter: async () => createApiKeyAdapter((await import("./integrations/opencode/provider")).OPENCODE_ZEN_SPEC),
     loadModels: async () => (await import("./integrations/opencode/provider")).OPENCODE_ZEN_MODELS,
@@ -523,7 +533,12 @@ export const PROVIDER_CAPABILITIES = {
   },
   inferhub: {
     loadAdapter: async () => (await import("./integrations/inferhub")).createInferhubAdapter(),
+    // Live `/v1/models` is the primary source: the marketplace republishes its
+    // whole roster and it moves faster than a committed array can. The static
+    // list stays as the offline fallback when the fetch fails.
     loadModels: async () => (await import("./integrations/inferhub")).INFERHUB_MODELS,
+    loadModelDiscovery: async () =>
+      (await import("./integrations/inferhub")).inferhubModelDiscovery()(),
     loadQuotaCollector: quotaCapability(() => import("./integrations/inferhub"), "fetchInferhubQuota"),
   },
   hermes: {
@@ -539,6 +554,21 @@ export const PROVIDER_CAPABILITIES = {
         ...(fetcher === undefined ? {} : { fetcher }),
       });
     },
+  },
+  inception: {
+    // Chat only: Mercury 3 / 2.5 / 2 answer the OpenAI-compatible chat wire.
+    // The base is version-rooted (`/v1`), so the path is declared below it.
+    endpointPathsByWireFamily: { chat: "/chat/completions" },
+    loadAdapter: async () => createApiKeyAdapter((await import("./integrations/inception/provider")).INCEPTION_SPEC),
+    loadModels: async () => (await import("./integrations/inception/provider")).INCEPTION_MODELS,
+    // The listing is bearer-authenticated and the whole provider is pinned to
+    // its free allowance, so every fetched row is stamped free-tier.
+    loadModelDiscovery: async () => async ({ baseUrl, credential, fetcher }) =>
+      (await import("./integrations/inception/provider")).discoverInceptionFreeModels({
+        baseUrl,
+        ...(typeof credential === "string" && credential.length > 0 ? { credential } : {}),
+        ...(fetcher === undefined ? {} : { fetcher }),
+      }),
   },
   openrouter: {
     loadAdapter: async () => createApiKeyAdapter((await import("./integrations/openrouter/provider")).OPENROUTER_SPEC),

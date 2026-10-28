@@ -107,7 +107,7 @@ export type { ProbeReasoningEffort } from "../../../src/providers/discovery/disc
  * `(level)` string here would drift from `parseThinkingSuffix` the moment
  * either side changes.
  */
-export { formatThinkingSuffix } from "../../../src/transport/translation/thinking";
+export { formatThinkingSuffix } from "../../../src/protocol/translation/thinking";
 
 export type {
   ComboStrategy,
@@ -128,10 +128,6 @@ export type {
   ShareKeyResponse,
 } from "../../../src/console/api-keys/contracts";
 
-// Model-abuse bans are a platform-admin, cross-tenant list (`GET`/`DELETE
-// /model-bans`). The row shape is the backend's own, so the dashboard never
-// keeps a second copy of the fields the unban call is keyed on.
-export type { ModelAbuseBan } from "../../../src/security/model-abuse";
 export type {
   SharedKeySummary,
   SharedKeyActivityDetail,
@@ -145,7 +141,8 @@ export type {
 export type { BackupPayload as BackupExportResponse } from "../../../src/console/backup/contracts";
 export type { ImportResult as BackupImportResponse } from "../../../src/console/backup/service";
 export type { ImportReport as BackupImportReport } from "../../../src/console/backup/nine-router";
-
+import type { DeleteAllScope } from "../../../src/console/backup/store";
+export type { DeleteAllScope };
 export type { AuditEntry, AuditListPage } from "../../../src/console/audit/contracts";
 
 export type {

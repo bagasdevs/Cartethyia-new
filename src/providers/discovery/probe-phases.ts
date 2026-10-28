@@ -36,6 +36,8 @@ import { OpenAICompatibleAdapter } from "../adapters/compatible-adapter";
 import { resolveByokWireProfile } from "../operations/byok-wire-profile";
 import { recordAccountFailure, recordAccountSuccess } from "../operations/account-health-service";
 import { buildCapabilityProfile } from "../../transport/routing/route-catalog";
+import { payloadRetentionMs, resolvePayloadCapture } from "../../observability/payload-capture";
+import type { TelemetryPayloadDepth } from "../../console/settings/contracts";
 import { classifyUpstreamFailure } from "../../transport/failure-policy";
 import { terminalFailure } from "../../transport/dispatch/attempt-finalize";
 import { GatewayError } from "../../protocol/gateway-error";
@@ -166,6 +168,8 @@ export interface ProbeTarget {
    * so the probe tests the route, not an empty stand-in.
    */
   readonly capabilityProfile: Readonly<Record<string, boolean>>;
+  /** The model row's output ceiling, when it declares one. */
+  readonly outputLimit?: number | null;
 }
 
 /**
@@ -215,10 +219,11 @@ export async function resolveProbeTarget(args: {
   let serviceKind: ServiceKind = requestedServiceKind;
   // Capability columns for the row the probe lands on. Resolved alongside the
   // wire so the profile describes the same row the probe dispatches to.
-  let capabilitySource: { modalities: unknown; reasoning: boolean; toolCall: boolean } = {
+  let capabilitySource: { modalities: unknown; reasoning: boolean; toolCall: boolean; outputLimit: number | null } = {
     modalities: null,
     reasoning: false,
     toolCall: false,
+    outputLimit: null,
   };
   if (request.wireFamily) {
     wireFamily = request.wireFamily as WireFamily;
@@ -240,6 +245,7 @@ export async function resolveProbeTarget(args: {
         modalities: staticDef.modalities,
         reasoning: staticDef.reasoning,
         toolCall: staticDef.toolCall,
+        outputLimit: staticDef.outputLimit ?? null,
       };
     } else {
       const existing = await db
@@ -250,6 +256,7 @@ export async function resolveProbeTarget(args: {
           modalities: models.modalities,
           reasoning: models.reasoning,
           toolCall: models.toolCall,
+          outputLimit: models.outputLimit,
         })
         .from(models)
         .where(
@@ -275,6 +282,7 @@ export async function resolveProbeTarget(args: {
           modalities: existing[0].modalities,
           reasoning: existing[0].reasoning,
           toolCall: existing[0].toolCall,
+          outputLimit: existing[0].outputLimit ?? null,
         };
       } else {
         if (requestedServiceKind !== "llm") {
@@ -332,7 +340,7 @@ export async function resolveProbeTarget(args: {
     toolCall: capabilitySource.toolCall,
     providerId,
   });
-  return { wireFamily, serviceKind, endpointPath, sourceSurface, capabilityProfile };
+  return { wireFamily, serviceKind, endpointPath, sourceSurface, capabilityProfile, outputLimit: capabilitySource.outputLimit };
 }
 
 /** The account a probe selected, or the operator-facing reason it could not. */
@@ -448,7 +456,23 @@ export interface ProbeReasoning {
 /** Tenant probe preferences that shape the request and telemetry. */
 export interface ProbePreferences {
   readonly probeReasoning: ProbeReasoning | undefined;
-  readonly payloadCaptureEnabled: boolean;
+  /**
+   * The tenant's resolved capture policy for the probe, through the same
+   * `resolvePayloadCapture` path every dispatched request uses.
+   *
+   * `none` (and a failed preference read — capture fails closed) captures
+   * nothing; `metadata` captures stage presence only; `full` keeps bodies at
+   * the tenant's own depth and retention. The previous boolean collapsed all
+   * three into "capture on", so a probe teed bodies at the flat deployment
+   * cap for a tenant whose choice was `metadata` — and whose live requests
+   * stored none.
+   */
+  readonly payloadCapture: {
+    readonly enabled: boolean;
+    readonly mode: "none" | "metadata" | "full";
+    readonly depth: TelemetryPayloadDepth;
+    readonly retentionMs: number;
+  };
 }
 
 /**
@@ -465,7 +489,12 @@ export async function loadProbePreferences(args: {
 }): Promise<ProbePreferences> {
   const { db, tenantId, wireFamily, request } = args;
   let probeReasoning: ProbeReasoning | undefined;
-  let payloadCaptureEnabled = false;
+  let payloadCapture: ProbePreferences["payloadCapture"] = {
+    enabled: false,
+    mode: "none",
+    depth: "minimum",
+    retentionMs: payloadRetentionMs(),
+  };
   // `auto` (and an omitted effort) means "send no reasoning intent": the probe
   // must reflect what the route does by itself, and a model that does not
   // support reasoning would otherwise fail a probe that should have passed.
@@ -483,10 +512,23 @@ export async function loadProbePreferences(args: {
     const raw = preferences?.responsesReasoningSummary;
     const mode: "auto" | "concise" | "detailed" =
       raw === "auto" || raw === "concise" || raw === "detailed" ? raw : "detailed";
-    // Unset matches the settings default: off. Only an explicit choice captures.
-    payloadCaptureEnabled =
-      preferences?.telemetryPayloads === "full" ||
-      preferences?.telemetryPayloads === "metadata";
+    // Unset matches the settings default: off. Only an explicit choice
+    // captures, and at the tenant's own depth/retention — the same resolution
+    // `resolvePayloadCapture` performs for dispatched requests, read from the
+    // same preferences row this phase already loaded.
+    const captureMode = preferences?.telemetryPayloads;
+    if (captureMode === "full" || captureMode === "metadata") {
+      const resolved = await resolvePayloadCapture(db, tenantId);
+      payloadCapture = resolved.ok
+        ? {
+            enabled: true,
+            mode: resolved.mode,
+            depth: resolved.depth,
+            retentionMs: resolved.retentionMs,
+          }
+        : // Failed preference read: capture fails closed.
+          { enabled: false, mode: "none", depth: "minimum", retentionMs: payloadRetentionMs() };
+    }
     if (wireFamily === "responses" && requestedEffort !== undefined) {
       probeReasoning = {
         effort: requestedEffort,
@@ -501,7 +543,7 @@ export async function loadProbePreferences(args: {
       };
     }
   }
-  return { probeReasoning, payloadCaptureEnabled };
+  return { probeReasoning, payloadCapture };
 }
 
 /**
@@ -716,12 +758,19 @@ export function computeProbeVerdict(args: {
           : status !== undefined
             ? `upstream ${status}`
             : undefined;
+    // A 429 that names a free-tier usage limit is upstream quota state, not a
+    // payload or egress defect — label it as the throttle it is instead of a
+    // generic probe failure.
+    const throttled =
+      status === 429 ||
+      providerStatus === 429 ||
+      /free usage limit|rate limit|throttl/i.test(base);
     // The toast title already names the model. Repeating `provider/model via
     // wire path` in the body made the operator read the same identity twice
     // and buried the upstream sentence. The wire family stays, because that is
     // the one fact the title does not carry; the path is noise next to it.
     const tagged = statusTag !== undefined ? `${pretty} (${statusTag})` : pretty;
-    errorMessage = `${wireFamily} — ${tagged}${upstreamReq ? ` [req ${upstreamReq}]` : ""}`;
+    errorMessage = `${wireFamily} — ${throttled ? "Upstream rate limit (HTTP 429): " : ""}${tagged}${upstreamReq ? ` [req ${upstreamReq}]` : ""}`;
 
   } else if (terminal?.type === "terminal" && terminal.state !== "complete") {
     // Read the terminal's own detail before falling back to the stop reason.

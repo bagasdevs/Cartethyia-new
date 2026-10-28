@@ -8,7 +8,7 @@
  * start can never match the gateway that is actually running.
  */
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { chooseFromMenu } from "../../scripts/cli/prompt";
@@ -27,6 +27,18 @@ afterEach(() => {
   if (originalConfigDir === undefined) delete process.env.CARTETHYIA_CONFIG_DIR;
   else process.env.CARTETHYIA_CONFIG_DIR = originalConfigDir;
   rmSync(configDir, { recursive: true, force: true });
+});
+
+test("the npm package has no source-checkout installer lifecycle", () => {
+  // The source installer requires explicit local/vps/docker arguments and a
+  // `.git` checkout. Running it from an npm lifecycle both fails in a non-TTY
+  // install and targets a directory the published package does not contain.
+  // `cartethyia setup` is the supported post-install configuration path.
+  const manifest = JSON.parse(readFileSync(join(import.meta.dir, "..", "..", "package.json"), "utf8")) as {
+    scripts: Record<string, string>;
+  };
+  expect(manifest.scripts["install"]).toBeUndefined();
+  expect(manifest.scripts["setup"]).toBe("bun run scripts/cli/setup.ts");
 });
 
 test("chooseFromMenu returns -1 when stdin is not a TTY", () => {

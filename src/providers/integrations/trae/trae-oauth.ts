@@ -23,6 +23,7 @@
 // in `trae_client.py`).
 
 import { randomUUID } from "node:crypto";
+import { firstNonEmptyString as firstString } from "../../../shared/coerce";
 import { OAuthClient } from "../../authentication/oauth-client";
 import type { OAuthExchangeResult, OAuthImportInput } from "../../authentication/oauth-flow-store";
 import type { OAuthTokenRefreshResult } from "../../authentication/oauth-refresh-service";
@@ -400,8 +401,8 @@ export class TraeOAuthClient extends OAuthClient {
         if (!response.ok) continue;
         const data = (await response.json()) as { Result?: Record<string, unknown> };
         const result = data.Result ?? {};
-        const email = firstStringValue(result, ["NonPlainTextEmail", "Email", "email"]);
-        const userId = firstStringValue(result, ["UserID", "userId"]);
+        const email = firstString(result, ["NonPlainTextEmail", "Email", "email"]);
+        const userId = firstString(result, ["UserID", "userId"]);
         return {
           ...(email === undefined ? {} : { email }),
           ...(userId === undefined ? {} : { userId }),
@@ -504,9 +505,15 @@ export class TraeOAuthClient extends OAuthClient {
   override async refresh(
     refreshToken: string,
     signal?: AbortSignal,
-    context?: { readonly account_id?: string },
+    context?: { readonly account_id?: string; readonly auth_state?: Readonly<Record<string, unknown>> },
   ): Promise<OAuthTokenRefreshResult> {
-    return this.refreshWithUser(refreshToken, context?.account_id ?? "", signal);
+    // The exchange is addressed per Trae account, not per gateway account row:
+    // `UserID` must be the upstream user id. The login flow stores it in
+    // `auth_state.userId`, and re-imports carry it the same way — preferring it
+    // over `account_id` keeps refresh working for accounts whose row id is not
+    // the upstream user id (any account created before the id was persisted).
+    const upstreamUserId = firstString(context?.auth_state ?? {}, ["userId", "user_id", "uid"]);
+    return this.refreshWithUser(refreshToken, upstreamUserId ?? context?.account_id ?? "", signal);
   }
 
   async #exchange(
@@ -576,12 +583,15 @@ function parsedResult(
   refresh: string,
   isStatic: boolean,
 ): OAuthExchangeResult {
+  const state: Record<string, unknown> = {};
+  if (isStatic) state["staticToken"] = true;
+  if (parsed.userId !== undefined) state["userId"] = parsed.userId;
   return {
     access,
     refresh,
     expiresAt:
       parsed.expiresAtMs === undefined ? new Date(Date.now() + 3600_000) : new Date(parsed.expiresAtMs),
-    ...(isStatic ? { auth_state: { staticToken: true } } : {}),
+    ...(Object.keys(state).length === 0 ? {} : { auth_state: state }),
     ...(parsed.email === undefined ? {} : { accountLabel: parsed.email }),
   };
 }
@@ -618,7 +628,12 @@ function parseExport(credential: string): TraeExport | undefined {
   const refresh = firstString(parsed, ["refreshToken", "refresh_token", "refresh"]);
   const expiresAtMs = firstNumber(parsed, ["expiredAt", "expiresAt", "TokenExpireAt", "tokenExpireAt"]);
   const email = firstString(parsed, ["email", "userEmail", "accountLabel"]);
-  const userId = firstString(parsed, ["userId", "user_id", "uid", "UserID"]);
+  // The exporter nests the user id under `authState`; a hand-built export may
+  // carry it at the top level instead.
+  const authState = firstRecord(parsed, ["authState", "auth_state"]);
+  const userId =
+    firstString(authState ?? {}, ["userId", "user_id", "uid", "UserID"]) ??
+    firstString(parsed, ["userId", "user_id", "uid", "UserID"]);
   return {
     access,
     ...(refresh === undefined ? {} : { refresh }),
@@ -628,10 +643,13 @@ function parseExport(credential: string): TraeExport | undefined {
   };
 }
 
-function firstString(record: Record<string, unknown>, keys: readonly string[]): string | undefined {
+/** First object value present under any of `keys`, or undefined. */
+function firstRecord(record: Record<string, unknown>, keys: readonly string[]): Record<string, unknown> | undefined {
   for (const key of keys) {
     const value = record[key];
-    if (typeof value === "string" && value.trim().length > 0) return value.trim();
+    if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+      return value as Record<string, unknown>;
+    }
   }
   return undefined;
 }
@@ -688,13 +706,7 @@ function parseTraeCallback(raw: string): TraeCallbackPayload {
   if (text.includes("?")) query = text.slice(text.indexOf("?") + 1);
   if (text.startsWith("#")) query = text.slice(1);
   const params = Object.fromEntries(new URLSearchParams(query));
-  const pick = (keys: readonly string[]): string | undefined => {
-    for (const key of keys) {
-      const value = params[key];
-      if (typeof value === "string" && value.trim().length > 0) return value.trim();
-    }
-    return undefined;
-  };
+  const pick = (keys: readonly string[]): string | undefined => firstString(params, keys);
   const error = pick(["error", "error_code", "errorCode"]);
   if (error !== undefined) {
     const detail = pick(["error_description", "error_desc", "message"]);
@@ -714,15 +726,6 @@ function parseTraeCallback(raw: string): TraeCallbackPayload {
   throw new Error(
     "Trae callback carries neither a refreshToken nor an AuthCode — paste the full callback URL",
   );
-}
-
-/** First non-empty string among the keys, for upstream's varied spellings. */
-function firstStringValue(record: Record<string, unknown>, keys: readonly string[]): string | undefined {
-  for (const key of keys) {
-    const value = record[key];
-    if (typeof value === "string" && value.trim().length > 0) return value.trim();
-  }
-  return undefined;
 }
 
 /** Client bound to the intl deployment. */

@@ -41,7 +41,7 @@ import { useSystemHealth, useLatestRelease, useNotifications } from "../../hooks
 import { useProviders } from "../../hooks/providers";
 import { DASHBOARD_RELEASE_LABEL, DASHBOARD_VERSION } from "../../lib/version";
 import { formatUptime } from "../../lib/format/numbers";
-import { GITHUB_ALT_REPO_URL } from "../../lib/links";
+import { GITHUB_RELEASES_URL } from "../../lib/links";
 import { isNewerRelease, type SystemHealthResponse } from "../../data/contracts";
 import type { SessionUser } from "../../data/contracts";
 
@@ -81,17 +81,10 @@ export const navigationGroups: readonly NavGroupDef[] = [
   {
     label: "Tools",
     items: [
-      { label: "Coming soon", path: "#tools-coming-soon-1", icon: Globe, disabled: true },
       {
-        label: "Coming soon",
-        path: "#tools-coming-soon-2",
+        label: "Tools",
         icon: Globe,
-        children: Array.from({ length: 5 }, (_, index) => ({
-          label: `Coming soon ${index + 1}`,
-          path: `#tools-coming-soon-${index + 3}`,
-          icon: Globe,
-          disabled: true,
-        })),
+        children: [],
       },
     ],
   },
@@ -625,13 +618,13 @@ function SidebarNavList({
                     <button
                       key={child.path ?? child.label}
                       type="button"
-                      className="nav-link-item w-full cursor-not-allowed opacity-55"
-                      disabled
-                      title="Coming soon"
+                      className="nav-link-item w-full"
+                      disabled={child.disabled === true}
+                      title={child.label}
                     >
                       <child.icon size={15} className="nav-link-icon" />
                       <span>{child.label}</span>
-                      <span className="nav-link-badge">Soon</span>
+                      {child.badge ? <span className="nav-link-badge">{child.badge}</span> : null}
                     </button>
                   ))}
                 </div>
@@ -827,7 +820,7 @@ export function DashboardShell({
                 <span>Cartethyia</span>
               </div>
               <div className="brand-version-badge">
-                <a href={GITHUB_ALT_REPO_URL} target="_blank" rel="noreferrer" className="brand-version-link">{DASHBOARD_RELEASE_LABEL}</a>
+                <a href={GITHUB_RELEASES_URL} target="_blank" rel="noreferrer" className="brand-version-link">{DASHBOARD_RELEASE_LABEL}</a>
                 {updateAvailable ? (
                   // A button, not a link to GitHub: the badge says an update
                   // exists and the dialog tells the operator how to install it.

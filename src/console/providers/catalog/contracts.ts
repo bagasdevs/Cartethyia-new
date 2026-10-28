@@ -509,6 +509,13 @@ export interface ProviderAccountResponse {
   credentialKind: CredentialKind;
   credentialMode?: CredentialMode;
   tokenExpiresAt?: string;
+  /**
+   * Who issued this credential, read from the JWT `iss` claim at registration
+   * time. Present only for static JWTs, and only when the payload carried the
+   * claim: the secret is never readable after registration, so this is the one
+   * record of where the token came from.
+   */
+  jwtIssuer?: string;
   status: string;
   /** Live routing admission count for this request path; absent when unavailable. */
   inflight?: number;
@@ -550,6 +557,14 @@ export interface ProviderAccountExport {
   accessToken: string;
   /** Decrypted OAuth refresh token, omitted when the account has none. */
   refreshToken?: string;
+  /**
+   * Non-secret upstream auth configuration carried on the account (the
+   * upstream user id, provisioned region, auth method, profile). Re-import
+   * must restore it: Trae refresh is addressed per upstream user id, and the
+   * data-plane host is region-scoped, so dropping it breaks re-imported
+   * accounts on their first refresh or dispatch.
+   */
+  authState?: Readonly<Record<string, unknown>>;
   createdAt: string;
   /** Live routing admission count at export time; absent when unavailable. */
   inflight?: number;
@@ -764,6 +779,17 @@ export interface ProviderCatalogStore {
   syncModels(tenantId: string, providerId: string): Promise<{ synced: number }>;
   listAccounts(tenantId: string, providerId: string): Promise<readonly ProviderAccountResponse[]>;
   listAllAccounts(tenantId: string): Promise<readonly ProviderAccountResponse[]>;
+  /**
+   * Non-secret upstream auth configuration for the given owned accounts,
+   * keyed by account id. Used by the account-export route so a re-import can
+   * restore the upstream user id / region that refresh and dispatch are
+   * addressed by; never surfaced on the read models.
+   */
+  listAccountAuthStates(
+    tenantId: string,
+    providerId: string,
+    accountIds: readonly string[],
+  ): Promise<Readonly<Record<string, Readonly<Record<string, unknown>>>>>;
   createAccount(
     tenantId: string,
     providerId: string,

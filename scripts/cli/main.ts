@@ -1,9 +1,25 @@
+// dynamic-import-ok: subcommand dispatcher. Every branch lazy-loads only the
+// module its command needs so `cartethyia --help` and `cartethyia stop` do
+// not drag the gateway, dashboard, and database driver into memory.
 import { mkdirSync } from "node:fs";
-import { resolveUserConfigDir } from "../../src/config/package-paths";
+import { PACKAGE_ROOT, resolveUserConfigDir } from "../../src/config/package-paths";
 import { readRequiredBunVersion, assertBunVersion } from "./version";
 import { printUpdateInstructions, runDetachedUpdate } from "./update";
 
 process.env.CARTETHYIA_CONFIG_DIR ??= resolveUserConfigDir();
+// Covers every entry into the CLI that is not the npm launcher — the menu's
+// "Hide to Tray" spawns this file directly, and the compiled gateway binary
+// it then starts resolves its assets from the package root. A compiled Bun
+// executable has a virtual `import.meta.dir` (`B:/~BUN/root/cartethyia`), so
+// an unset root becomes `B:\` and startup dies with
+// `ENOENT: scandir 'B:\migrations\lite-sqlite3'`.
+process.env.CARTETHYIA_PACKAGE_ROOT ??= PACKAGE_ROOT;
+
+/**
+ * Seconds to hold the window open after reporting that another instance owns
+ * this installation. Long enough to read, short enough not to feel like a hang.
+ */
+const DOUBLE_INSTANCE_EXIT_SECONDS = 30;
 
 const HELP = (minimumBunVersion: string) => `Cartethyia ${minimumBunVersion}+ (Bun is required)
 
@@ -17,6 +33,7 @@ Usage:
   cartethyia doctor
   cartethyia admin reset-lockout <username> <clientIp>
   cartethyia admin reset-lockout --all
+  cartethyia telemetry reconcile --apply|--verify
   cartethyia update
 
 carte starts the gateway in the background and leaves only the console menu on
@@ -65,7 +82,7 @@ async function reportTrayFailed(message: string): Promise<void> {
 async function main(): Promise<void> {
   await assertBunVersion();
   const [command] = process.argv.slice(2);
-  if (command === "setup" || command === "start" || command === "stop" || command === "tray" || command === "menu" || command === "doctor" || command === "admin") {
+  if (command === "setup" || command === "start" || command === "stop" || command === "tray" || command === "menu" || command === "doctor" || command === "admin" || command === "telemetry") {
     await loadUserConfig();
   }
 
@@ -141,6 +158,16 @@ async function main(): Promise<void> {
       await resetLockout(process.argv.slice(4));
       return;
     }
+    case "telemetry": {
+      if (process.argv[3] !== "reconcile") {
+        console.error("Usage: cartethyia telemetry reconcile --apply|--verify");
+        process.exitCode = 2;
+        return;
+      }
+      const { telemetry } = await import("./telemetry");
+      await telemetry(process.argv.slice(4));
+      return;
+    }
     case "update":
       runDetachedUpdate();
       printUpdateInstructions("this install", null);
@@ -158,7 +185,24 @@ async function main(): Promise<void> {
 
 main().catch(async (error: unknown) => {
   const message = error instanceof Error ? error.message : "unknown error";
-  if (process.argv[2] === "tray") await reportTrayFailed(message);
+  // Only the tray launched for this exact handoff may answer its parent's
+  // signal file. An independent `carte --tray` must never fail an unrelated
+  // menu that happens to be transferring ownership at the same time.
+  if (process.argv[2] === "tray" && process.env.CARTETHYIA_CONTROLLER_PARENT_PID) {
+    await reportTrayFailed(message);
+  }
+  if (message.includes("not starting another instance")) {
+    // Exits on its own after a short pause rather than vanishing instantly.
+    // Double-clicking a shortcut or re-running a command in a terminal that is
+    // already serving used to print nothing visible — the window closed before
+    // the operator could read why. The delay is also long enough to notice in
+    // a console that stays open, and short enough not to feel like a hang.
+    console.error(`Cartethyia is already running.\n${message}`);
+    console.error(`\nThis window will close in ${DOUBLE_INSTANCE_EXIT_SECONDS} seconds.`);
+    process.exitCode = 1;
+    await Bun.sleep(DOUBLE_INSTANCE_EXIT_SECONDS * 1_000);
+    return;
+  }
   console.error(`Cartethyia failed: ${message}`);
   process.exitCode = 1;
 });

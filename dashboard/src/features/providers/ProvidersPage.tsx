@@ -675,6 +675,10 @@ const FREE_LIMITED_IDS = new Set([
   // alongside its paid rows, so its free allowance is metered against that
   // one reseller rather than a standing free tier.
   "kilo",
+  // Inception Labs ships a standing free tier — mercury-3 at zero price —
+  // rather than a daily allowance, but it belongs in the same section as the
+  // other free-limited providers an operator reaches for first.
+  "inception",
 ]);
 /**
  * The providers an operator reaches for first: household names with a
@@ -968,15 +972,20 @@ function readCollapsedSections(): ReadonlySet<string> {
   }
 }
 
+/** Shared section heading, so new sections do not add styling debt. */
+const SECTION_TITLE = "text-body font-bold tracking-[-0.01em]";
+
 const SECTIONS = [
   {
     title: "Founding Friend & Sponsors",
     subtitle: "Super Cheap inference pool",
-    filter: (p: ProviderResponse) => FOUNDING_IDS.has(p.providerId.toLowerCase()),
+    filter: (p: ProviderResponse) =>
+      FOUNDING_IDS.has(p.providerId.toLowerCase()),
   },
   {
     title: "Free Limited Providers",
-    filter: (p: ProviderResponse) => FREE_LIMITED_IDS.has(p.providerId.toLowerCase()),
+    filter: (p: ProviderResponse) =>
+      FREE_LIMITED_IDS.has(p.providerId.toLowerCase()),
   },
   {
     title: "OAuth & Agent Providers",
@@ -1193,7 +1202,7 @@ export default function Providers(): ReactNode {
             >
               <ChevronDown size={15} className={cn("mt-1 shrink-0 transition-transform", collapsed && "-rotate-90")} />
               <Stack gap="1px">
-                <h2 className="text-body font-bold tracking-[-0.01em]">
+                <h2 className={SECTION_TITLE}>
                   {section.title} ({section.providers.length}){collapsed ? " (Hidden)" : ""}
                 </h2>
                 {!collapsed && section.subtitle ? (

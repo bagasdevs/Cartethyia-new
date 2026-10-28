@@ -1,5 +1,5 @@
 // Drizzle-backed console persistence for network pools.
-import { and, asc, eq, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { CartethyiaDatabase } from "../../../persistence/db-handle";
 import { networkPools, poolRoutingSettings } from "../../../persistence/schema";
 import {
@@ -16,6 +16,7 @@ import { classifyPoolConnectError, classifyPoolProbeResponse, parseEgressIp } fr
 import { encryptCredential } from "../../../security/crypto";
 import { createValidatedFetch } from "../../../network/outbound-fetch";
 import { classifyProviderProbeAnswer } from "./probe-verdict";
+import { buildProviderProbeRequest } from "../../../providers/provider-probe";
 import type { StoredProviderProbe } from "./contracts";
 import {
   createHttpProxyAgent,
@@ -33,6 +34,7 @@ import {
   recoverNetworkPool,
 } from "../../../network/pool-health-machine";
 import { drainPoolByteDelta, recordPoolBytes } from "../../../network/pool/byte-accounting";
+import * as poolCooldownStore from "../../../network/pool-cooldown-store";
 // Cloudflare's trace endpoint answers with plain `key=value` lines including
 // `ip=`, the address the request egressed from. Dialing it THROUGH the pool
 // therefore reports the pool's public address — which is what an operator
@@ -254,7 +256,7 @@ export class DrizzleNetworkPoolStore implements NetworkPoolStore {
         reason: error instanceof Error ? error.message : "Failed to build pool agent",
       };
     }
-    return await this.dialProviderProbe(agent, poolId, providerId, poolId);
+    return await this.dialProviderProbe(agent, poolId, providerId, poolId, rec.endpoint);
   }
 
   /**
@@ -294,15 +296,20 @@ export class DrizzleNetworkPoolStore implements NetworkPoolStore {
    *
    * `label` is what the result reports (a pool id, or a pasted endpoint that
    * has no row yet). `poolId` is the row to bank the verdict on — omitted for
-   * an ad-hoc probe, because there is nothing to attach it to.
+   * an ad-hoc probe, because there is nothing to attach it to. `endpoint` is
+   * the address the verdict describes, recorded beside it so
+   * `storedProviderProbe` can verify it later — it must be the pool's *current
+   * endpoint*, never the label: a verdict banked against the pool id fails the
+   * endpoint comparison on read and is hidden as "never probed", which is
+   * exactly the disappearing-verdict report.
    */
   private async dialProviderProbe(
     agent: PoolAgent,
     label: string,
     providerId: string,
     poolId?: string,
+    endpoint?: string,
   ): Promise<PoolProviderProbeResult> {
-    const { buildProviderProbeRequest } = await import("../../../providers/provider-probe");
     const spec = await buildProviderProbeRequest(providerId);
     if (!spec) {
       return { poolId: label, providerId, status: "unreachable", reason: "Unknown provider" };
@@ -343,7 +350,7 @@ export class DrizzleNetworkPoolStore implements NetworkPoolStore {
       latencyMs,
       ...(verdict.reason === undefined ? {} : { reason: verdict.reason }),
     };
-    if (poolId !== undefined) await this.persistProviderProbe(poolId, label, result);
+    if (poolId !== undefined) await this.persistProviderProbe(poolId, endpoint ?? label, result);
     return result;
   }
 
@@ -403,12 +410,24 @@ export class DrizzleNetworkPoolStore implements NetworkPoolStore {
   }
 
   async create(record: NetworkPoolRecord): Promise<void> {
-    const kind = record.kind === "https" ? "http" : record.kind;
-    await this.db.insert(networkPools).values({
+    await this.createMany([record]).then(() => undefined);
+  }
+
+  /**
+   * Inserts every record in one statement.
+   *
+   * A batch import used to be one round trip per proxy, so a long paste took
+   * minutes and the dialog sat there while the operator waited. Drizzle emits a
+   * single multi-row INSERT, which makes the cost independent of the paste
+   * length.
+   */
+  async createMany(records: readonly NetworkPoolRecord[]): Promise<number> {
+    if (records.length === 0) return 0;
+    const values = records.map((record) => ({
       id: record.id,
       tenantId: record.tenantId,
       createdAt: new Date(record.createdAt),
-      kind,
+      kind: record.kind === "https" ? "http" : record.kind,
       endpointConfig: {
         endpoint: record.endpoint,
         ...(record.label ? { label: record.label } : {}),
@@ -423,7 +442,50 @@ export class DrizzleNetworkPoolStore implements NetworkPoolStore {
       consecutiveFailures: 0,
       ...(record.quotaBytes !== undefined ? { quotaBytes: record.quotaBytes } : {}),
       ...(record.family !== undefined ? { family: record.family } : {}),
-    });
+    }));
+    await this.db.insert(networkPools).values(values);
+    return values.length;
+  }
+
+  /**
+   * Sets one status on every named pool in a single statement.
+   *
+   * Bulk enable/disable was a loop of per-row updates — one round trip each,
+   * and one snapshot invalidation each. A tenant-wide selection is exactly the
+   * case where that is felt.
+   */
+  async updateManyStatus(
+    tenantId: string,
+    poolIds: readonly string[],
+    status: NetworkPoolRecord["status"],
+  ): Promise<number> {
+    if (poolIds.length === 0) return 0;
+    const rows = await this.db
+      .update(networkPools)
+      .set({ status })
+      .where(
+        and(
+          eq(networkPools.tenantId, tenantId),
+          inArray(networkPools.id, [...poolIds]),
+        ),
+      )
+      .returning({ id: networkPools.id });
+    return rows.length;
+  }
+
+  /** Deletes every named pool in one statement. */
+  async deleteMany(tenantId: string, poolIds: readonly string[]): Promise<number> {
+    if (poolIds.length === 0) return 0;
+    const rows = await this.db
+      .delete(networkPools)
+      .where(
+        and(
+          eq(networkPools.tenantId, tenantId),
+          inArray(networkPools.id, [...poolIds]),
+        ),
+      )
+      .returning({ id: networkPools.id });
+    return rows.length;
   }
 
   async update(
@@ -511,6 +573,34 @@ export class DrizzleNetworkPoolStore implements NetworkPoolStore {
 
   async listHealthEvents(tenantId: string, poolId: string) {
     return listNetworkPoolHealthEvents(this.db, tenantId, poolId);
+  }
+
+  async dropProviderCooldownMarker(
+    tenantId: string,
+    poolId: string,
+    providerId: string,
+    onlyBlocked: boolean,
+  ): Promise<void> {
+    if ((await this.get(tenantId, poolId)) === undefined) return;
+    await poolCooldownStore.dropProviderCooldownMarker(this.db, poolId, providerId, onlyBlocked);
+  }
+
+  async dropAllProviderCooldownMarkers(
+    tenantId: string,
+    poolId: string,
+  ): Promise<void> {
+    if ((await this.get(tenantId, poolId)) === undefined) return;
+    await poolCooldownStore.dropAllProviderCooldownMarkers(this.db, poolId);
+  }
+
+  async recordProviderProbeCooldown(
+    tenantId: string,
+    poolId: string,
+    providerId: string,
+    marker: { until: number; reason: string; blocked?: boolean },
+  ): Promise<void> {
+    if ((await this.get(tenantId, poolId)) === undefined) return;
+    await poolCooldownStore.recordProbeVerdict(this.db, poolId, providerId, marker);
   }
 
   async recover(tenantId: string, poolId: string): Promise<boolean> {

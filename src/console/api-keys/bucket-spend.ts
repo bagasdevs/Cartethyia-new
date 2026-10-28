@@ -2,7 +2,7 @@ import { eq } from "drizzle-orm";
 
 import type { CartethyiaDatabase } from "../../persistence/db-handle";
 import { apiKeys } from "../../persistence/schema";
-import { queryIndexedBuckets } from "../../observability/event-day-index";
+import { sumTelemetryTokens } from "../../observability/event-query";
 import { utcDayStart, utcMonthStart } from "../shared/day";
 
 /**
@@ -27,27 +27,24 @@ export async function familyBucketSpend(
   keyId: string,
   now: Date,
 ): Promise<{ daily: number; monthly: number }> {
+  // The tenant comes from the key row itself: the caller passes only the key
+  // id, and the SQL sums are tenant-scoped so scoping must not be guessed.
+  const [parent] = await db
+    .select({ tenantId: apiKeys.tenantId })
+    .from(apiKeys)
+    .where(eq(apiKeys.id, keyId))
+    .limit(1);
+  const tenantId = parent?.tenantId;
+  if (tenantId === undefined) return { daily: 0, monthly: 0 };
   const children = await db
     .select({ id: apiKeys.id })
     .from(apiKeys)
     .where(eq(apiKeys.parentKeyId, keyId));
   const keyIds = [keyId, ...children.map((child) => child.id)];
-  const spentSince = async (start: Date): Promise<number> => {
-    // Folded first, so the index covers every event written so far including the
-    // current day's — then read from the index alone.
-    //
-    // Deliberately not index *plus* events: they hold the same requests, and
-    // adding them doubled every bucket. Folding first is what makes the index
-    // sufficient on its own; the watermark is the point up to which it is
-    // complete.
-    const allowed = new Set(keyIds);
-    const indexed = await queryIndexedBuckets({ since: start, foldFirst: true }).catch(
-      () => [],
-    );
-    return indexed
-      .filter((bucket) => bucket.apiKeyId !== null && allowed.has(bucket.apiKeyId))
-      .reduce((sum, bucket) => sum + bucket.inputTokens + bucket.outputTokens, 0);
-  };
+  // Two SQL sums instead of reading every event of the family: the bucket
+  // spend only needs a total, and this runs on the key-creation path.
+  const spentSince = async (start: Date): Promise<number> =>
+    sumTelemetryTokens(db, tenantId, { apiKeyIds: keyIds, since: start });
   const [daily, monthly] = await Promise.all([
     spentSince(utcDayStart(now)),
     spentSince(utcMonthStart(now)),

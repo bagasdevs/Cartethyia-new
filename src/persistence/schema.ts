@@ -490,6 +490,24 @@ export const networkPools = pgTable("network_pools", {
   /** The endpoint the verdict was measured against. Compared on read, so an
    * edited endpoint reports "never probed" instead of a stale verdict. */
   providerProbeEndpoint: text("provider_probe_endpoint"),
+  /**
+   * The database mirror of the pool selector's provider cooldown state, one
+   * entry per cooling provider keyed by its lowercased id:
+   * `{ "opencode": { "until": <epoch ms>, "reason": "...", "blocked": false } }`.
+   *
+   * The selector's own map is process-local (mirrored to Redis when present),
+   * so a restart dropped every flag while the upstream kept refusing the
+   * egress — dispatch re-picked a spent pool and the console showed nothing.
+   * The dispatch-side flaggers write each marker here, and boot reads this
+   * column back into the selector, so the state survives a restart the way the
+   * upstream's memory of the address does.
+   *
+   * `null` means no provider was ever flagged. Expired entries are left inert
+   * until the next write for the pool rather than swept eagerly: a marker with
+   * `until` in the past is skipped by every reader.
+   */
+  providerCooldowns: jsonb("provider_cooldowns")
+    .$type<Record<string, { until: number; reason: string; blocked?: boolean }>>(),
   /** Metered egress totals, flushed from the in-memory socket counters on
    * every pool-touching write so the quota bar survives a restart. */
   bytesSentTotal: bigint("bytes_sent_total", { mode: "number" }).notNull().default(0),
@@ -676,6 +694,7 @@ export const providerRoutingSettings = pgTable(
 export const poolRoutingStrategy = pgEnum("pool_routing_strategy", [
   "least_loaded",
   "round_robin",
+  "random",
 ]);
 export type PoolRoutingStrategy = (typeof poolRoutingStrategy.enumValues)[number];
 
@@ -1040,16 +1059,7 @@ export interface ConsoleSettingsPreferences {
    * - `maximum` — 16 MiB combined cap, expect CPU/memory spikes while active
    */
   telemetryPayloadDepth?: "minimum" | "moderate" | "maximum";
-  /**
-   * How long a captured payload frame is kept, in whole minutes.
-   *
-   * `null` or absent means the deployment default
-   * (`CARTETHYIA_TELEMETRY_PAYLOAD_RETENTION_MS`, 15 minutes). Raising it is a
-   * real trade: a frame is a gzipped copy of up to four request bodies, so
-   * keeping them for a week is keeping a week of bodies on disk. The upper
-   * bound is seven days, enforced by the capture path rather than trusted here.
-   */
-  telemetryPayloadRetentionMinutes?: number | null;
+
   privacyMode?: "masked" | "full";
   /**
    * Ignores an account-wide cooldown when building route candidates.
@@ -1069,18 +1079,33 @@ export interface ConsoleSettingsPreferences {
    */
   forceDisableCooldown?: boolean;
   /**
+   * Stops every invoke and route for this tenant. Off by default.
+   *
+   * A kill switch, not a routing tweak: while it is on, `/v1/*` returns 503 and
+   * nothing is dispatched upstream. The console keeps working, which is the
+   * point — an operator must be able to stop traffic and still reach the UI
+   * that turns it back on.
+   */
+  invokeDisabled?: boolean;
+  /**
+   * Slack added on top of every key's concurrency limit for this tenant.
+   *
+   * `maxConcurrentRequests` is the number an operator chose and what a
+   * refusal names; this is deliberate allowance above it so a run landing a
+   * few over is not refused at that number. Effective ceiling is
+   * `limit + tolerance`, and only requests past it are refused — never ones
+   * already admitted.
+   */
+  concurrencyTolerance?: number | null;
+  /**
    * Per-tenant upstream request timeout in seconds, overriding
    * `CARTETHYIA_UPSTREAM_TIMEOUT_MS`. `null` or absent means use the
    * deployment default.
    */
   upstreamTimeoutSeconds?: number | null;
-  /**
-   * Per-tenant telemetry compaction age in days, overriding
-   * `CARTETHYIA_TELEMETRY_COMPACT_AFTER_DAYS`. `null` or absent means use the
-   * deployment default. Lower keeps less history but bounds the usage-list
-   * scan; see the compaction notes in `event-compaction.ts`.
-   */
+  /** Captured payload detail lifetime in minutes; null means deployment default. */
   telemetryWindowMinutes?: number | null;
+
   /**
    * Per-tenant ceiling for one inline attachment, in bytes, overriding the
    * deployment default of 10 MB.
@@ -1098,6 +1123,22 @@ export interface ConsoleSettingsPreferences {
 export const consoleSettings = pgTable("console_settings", {
   tenantId: tenantRefPrimaryKey(),
   preferences: jsonb("preferences").notNull().default({}).$type<ConsoleSettingsPreferences>(),
+  updatedAt: updatedAtColumn(),
+});
+
+// InferHub `config_read` key. One row for the whole deployment.
+//
+// Deliberately NOT `provider_accounts.auth_state`: that field is documented as
+// per-account *non-secret* upstream config and travels with the account through
+// backup/restore, so a credential stored there is copied around and readable by
+// anything that reads accounts. This key is a secret and gets its own encrypted
+// row, unreachable from the account paths.
+export const inferhubConfigKeys = pgTable("inferhub_config_keys", {
+  id: text("id").primaryKey(),
+  /** `encryptCredential` output — never plaintext, never returned by an API. */
+  ciphertext: bytea("ciphertext").notNull(),
+  /** Hash only, for "did it change" checks. Not used to verify the key. */
+  fingerprint: text("fingerprint").notNull(),
   updatedAt: updatedAtColumn(),
 });
 
@@ -1165,6 +1206,12 @@ export const telemetryEvents = pgTable(
     requestId: uuid("request_id").notNull(),
     sourceSurface: telemetrySourceSurface("source_surface"),
     requestedModel: text("requested_model"),
+    /**
+     * Canonical client name derived from `user_agent` at ingestion
+     * (`clientNameFromUserAgent`). Stamped once at write time so client
+     * breakdowns group in SQL; the raw `user_agent` stays for detail.
+     */
+    clientName: text("client_name"),
     /**
      * The `model` the upstream put in its own response, verbatim.
      *
@@ -1238,7 +1285,38 @@ export const telemetryEvents = pgTable(
   },
   (table) => [
     index("telemetry_events_created_at_idx").on(table.createdAt),
-    index("telemetry_events_tenant_created_idx").on(table.tenantId, table.createdAt),
+    // Keyset pagination, newest-first: `(created_at, id)` DESC breaks ties
+    // deterministically (created_at is second-resolution), so a cursor on the
+    // pair never skips or repeats rows at a boundary. Replaces the plain
+    // `(tenant_id, created_at)` index, which could not break ties.
+    index("telemetry_events_tenant_created_id_idx").on(
+      table.tenantId,
+      desc(table.createdAt),
+      desc(table.id),
+    ),
+    /**
+     * Cross-process idempotency boundary: one terminal event per
+     * (tenant, request). Retried drains and cross-process races converge to
+     * one row (and one usage charge) via `ON CONFLICT DO NOTHING`.
+     */
+    uniqueIndex("telemetry_events_tenant_request_uidx").on(
+      table.tenantId,
+      table.requestId,
+    ),
+    // Usage status breakdown: equality on `http_status`, keyset range+order.
+    index("telemetry_events_tenant_http_created_id_idx").on(
+      table.tenantId,
+      table.httpStatus,
+      desc(table.createdAt),
+      desc(table.id),
+    ),
+    // Per-key family spend: equality on `api_key_id`, keyset range+order.
+    index("telemetry_events_tenant_api_key_created_id_idx").on(
+      table.tenantId,
+      table.apiKeyId,
+      desc(table.createdAt),
+      desc(table.id),
+    ),
     index("telemetry_events_request_id_idx").on(table.requestId),
     index("telemetry_events_tenant_account_created_idx").on(
       table.tenantId,
@@ -1251,6 +1329,37 @@ export const telemetryEvents = pgTable(
      * it every share render scanned the largest table in the schema.
      */
     index("telemetry_events_api_key_created_idx").on(table.apiKeyId, table.createdAt),
+  ],
+);
+
+/**
+ * Backfill/reconciliation checkpoint for `carte telemetry reconcile`.
+ *
+ * One row per job name. The checkpoint (file_name, byte_offset) commits in
+ * the same transaction as each backfill batch, so a crash resumes from the
+ * last committed offset. The lease columns let exactly one worker run the
+ * job: a second worker is rejected until the lease expires.
+ */
+export const telemetryReconciliationState = pgTable(
+  "telemetry_reconciliation_state",
+  {
+    jobName: text("job_name").primaryKey(),
+    leaseOwner: text("lease_owner"),
+    leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+    fileName: text("file_name").notNull().default(""),
+    byteOffset: bigint("byte_offset", { mode: "number" }).notNull().default(0),
+    filesCompleted: bigint("files_completed", { mode: "number" }).default(0),
+    eventsExamined: bigint("events_examined", { mode: "number" }).default(0),
+    eventsInserted: bigint("events_inserted", { mode: "number" }).default(0),
+    conflicts: bigint("conflicts", { mode: "number" }).default(0),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    check("telemetry_reconciliation_state_offset_nonneg", sql`${table.byteOffset} >= 0`),
+    check("telemetry_reconciliation_state_files_nonneg", sql`${table.filesCompleted} >= 0`),
+    check("telemetry_reconciliation_state_examined_nonneg", sql`${table.eventsExamined} >= 0`),
+    check("telemetry_reconciliation_state_inserted_nonneg", sql`${table.eventsInserted} >= 0`),
+    check("telemetry_reconciliation_state_conflicts_nonneg", sql`${table.conflicts} >= 0`),
   ],
 );
 

@@ -27,22 +27,12 @@ import { applySqliteMigrations, buildSqliteHandle, createSqliteDatabase } from "
 import {
   adoptFirstBuddy,
   agreeBuddyAgreement,
-  claimBuddyTravel,
-  claimBuddyTrial,
-  claimBuddyGift,
-  departBuddyTravel,
-  drawBuddyLottery,
-  redeemBuddyStreakTier,
   useBuddyMakeupCard,
 } from "../../src/providers/integrations/buddy/buddy-growth-shared";
 import {
   buddyAdoptTask,
   buddyDayKey,
-  buddyLotteryTask,
-  buddyRedeemTask,
   buddyStreakTask,
-  buddyTravelTask,
-  buddyTrialTask,
   type BuddyTaskDeps,
 } from "../../src/workers/buddy-growth-tasks";
 import type { FetchLike } from "../../src/providers/quota/quota-contracts";
@@ -92,52 +82,6 @@ function withFetcher(fetcher: FetchLike) {
 }
 
 describe("the growth endpoints — request shape", () => {
-  test("redeem posts the tier and a fresh client_token", async () => {
-    const { fetcher, calls } = recording(() => ok({ code: 0, data: { credit_granted: 300 } }));
-    const result = await redeemBuddyStreakTier(withFetcher(fetcher), "14d");
-    expect(result.state).toBe("claimed");
-    expect(result.credit).toBe(300);
-    expect(calls[0]!.url).toBe(
-      "https://copilot.tencent.com/activity/growth/redeem",
-    );
-    expect(calls[0]!.method).toBe("POST");
-    expect(calls[0]!.body?.["tier"]).toBe("14d");
-    // The idempotency key is `<prefix>-<uuid>` and must differ per call: reusing
-    // one lets the upstream swallow the claim as a duplicate.
-    expect(String(calls[0]!.body?.["client_token"])).toMatch(/^redeem-14d-[0-9a-f-]{36}$/);
-    expect(calls[0]!.headers["Authorization"]).toBe("Bearer token-1");
-  });
-
-  test("a 409 duplicate is success-equivalent, not a retry", async () => {
-    const { fetcher } = recording(() => err(409, 0, "duplicate claim this month"));
-    const result = await redeemBuddyStreakTier(withFetcher(fetcher), "7d");
-    expect(result.state).toBe("already");
-    expect(result.error).toBeNull();
-  });
-
-  test("403 days-not-enough is not eligible, not a failure", async () => {
-    const { fetcher } = recording(() => err(403, 0, "连续登录天数不足"));
-    const result = await redeemBuddyStreakTier(withFetcher(fetcher), "28d");
-    expect(result.state).toBe("not_eligible");
-    expect(result.error).toBeNull();
-  });
-
-  test("lottery draws with its own fresh token", async () => {
-    const { fetcher, calls } = recording(() =>
-      ok({ code: 0, data: { prize_code: "p1", prize_name: "Credits", prize_type: "credit", credit_amount: 10 } }),
-    );
-    const result = await drawBuddyLottery(withFetcher(fetcher));
-    expect(result.state).toBe("claimed");
-    expect(calls[0]!.url).toContain("/activity/growth/lottery/draw");
-    expect(String(calls[0]!.body?.["client_token"])).toMatch(/^draw-[0-9a-f-]{36}$/);
-  });
-
-  test("lottery with no chances is a normal state", async () => {
-    const { fetcher } = recording(() => err(400, 0, "insufficient chances"));
-    const result = await drawBuddyLottery(withFetcher(fetcher));
-    expect(result.state).toBe("not_eligible");
-  });
-
   test("makeup posts the target date only when yesterday was missed", async () => {
     // Yesterday scored zero and a card is available → one spend.
     const { fetcher, calls } = recording((seen) => {
@@ -167,16 +111,6 @@ describe("the growth endpoints — request shape", () => {
     expect(calls.some((entry) => entry.url.endsWith("/makeup-cards/use"))).toBe(false);
   });
 
-  test("travel departs with the fixed location and claims with the record id", async () => {
-    const { fetcher, calls } = recording(() => ok({ code: 0, data: { reward_credit: 50 } }));
-    await departBuddyTravel(withFetcher(fetcher));
-    expect(calls[0]!.url).toContain("/activity/growth/buddy/travel/depart");
-    expect(calls[0]!.body).toEqual({ location_id: 4 });
-    await claimBuddyTravel(withFetcher(fetcher), 991);
-    expect(calls[1]!.url).toContain("/activity/growth/buddy/travel/claim");
-    expect(calls[1]!.body).toEqual({ record_id: 991 });
-  });
-
   test("adoption agrees first, then adopts", async () => {
     const { fetcher, calls } = recording(() => ok({ code: 0, data: {} }));
     await agreeBuddyAgreement(withFetcher(fetcher));
@@ -193,34 +127,11 @@ describe("the growth endpoints — request shape", () => {
     expect(result.error).toBeNull();
   });
 
-  test("trial business code 14051 is already claimed", async () => {
-    const { fetcher } = recording(() => ok({ code: 14051, msg: "already claimed" }));
-    const result = await claimBuddyTrial(withFetcher(fetcher));
-    expect(result.state).toBe("already");
-    expect(result.error).toBeNull();
-  });
-
-  test("a host that does not serve the trial endpoint is skipped, not failed", async () => {
-    // The international sites do not serve all of these; a 404 is a routing fact
-    // about the endpoint, and must never read as an account problem.
-    const { fetcher } = recording(() => new Response("not found", { status: 404 }));
-    const result = await claimBuddyTrial(withFetcher(fetcher));
-    expect(result.state).toBe("skipped");
-    expect(result.error).toBeNull();
-  });
-
-  test("gift and compensation claim-if-present, and a business error is not a failure", async () => {
-    const { fetcher } = recording(() => ok({ code: 14000, msg: "already claimed" }));
-    const gift = await claimBuddyGift(withFetcher(fetcher));
-    expect(gift.state).toBe("already");
-    expect(gift.error).toBeNull();
-  });
-
   test("a transport failure is the only thing that reports an error", async () => {
     const { fetcher } = recording(() => {
       throw new Error("network down");
     });
-    const result = await redeemBuddyStreakTier(withFetcher(fetcher), "7d");
+    const result = await adoptFirstBuddy(withFetcher(fetcher));
     expect(result.state).toBe("error");
     expect(result.error).toContain("network down");
   });
@@ -263,7 +174,7 @@ describe("the day marker — one claim per account per task", () => {
     const { fetcher, calls } = recording(() => ok({ code: 0, data: {} }));
     const deps = taskDeps(db, fetcher);
 
-    await buddyRedeemTask(deps);
+    await buddyStreakTask(deps);
     const afterFirst = calls.length;
     expect(afterFirst).toBeGreaterThan(0);
     const rows = sqlite
@@ -273,7 +184,7 @@ describe("the day marker — one claim per account per task", () => {
       {
         day_key: buddyDayKey(new Date("2026-10-16T02:00:00Z")),
         account_id: "a1",
-        task: "buddy-redeem",
+        task: "buddy-streak",
       },
     ]);
     sqlite.close();
@@ -295,23 +206,13 @@ describe("the day marker — one claim per account per task", () => {
     const { db, sqlite } = await realDb();
     const { fetcher } = recording(() => ok({ code: 0, data: { state: "idle" } }));
     const deps = taskDeps(db, fetcher);
-    await buddyTravelTask(deps);
     await buddyAdoptTask(deps);
-    await buddyLotteryTask(deps);
     const tasks = (
       sqlite.prepare("SELECT task FROM buddy_task_ledger ORDER BY task").all() as Array<{ task: string }>
     ).map((row) => row.task);
-    expect(tasks).toEqual(["buddy-adopt", "buddy-lottery", "buddy-travel"]);
+    expect(tasks).toEqual(["buddy-adopt"]);
     sqlite.close();
   });
 
-  test("an endpoint that errors still settles the day, so a pass cannot hammer it", async () => {
-    const { db, sqlite } = await realDb();
-    const { fetcher, calls } = recording(() => new Response("boom", { status: 500 }));
-    const deps = taskDeps(db, fetcher);
-    await buddyTrialTask(deps);
-    await buddyTrialTask(deps);
-    expect(calls).toHaveLength(3);
-    sqlite.close();
-  });
+
 });

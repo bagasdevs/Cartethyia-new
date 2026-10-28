@@ -17,6 +17,7 @@ import {
   requireTenantAnyScope,
 } from "../../shared/errors";
 import type { AccessDecision } from "../../../security/access-control";
+import type { ProviderUsageDayRow } from "../../../observability/event-query";
 import { isBundledProviderId } from "../../../providers/provider-contracts";
 import type { ProviderRegistry } from "../../../providers/provider-registry";
 import { getProviderClientVersion, getRouteIdentityVersions } from "../../../providers/operations/client-versions";
@@ -147,6 +148,16 @@ export interface ProviderCatalogConfig {
     }[];
   }>;
   /**
+   * Day × model usage aggregate feeding the provider's Activity Matrix card.
+   * Optional so hosts without telemetry reads (and existing test doubles) keep
+   * the route returning an empty matrix instead of failing.
+   */
+  readonly providerUsageMatrix?: (
+    tenantId: string,
+    providerId: string,
+    days: number,
+  ) => Promise<readonly ProviderUsageDayRow[]>;
+  /**
    * Resolves the stored credential and optional OAuth refresh token for export,
    * decrypting them without applying provider-specific dispatch codecs.
    */
@@ -249,6 +260,19 @@ export function createProviderCatalogOperations(config: ProviderCatalogConfig) {
           throw new ConsoleDomainError("provider_not_found", 404, `Provider ${providerId} not found`);
         return attachProviderCapabilities(sanitizeProviderResponse(rec, true), config.providerRegistry);
       },
+    async getUsageMatrix(
+      access: AccessDecision | undefined,
+      providerId: string,
+      days: number,
+    ): Promise<{ readonly days: number; readonly rows: readonly ProviderUsageDayRow[] }> {
+      const a = requireTenantAnyScope(access, PROVIDER_READ_SCOPES);
+      // Bounded window even on a hostile query string: the card reads a
+      // calendar, not history, and the aggregate scan cost grows with `days`.
+      const bounded = Math.min(Math.max(Math.trunc(days) || 1, 1), 366);
+      if (!config.providerUsageMatrix) return { days: bounded, rows: [] };
+      const rows = await config.providerUsageMatrix(a.tenantId, providerId, bounded);
+      return { days: bounded, rows };
+    },
     async createProvider(
         access: AccessDecision | undefined,
         request: CreateProviderRequest,
@@ -639,6 +663,11 @@ export function createProviderCatalogOperations(config: ProviderCatalogConfig) {
         const selected = owned.filter(
           (account) => wanted.has(account.id) && account.tenantId === a.tenantId,
         );
+        const authStates = await config.store.listAccountAuthStates(
+          a.tenantId,
+          providerId,
+          selected.map((account) => account.id),
+        );
         const accounts = await Promise.all(
           selected.map(async (account): Promise<ProviderAccountExport> => {
             let accessToken = "";
@@ -661,6 +690,15 @@ export function createProviderCatalogOperations(config: ProviderCatalogConfig) {
               status: account.status,
               accessToken,
               ...(refreshToken === undefined ? {} : { refreshToken }),
+              // Non-secret auth state is part of the credential export: without
+              // it a re-import loses the upstream user id and region that Trae
+              // refresh and dispatch are addressed by.
+              ...(() => {
+                const authState = authStates[account.id];
+                return authState !== undefined && Object.keys(authState).length > 0
+                  ? { authState }
+                  : {};
+              })(),
               ...(account.inflight === undefined ? {} : { inflight: account.inflight }),
               createdAt: account.createdAt,
               ...(account.cooldownUntil ? { cooldownUntil: account.cooldownUntil } : {}),

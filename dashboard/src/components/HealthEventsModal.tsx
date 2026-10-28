@@ -28,6 +28,8 @@ export interface AccountHealthSummary {
   readonly staticToken?: boolean;
   readonly credentialKind?: CredentialKind;
   readonly credentialMode?: CredentialMode;
+  /** Who issued a static JWT, when the token's `iss` claim was readable. */
+  readonly jwtIssuer?: string | undefined;
 }
 
 /** Recovery is offered for the one transient state the backend can recover. */
@@ -65,7 +67,15 @@ export function HealthEventsModal({
   readonly summary: AccountHealthSummary;
   readonly onClose: () => void;
 }): ReactNode {
-  const { providerId, accountId, title, status, errorCategory, errorMessage } = summary;
+  const {
+    providerId,
+    accountId,
+    title,
+    status,
+    errorCategory,
+    errorMessage,
+    jwtIssuer,
+  } = summary;
   const query = useAccountHealthEvents(providerId, accountId);
   const recover = useRecoverAccount();
   const events = query.data ?? [];
@@ -122,6 +132,19 @@ export function HealthEventsModal({
               <div className="text-badge text-text-tertiary">
                 {staticMode ? "Static mode: no refresh request will be sent." : "OAuth refresh is enabled for this account."}
               </div>
+              {/* The issuer is the only record of where a static token came
+                  from — the secret is unreadable after registration — so it is
+                  shown next to the mode rather than left for the operator to
+                  guess from the label. */}
+              {jwtIssuer ? (
+                <div className="text-badge text-text-tertiary mt-1 wrap-anywhere">
+                  {/* Expiry is omitted on purpose — the account card already
+                      shows it, and repeating it here pushes the issuer, the
+                      one thing this row adds, off the line. */}
+                  Static · no refresh · issuer{" "}
+                  <span className="font-mono text-text-secondary">{jwtIssuer}</span>
+                </div>
+              ) : null}
             </div>
             <Button
               size="sm"
@@ -172,9 +195,21 @@ export function HealthEventsModal({
                       {new Date(ev.createdAt).toLocaleString()}
                     </td>
                     <td className="whitespace-nowrap">
-                      <span className="text-badge text-text-secondary">
-                        {ev.fromStatus ?? "new"} →{" "}
-                      </span>
+                      {/*
+                        * A same-status row is a recorded failure that did not
+                        * move the account — a provider-scoped rate limit, for
+                        * instance: nothing was cooled, so the account stays
+                        * active. Rendering it as "ACTIVE → ACTIVE" looked like
+                        * a broken transition; naming it as an event beside the
+                        * unchanged status is what it actually is.
+                        */}
+                      {ev.fromStatus !== null && ev.fromStatus !== ev.toStatus ? (
+                        <span className="text-badge text-text-secondary">
+                          {ev.fromStatus} →{" "}
+                        </span>
+                      ) : (
+                        <span className="text-badge text-text-tertiary">logged · </span>
+                      )}
                       <Badge tone={statusTone(ev.toStatus)}>{ev.toStatus}</Badge>
                     </td>
                     <td className="font-mono tabular-nums text-badge text-text-secondary wrap-anywhere">

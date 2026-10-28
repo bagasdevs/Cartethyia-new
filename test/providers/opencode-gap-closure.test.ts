@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import {
   isFreeTierZenModel,
   OPENCODE_FREE_SPEC,
@@ -12,7 +12,7 @@ import { fetchOpenCodeGoQuota } from "../../src/providers/integrations/opencode/
 
 describe("free-tier Accept advertises what a real client sends", () => {
   test("a free dispatch carries the AI SDK's Accept value", async () => {
-    // `opencode2api` sends `application/json, text/event-stream`
+    // The reference gateway sends `application/json, text/event-stream`
     // (upstream.go:1293); we used to claim the narrower
     // `text/event-stream`. Both work today — this pins the one a real
     // OpenCode 2.x client produces.
@@ -34,6 +34,11 @@ describe("free-tier Accept advertises what a real client sends", () => {
 
 describe("the free-tier blocklist is correctable without a deploy", () => {
   const original = process.env.CARTETHYIA_OPENCODE_UNAVAILABLE_FREE;
+
+  afterAll(() => {
+    if (original === undefined) delete process.env.CARTETHYIA_OPENCODE_UNAVAILABLE_FREE;
+    else process.env.CARTETHYIA_OPENCODE_UNAVAILABLE_FREE = original;
+  });
 
   test("unset, the bundled measured list stands", () => {
     delete process.env.CARTETHYIA_OPENCODE_UNAVAILABLE_FREE;
@@ -69,11 +74,6 @@ describe("the free-tier blocklist is correctable without a deploy", () => {
     expect(isFreeTierZenModel("claude-opus-5")).toBe(false);
   });
 
-  test("cleanup restores the original environment", () => {
-    if (original === undefined) delete process.env.CARTETHYIA_OPENCODE_UNAVAILABLE_FREE;
-    else process.env.CARTETHYIA_OPENCODE_UNAVAILABLE_FREE = original;
-    expect(true).toBe(true);
-  });
 });
 
 describe("the Go plan reports a real subscription quota", () => {

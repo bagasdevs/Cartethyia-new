@@ -5,6 +5,8 @@ import { createAccountQuotaRoutes } from "./quota/account-quota";
 import { createApiKeyRoutes } from "./api-keys/routes";
 import { familyBucketSpend } from "./api-keys/bucket-spend";
 import { createProviderCatalogRoutes } from "./providers/catalog/routes";
+import { createInferhubRoutes } from "./inferhub/routes";
+import { createInferhubKeyStore } from "./inferhub/key-store";
 import {
   createProviderDetailRoutes,
 } from "./providers/detail/routes";
@@ -32,7 +34,6 @@ import { DrizzleObservabilityStore } from "./observability/store";
 import { createLiveRoutes } from "./observability/live";
 import { createLogRoutes } from "./observability/logs";
 import { createAuditRoutes } from "./audit/routes";
-import { createModelAbuseRoutes } from "./admin/model-abuse/routes";
 import { DrizzleAuditReadStore } from "./audit/store";
 import { createPerformanceRoutes } from "./observability/performance";
 import { createUpdateRoutes } from "./updates/routes";
@@ -43,8 +44,9 @@ import { createBackupRoutes } from "./backup/routes";
 import { BackupService } from "./backup/service";
 import type { ConsoleCredentialService } from "./auth/credentials";
 import { resolveTelemetryRetentionDays } from "../config/telemetry";
-import { MAX_PAYLOAD_RETENTION_MS, payloadRetentionMs } from "../observability/payload-capture";
+import { payloadRetentionMs, resolvePayloadCapture } from "../observability/payload-capture";
 import { TELEMETRY_EVENT_DIR } from "../observability/event-log";
+import { providerUsageMatrix } from "../observability/event-query";
 
 import { InMemoryOAuthFlowStore, OAuthFlowStore } from "../providers/authentication/oauth-flow-store";
 import { OAuthCallbackListener } from "./providers/oauth/callback-listener";
@@ -54,7 +56,10 @@ import {
 } from "../providers/operations/provider-credential-service";
 import { syncByokProvider } from "../providers/operations/provider-catalog-service";
 import { DrizzleApiKeyStore } from "../persistence/stores/api-key-store";
-import { DrizzleShareLinkStore } from "../persistence/stores/share-store";
+import {
+  DrizzleShareLinkStore,
+  type ShareLinkStore,
+} from "../persistence/stores/share-store";
 import { createShareUsagePort } from "./share/share-usage";
 import { resolveSsrfPolicy } from "../config/network";
 import { createValidatedFetch } from "../network/outbound-fetch";
@@ -63,7 +68,6 @@ import type { CliToolService } from "./cli-tools/service";
 import type { NetworkPoolSelector } from "../network/pool/selector";
 import type { LiveInFlightSource } from "./observability/live";
 import type { ApiKeyAdmissionService } from "../security/admission/service";
-import type { ModelStrikeService } from "../security/model-abuse";
 import type { TelemetryBatchBuffer } from "../observability/telemetry-buffer";
 import type { OAuthRefreshService } from "../providers/authentication/oauth-refresh-service";
 import { resolveRedisBackend } from "../persistence/redis";
@@ -99,9 +103,13 @@ export interface ConsoleDomainContext {
   };
   /** Owns the live in-flight gauge the console surfaces. */
   readonly stateStore?: LiveInFlightSource;
+  /**
+   * Share-link store shared with the public share router, so both surfaces
+   * wrap the same table through one instance. Falls back to a fresh store
+   * when absent (reduced compositions, tests).
+   */
+  readonly shareStore?: ShareLinkStore;
   readonly admissionService: Pick<ApiKeyAdmissionService, "purgeKey">;
-  /** Graduated model-abuse strikes: list and lift bans from the console. */
-  readonly modelStrikes?: Pick<ModelStrikeService, "listBans" | "unban" | "ban">;
   readonly readRoutingAccountInflight?:
     | ((
         providerId: string,
@@ -227,7 +235,7 @@ export function registerConsoleDomains(
   const runtimeSettingsStore = new DrizzleRuntimeSettingsStore(ctx.db, resolveRedisBackend(ctx.redis));
   const modelRoutingStore = new DrizzleModelRoutingStore(ctx.db);
   const apiKeyStore = new DrizzleApiKeyStore(ctx.db);
-  const shareStore = new DrizzleShareLinkStore(ctx.db);
+  const shareStore = ctx.shareStore ?? new DrizzleShareLinkStore(ctx.db);
   const shareActivity = createShareUsagePort({ db: ctx.db, redis: ctx.redis });
 
 
@@ -249,12 +257,14 @@ export function registerConsoleDomains(
     service: createRemoteSupportService({ port: resolvePort() }),
   }));
   console.use(createAuditRoutes({ store: auditReadStore, accessResolver: ctx.accessResolver }));
-  if (ctx.modelStrikes) {
-    console.use(createModelAbuseRoutes({
-      strikes: ctx.modelStrikes,
-      accessResolver: ctx.accessResolver,
-    }));
-  }
+  // InferHub market data. On demand only: a route fetches when its snapshot is
+  // past its freshness window, so a page nobody opens causes no upstream calls.
+  const inferhubKeys = createInferhubKeyStore(ctx.db);
+  console.use(createInferhubRoutes({
+    accessResolver: ctx.accessResolver,
+    resolveConfigKey: () => inferhubKeys.read(),
+    keyStore: inferhubKeys,
+  }));
   console.use(createProviderCatalogRoutes({
     store: providerCatalogStore,
     accessResolver: ctx.accessResolver,
@@ -270,6 +280,13 @@ export function registerConsoleDomains(
       aliases: await modelRoutingStore.listAliases(tenantId),
       combos: await modelRoutingStore.listCombos(tenantId),
     }),
+    providerUsageMatrix: (tenantId, providerId, days) =>
+      providerUsageMatrix(
+        ctx.db,
+        tenantId,
+        providerId,
+        new Date(Date.now() - days * 86_400_000),
+      ),
   }));
   console.use(createProviderDetailRoutes({
     store: providerDetailStore,
@@ -293,8 +310,20 @@ export function registerConsoleDomains(
     createDataManagementRoutes({
       telemetryDir: TELEMETRY_EVENT_DIR,
       retentionDays: resolveTelemetryRetentionDays(),
-      payloadRetentionMs: payloadRetentionMs(),
-      payloadRetentionMaxMs: MAX_PAYLOAD_RETENTION_MS,
+      /*
+       * Resolved per tenant, not once at boot: the Request detail window is a
+       * per-tenant setting, and this panel is the only place that reports the
+       * number back. A deployment-level value made it show the default while
+       * the gateway applied the tenant's own window.
+       *
+       * It goes through the same `resolvePayloadCapture` the dispatch path
+       * uses, so the panel and the gateway cannot disagree about how long a
+       * frame lives.
+       */
+      payloadRetentionMs: async (tenantId) => {
+        const resolved = await resolvePayloadCapture(ctx.db, tenantId);
+        return resolved.ok ? resolved.retentionMs : payloadRetentionMs();
+      },
       accessResolver: ctx.accessResolver,
       auditSink: ctx.auditRecorder,
       flusher: ctx.flushBuffers,

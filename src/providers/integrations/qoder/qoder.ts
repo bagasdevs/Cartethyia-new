@@ -11,7 +11,15 @@ import {
   upstreamErrorIdentifier,
 } from "../../../transport/failure-policy";
 import { GatewayError } from "../../../protocol/gateway-error";
-import type { CanonicalEvent, CanonicalRequest, CanonicalStopReason, ContentPart } from "../../../protocol/canonical-model";
+import { resolveImageSource } from "../../../protocol/codecs";
+import type {
+  CanonicalEvent,
+  CanonicalRequest,
+  CanonicalStopReason,
+  ContentPart,
+  ToolChoice,
+  ToolDefinition,
+} from "../../../protocol/canonical-model";
 import { toolResultParts } from "../../../protocol/canonical-model";
 import { decodeSseEvents } from "../../../protocol/sse-decoder";
 import { usageFromProvider, readReasoningText } from "../../provider-usage";
@@ -479,11 +487,155 @@ function qoderRequestedMaxTokens(request: CanonicalRequest, modelConfig: QoderMo
   return typeof requested === "number" && requested > 0 ? Math.min(requested, configured) : configured;
 }
 
+/**
+ * Whether this model needs the prior turn's reasoning echoed back.
+ *
+ * The DeepSeek family ties multi-turn consistency to `reasoning_content`: an
+ * assistant turn that thought must be replayed with that field or the upstream
+ * refuses the whole history. The upstream reference bridge keeps it for exactly
+ * these models and drops it as noise for every other one
+ * (`keep_reasoning=is_deepseek_model(...)`, and `reasoning_content` in
+ * `NOISE_KEYS` otherwise), and notes the symptom when it is missed: occasional
+ * failures that sometimes pass on retry.
+ *
+ * Matched by the upstream key and by the display name, because a caller may
+ * name either — the reference warns that matching only the "deepseek" prefix
+ * missed every request that used the key.
+ */
+function qoderKeepsReasoning(modelId: string): boolean {
+  const key = modelId.trim().toLowerCase();
+  if (key === "dmodel" || key === "dfmodel") return true;
+  return key.startsWith("deepseek");
+}
+
+/**
+ * The `reasoning_content` field for an assistant turn, when one is needed.
+ *
+ * Presence, not length, decides: a client that already knows the rule sends
+ * `""` on a thinking turn whose text is not readable back, and dropping that
+ * empty string re-triggers the complaint it was sent to avoid.
+ *
+ * DeepSeek multi-turn consistency also backfills the field on every assistant
+ * turn once the conversation carries a reasoning trace at all — the reference
+ * bridge does the same (`backfill_reasoning_content`), and notes the symptom
+ * when it is missed: occasional failures that sometimes pass on retry. An
+ * assistant turn with no reasoning and no trace gains nothing, so nothing is
+ * fabricated.
+ */
+function qoderReasoningEcho(
+  message: { content: readonly ContentPart[] },
+  modelId: string,
+  hasReasoningTrace = false,
+): { reasoning_content: string } | Record<string, never> {
+  if (!qoderKeepsReasoning(modelId)) return {};
+  const reasoning = message.content.filter((part) => part.kind === "reasoning");
+  if (reasoning.length === 0) {
+    return hasReasoningTrace ? { reasoning_content: "" } : {};
+  }
+  const text = reasoning
+    .map((part) => (part.kind === "reasoning" ? (part.summary ?? part.payload ?? "") : ""))
+    .join("");
+  return { reasoning_content: text };
+}
+
+/**
+ * The tool arguments as the object the `tool_use` block expects.
+ *
+ * The canonical form keeps them as the raw JSON text the caller sent, which is
+ * what a chat-completions `tool_calls` entry holds. A `tool_use` block wants
+ * structured input, so the text is parsed back.
+ *
+ * The fallbacks mirror the upstream reference bridge rather than inventing
+ * shapes: unparseable text becomes `{}` and a non-object becomes `{value}`.
+ * Smuggling the raw text through instead would emit an argument shape the
+ * upstream has never seen for this field.
+ */
+/**
+ * Projects the canonical tools onto Qoder's chat-completions `tools` array.
+ *
+ * Without this the upstream is never told a tool exists, so a model that wants
+ * one improvises markup in its prose (`<Read file_path="..." />`) instead of
+ * emitting a structured call — the call is then neither runnable nor
+ * recoverable, because it never was a call on either side.
+ *
+ * Only `function` tools are representable upstream. Anything else is dropped
+ * rather than forwarded: Qoder rejects an unknown variant during
+ * deserialization and fails the whole turn, which is worse than omitting a
+ * tool the model could not have used anyway.
+ */
+function qoderTools(
+  tools: readonly ToolDefinition[] | undefined,
+): Array<Record<string, unknown>> {
+  const out: Array<Record<string, unknown>> = [];
+  for (const tool of tools ?? []) {
+    if (tool.tool_type !== undefined && tool.tool_type !== "function") continue;
+    // The upstream requires `tools[].function` to be an object. A flat
+    // declaration naming the tool at the top level is rejected outright with
+    // "'function' is a required property, expected an object", which fails the
+    // whole request rather than just this tool.
+    out.push({
+      type: "function",
+      function: {
+        name: tool.name,
+        ...(tool.description === undefined ? { description: "" } : { description: tool.description }),
+        parameters: tool.jsonSchema ?? { type: "object", properties: {} },
+        ...(tool.strict === undefined ? {} : { strict: tool.strict }),
+      },
+    });
+  }
+  return out;
+}
+
+
+/**
+ * Projects the canonical tool choice onto the upstream's field.
+ *
+ * The upstream only accepts a string here. Given the object form
+ * `{type:"function",function:{name}}` it ignores the field, and the model then
+ * calls the tool with no arguments filled in.
+ *
+ * `allowed_tools` has no chat-completions equivalent, so it collapses to the
+ * direction it already names rather than being dropped: a caller that asked for
+ * `required` must not silently get `auto`.
+ */
+function qoderToolChoice(choice: ToolChoice | undefined): unknown {
+  if (choice === undefined) return undefined;
+  if (typeof choice === "string") return choice;
+  if (choice.type === "tool" || choice.type === "custom") {
+    const name = choice.name.trim();
+    return name.length > 0 ? name : "auto";
+  }
+  return choice.mode;
+}
+
+/**
+ * Marks a tool call recorded into the text of an assistant turn.
+ *
+ * The upstream only reads structured turns on its CN realm, so on INTL a past
+ * call has to be described in prose or the model loses the record of what it
+ * asked for. The wording matches the reference bridge, which is what the
+ * upstream has been trained to read back.
+ */
+const QODER_TOOL_MARKER = "[assistant 请求调用工具]";
+
+/**
+ * Whether this request sends its tool history as structured turns.
+ *
+ * The upstream honours the structured form on its CN realm only. On INTL it is
+ * not enabled, and sending it anyway yields tool calls that come back right in
+ * name but with no arguments filled in — a call that cannot run. So the shape
+ * follows the realm rather than being assumed everywhere.
+ */
+function qoderStructuredTools(realm: QoderRealm): boolean {
+  return realm === "cn";
+}
+
 export function buildQoderRequest(
   modelId: string,
   request: CanonicalRequest,
   modelConfig: QoderModelConfig,
   auth: QoderAuth,
+  realm: QoderRealm = "intl",
 ): Record<string, unknown> {
   const allMessages = request.messages;
   const systemParts: string[] = [];
@@ -501,11 +653,17 @@ export function buildQoderRequest(
   }
   const systemPrompt = systemParts.join("\n\n").trim();
   const qoderMessages: Array<Record<string, unknown>> = [];
+  const structuredTools = qoderStructuredTools(realm);
+  // DeepSeek multi-turn: once any turn in the conversation carries a reasoning
+  // trace, every assistant message must replay `reasoning_content` (see
+  // `qoderReasoningEcho`).
+  const hasReasoningTrace = allMessages.some((message) =>
+    message.content.some((part) => part.kind === "reasoning"),
+  );
   if (MODERN_PROFILE.mirrorTopLevelSystem && systemPrompt.length > 0) {
     qoderMessages.push({
       role: "system",
       content: systemPrompt,
-      contents: [{ type: "text", text: systemPrompt }],
     });
   }
   for (const m of allMessages) {
@@ -514,7 +672,7 @@ export function buildQoderRequest(
     // so the result scan is role-agnostic. Each result becomes its own `tool`
     // turn carrying its `tool_call_id`; any non-result content on the same turn
     // is emitted after, so nothing is duplicated or lost.
-    const results = toolResultParts(m);
+    const results = structuredTools ? toolResultParts(m) : [];
     if (results.length > 0) {
       for (const block of results) {
         const text = flattenCanonicalContent(
@@ -525,25 +683,110 @@ export function buildQoderRequest(
         qoderMessages.push({
           role: "tool",
           content: text,
-          contents: [{ type: "text", text }],
           tool_call_id: block.call_id,
         });
       }
+      // Text that shared the turn with a result is emitted after it, minus the
+      // result itself. Re-emitting the result's own text here was doubling
+      // every tool answer: the `tool` turn above and a `user` turn with the
+      // same content, which doubled the payload for no reason.
       const remaining = m.content.filter((part) => part.kind !== "toolResult");
-      if (remaining.length === 0) continue;
       const flat = flattenCanonicalContent(remaining);
+      if (flat.length === 0) continue;
       qoderMessages.push({
         role: "user",
         content: flat,
-        contents: [{ type: "text", text: flat }],
+      });
+      continue;
+    }
+    // An assistant turn that called tools must carry the calls, not just its
+    // text. Falling through to the text-only emit dropped them, so the payload
+    // arrived as a `tool` result with no preceding call and the upstream
+    // rejected the whole transcript: "Messages with role 'tool' must be a
+    // response to a preceding message with 'tool_calls'".
+    const allCalls = m.content.filter((part) => part.kind === "toolCall");
+    const reasoningEcho = qoderReasoningEcho(m, modelId, hasReasoningTrace);
+    // Structured tool turns are only safe when every call carries an id — the
+    // upstream drops or rejects a transcript whose `tool` result answers a call
+    // without one. Fall back to prose history exactly like INTL in that case.
+    const structuredIdsOk = allCalls.every(
+      (part) => typeof part.call_id === "string" && part.call_id.length > 0,
+    );
+    if ((!structuredTools || !structuredIdsOk) && allCalls.length > 0) {
+      // INTL does not read structured turns, so the call is written into the
+      // text instead of being dropped. Dropping it left the next `tool` turn
+      // answering a call that was never made, and the model had no record of
+      // what it had asked for — so it re-emitted a call with no arguments.
+      //
+      // The marker and the JSON shape mirror the reference bridge, which is
+      // what the upstream has actually been trained to read back.
+      const textParts = m.content.filter((part) => part.kind !== "toolCall");
+      const prose = flattenCanonicalContent(textParts);
+      const recorded = allCalls.map((part) => ({
+        name: part.name,
+        arguments: typeof part.arguments === "string" ? part.arguments : "",
+      }));
+      qoderMessages.push({
+        role: "assistant",
+        content: (prose.length > 0 ? prose + "\n\n" : "") + QODER_TOOL_MARKER + "\n" + JSON.stringify(recorded),
+        ...reasoningEcho,
+      });
+      continue;
+    }
+    const calls = structuredTools && structuredIdsOk ? allCalls : [];
+    if (calls.length > 0) {
+      const textParts = m.content.filter((part) => part.kind !== "toolCall");
+      const flat = flattenCanonicalContent(textParts);
+      qoderMessages.push({
+        role: "assistant",
+        content: flat,
+        ...reasoningEcho,
+        tool_calls: calls.map((part) => ({
+          id: part.call_id,
+          type: "function",
+          function: {
+            name: part.name,
+            arguments: typeof part.arguments === "string" ? part.arguments : "",
+          },
+        })),
+      });
+      continue;
+    }
+    const role = m.role === "assistant" ? "assistant" : "user";
+    // Images must travel as structured OpenAI parts inside the message content —
+    // the upstream reads `image_url` parts there and not the top-level
+    // `image_urls` (mirroring `flatten_messages` in the reference bridge). A
+    // bare file_id reference degrades to a text note instead of being dropped.
+    const hasImages = m.content.some((part) => part.kind === "image");
+    if (hasImages) {
+      const parts: Array<Record<string, unknown>> = [];
+      for (const part of m.content) {
+        if (part.kind === "text") {
+          parts.push({ type: "text", text: part.text });
+        } else if (part.kind === "image") {
+          const source = resolveImageSource(part.payload);
+          if (source?.url !== undefined) {
+            parts.push({ type: "image_url", image_url: { url: source.url } });
+          } else {
+            parts.push({
+              type: "text",
+              text: source?.fileId !== undefined ? `[image: ${source.fileId}]` : "[image: unsupported source]",
+            });
+          }
+        }
+      }
+      qoderMessages.push({
+        role,
+        content: parts,
+        ...(role === "assistant" ? qoderReasoningEcho(m, modelId, hasReasoningTrace) : {}),
       });
       continue;
     }
     const flat = flattenCanonicalContent(m.content);
     qoderMessages.push({
-      role: m.role === "assistant" ? "assistant" : "user",
+      role,
       content: flat,
-      contents: [{ type: "text", text: flat }],
+      ...(role === "assistant" ? qoderReasoningEcho(m, modelId, hasReasoningTrace) : {}),
     });
   }
   const latestUserMessage = [...qoderMessages].reverse().find((m) => m["role"] === "user");
@@ -573,13 +816,21 @@ export function buildQoderRequest(
     chat_context: {
       chatPrompt: MODERN_PROFILE.mirrorTopLevelSystem ? systemPrompt : "",
       imageUrls: null,
-      extra: { context: [], modelConfig: { key: modelId, is_reasoning: reasoning }, originalContent: latestUserText },
+      extra: { context: [], modelConfig: { key: modelId, is_reasoning: reasoning }, originalContent: { text: latestUserText } },
       features: [],
-      text: latestUserText,
+      // An object, as the reference sends it: `cc["text"]["text"] = prompt`.
+      text: { text: latestUserText },
     },
     model_config: {
       key: modelId,
       display_name: modelConfig.display_name,
+      // Declares the wire dialect for the tool calls. Without it the upstream
+      // does not read the OpenAI-shaped `tools` array the same way, and the
+      // model then emits a call with no arguments filled in.
+      format: "openai",
+      model: "",
+      api_key: "",
+      url: "",
       is_vl: modelConfig.is_vl,
       is_reasoning: modelConfig.is_reasoning,
       max_input_tokens: modelConfig.max_input_tokens,
@@ -591,20 +842,177 @@ export function buildQoderRequest(
     },
     messages: qoderMessages,
     max_tokens: maxTokens,
+    // Always present, even when empty. Omitting the field makes Qoder fall back
+    // to the desktop agent's own toolset (Bash/Edit/...), which then leaks to a
+    // caller that declared none — the reference bridge sends `[]` for exactly
+    // that reason. Parallel calls are stated explicitly rather than left to the
+    // upstream default, so a caller expecting them is not served serial
+    // behaviour.
+    tools: qoderTools(request.tools),
+    parallel_tool_calls: true,
+    ...(() => {
+      const choice = qoderToolChoice(request.tool_choice);
+      return choice === undefined ? {} : { tool_choice: choice };
+    })(),
   };
+}
+
+// ---------------------------------------------------------------------------
+// DSML tool-call recovery — DeepSeek's native markup in the text stream
+// ---------------------------------------------------------------------------
+// Some DeepSeek-family models write their tool calls as XML-like DSML markup
+// inside the plain-text `content` stream instead of the structured
+// `tool_calls` field. Left alone, the markup reaches the caller as visible
+// prose and the tool never runs — which is exactly the symptom reported.
+//
+// The parser lives in `src/protocol/dsml.ts`, shared with the CodeBuddy
+// family; Qoder selects the fuzzy dialect, which mirrors the reference bridge's
+// Python regexes (`qoder_proxy.py`, `parse_dsml_tool_calls`).
+import {
+  parseFuzzyDsmlToolCalls,
+  dsmlTailHold,
+  stripDsmlCloseTags,
+  type DsmlToolCall,
+} from "../../../protocol/dsml";
+
+/** Qoder's dialect bounds the shared parser to the fuzzy (non-strict) form. */
+export const parseDsmlToolCalls = (text: string) => parseFuzzyDsmlToolCalls(text);
+export { dsmlTailHold, stripDsmlCloseTags } from "../../../protocol/dsml";
+
+/** One recovered call, in the shape the canonical events want. */
+export type DsmlCall = DsmlToolCall;
+
+/**
+ * Escapes the bare quotes that belong inside a JSON string value.
+ *
+ * Escaped quotes are parked first so they are not escaped twice, then every
+ * remaining quote is escaped, then the parked ones are restored.
+ */
+function repairJsonQuotes(text: string): string {
+  const ph = "\u0000";
+  return text.replace(/\\"/g, ph).replace(/"/g, '\\"').replaceAll(ph, '\\"');
+}
+
+/** `[{"name":"…","arguments":"<unescaped JSON>"}]`, one call only. */
+const ECHO_LOOSE_RE = /^\[\s*\{\s*"name"\s*:\s*"([^"]{1,200})"\s*,\s*"arguments"\s*:\s*"(.*)"\s*\}\s*\]$/s;
+
+/**
+ * Any spelling of the INTL tool-call leak marker — the square-bracket
+ * canonical form, the angle-bracket variant the upstream also emits
+ * (`<assistant 请求调用工具>`), and partial variants missing the closing
+ * bracket. Mirrors `_LEAK_MARKER_RE` in the reference bridge.
+ */
+const LEAK_MARKER_ANY_RE = /[\[<(]*\s*assistant\s*请求调用工具\s*[\]>)]?/;
+
+/**
+ * Rebuilds the single-call echo shape when strict parsing fails.
+ *
+ * Returns `null` when the text is not that shape at all, so a caller can fall
+ * back rather than accepting a guess. The result still goes through the same
+ * strict checks as a normally-parsed array.
+ */
+function salvageEchoArray(rest: string): unknown {
+  const m = ECHO_LOOSE_RE.exec(rest.trim());
+  if (!m) return null;
+  const name = m[1] ?? "";
+  const raw = m[2] ?? "";
+  for (const candidate of [raw, repairJsonQuotes(raw)]) {
+    try {
+      JSON.parse(candidate);
+      return [{ name, arguments: candidate }];
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+/**
+ * Recovers a tool call the model echoed back as text.
+ *
+ * On INTL the upstream reads tool calls as prose, so a turn that called a tool
+ * is described with `QODER_TOOL_MARKER` followed by a JSON array of
+ * `{name, arguments}`. The model occasionally reproduces that shape verbatim as
+ * its answer instead of calling again, and left alone the client shows the JSON
+ * as content while the tool never runs.
+ *
+ * Only a well-formed array whose every entry names a tool and carries parseable
+ * arguments is accepted. Anything else returns no calls and the original text,
+ * so a model merely talking about the format is never mistaken for a call.
+ */
+export function parseLeakedToolCalls(
+  text: string,
+  allowedNames?: ReadonlySet<string>,
+): { calls: DsmlCall[]; clean: string } {
+  if (text.length === 0) {
+    return { calls: [], clean: text };
+  }
+  // The upstream occasionally echoes the marker in variants — angle brackets,
+  // a missing closing bracket, or wrapped inside a ``` fence. Strip a leading
+  // fence, then locate any marker spelling, mirroring the reference bridge's
+  // `_normalize_leak_marker`.
+  const fence = text.match(/^```[a-z]*\s*\n?/i);
+  const src = fence && fence[0] ? text.slice(fence[0].length) : text;
+  const marker = LEAK_MARKER_ANY_RE.exec(src);
+  if (!marker) {
+    return { calls: [], clean: text };
+  }
+  const head = src.slice(0, marker.index).trim();
+  let rest = src.slice(marker.index + marker[0].length).trim();
+  // The model occasionally leaves raw DSML closing tags after the echo array
+  // (`</｜DSML｜parameter>` etc.), and a ``` fence may close the block. Strip
+  // trailing residue so the JSON parse is not poisoned by "Extra data".
+  rest = stripDsmlCloseTags(rest);
+  rest = rest.replace(/\s*```\s*$/, "").trim();
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rest);
+  } catch {
+    // A model echoing the call writes the inner quotes unescaped:
+    // `[{"name":"Read","arguments":"{"file_path":"a.ts"}"}]`. That is not
+    // valid JSON at either level, so the array has to be rebuilt before it can
+    // be trusted. Only the single-call shape is salvaged, which is what an echo
+    // almost always is.
+    const salvaged = salvageEchoArray(rest);
+    if (salvaged === null) return { calls: [], clean: text };
+    parsed = salvaged;
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0) return { calls: [], clean: text };
+
+  const calls: DsmlCall[] = [];
+  for (const item of parsed) {
+    if (typeof item !== "object" || item === null) return { calls: [], clean: text };
+    const rec = item as Record<string, unknown>;
+    const name = typeof rec["name"] === "string" ? rec["name"].trim() : "";
+    if (name.length === 0) return { calls: [], clean: text };
+    if (allowedNames && !allowedNames.has(name)) return { calls: [], clean: text };
+    let args = rec["arguments"];
+    if (typeof args === "object" && args !== null) args = JSON.stringify(args);
+    if (typeof args !== "string") return { calls: [], clean: text };
+    // Arguments that do not parse are not a call this can trust.
+    if (args.trim().length > 0) {
+      try {
+        JSON.parse(args);
+      } catch {
+        return { calls: [], clean: text };
+      }
+    }
+    calls.push({ id: `call_${randomUUID().replace(/-/g, "").slice(0, 16)}`, name, arguments: args });
+  }
+  return { calls, clean: head };
 }
 
 // Stream transformation — decode SSE, unwrap COSY envelope, map OpenAI chat chunks to CanonicalEvent
 
 function mapQoderFinishReason(raw: unknown): CanonicalStopReason | undefined {
-  if (raw === "stop") return "stop";
   if (raw === "length") return "length";
   if (raw === "tool_calls") return "tool_use";
   if (raw === "content_filter") return "content_filter";
   return undefined;
 }
 
-async function* qoderBodyToCanonicalEvents(
+export async function* qoderBodyToCanonicalEvents(
   body: ReadableStream<Uint8Array>,
   signal: AbortSignal,
   model: string,
@@ -614,6 +1022,31 @@ async function* qoderBodyToCanonicalEvents(
   let finishReason: unknown = undefined;
   let rawUsage: Record<string, unknown> | undefined = undefined;
   let hasTerminal = false;
+  /** First-sighting id per wire tool-call index, for continuation chunks. */
+  const indexIds = new Map<number, string>();
+  /** Last seen call id/name, for index-less continuation fragments. */
+  let lastSeenToolId: string | undefined = undefined;
+  let lastSeenToolName: string | undefined = undefined;
+  // DSML recovery state. While `buf` is empty the text passes through
+  // untouched; once a chunk carries DSML the rest is buffered so the markup can
+  // be parsed whole at end of stream. `tail` holds a possible half-tag that
+  // straddles a frame boundary.
+  let buf = "";
+  let tail = "";
+  // Text that flowed through while not in a DSML stream. The INTL leak marker
+  // (`[assistant 请求调用工具] …`) is not DSML, so it was never buffered and
+  // recovered; keeping the plain text lets the end-of-stream recovery see it.
+  let plainBuf = "";
+  /** Calls recovered from the thinking channel, emitted if content had none. */
+  let reasonCalls: readonly DsmlCall[] = [];
+  /** True once any tool call has been emitted by any channel this turn. */
+  let hasEmittedToolCall = false;
+  // The same recovery for the thinking channel. A model that plans its call
+  // inside `reasoning_content` writes the markup there instead of in `content`,
+  // so recovering only the content channel loses the call *and* leaves the
+  // tags visible in the user's thinking.
+  let reasonBuf = "";
+  let reasonTail = "";
 
   for await (const sse of decodeSseEvents(body, { signal })) {
     const sseData = sse.data;
@@ -642,29 +1075,98 @@ async function* qoderBodyToCanonicalEvents(
         const delta = choice["delta"] as Record<string, unknown> | undefined;
         if (delta) {
           if (typeof delta["content"] === "string" && (delta["content"] as string).length > 0) {
-            yield {
-              type: "content_delta",
-              sequence_number: seq++,
-              content: { kind: "text", text: delta["content"] as string },
-            } as CanonicalEvent;
+            const piece = tail + (delta["content"] as string);
+            tail = "";
+            if (buf.length === 0) {
+              // Not yet in a DSML stream: hold back only a possible tag start,
+              // and pass everything before it through unchanged.
+              const hold = dsmlTailHold(piece);
+              const body = hold.length > 0 ? piece.slice(0, piece.length - hold.length) : piece;
+              if (body.includes("DSML")) {
+                buf = body;
+                tail = hold;
+                continue;
+              }
+              if (body.length > 0) {
+                plainBuf += body;
+                yield {
+                  type: "content_delta",
+                  sequence_number: seq++,
+                  content: { kind: "text", text: body },
+                } as CanonicalEvent;
+              }
+              tail = hold;
+              continue;
+            }
+            buf += piece;
+            continue;
           }
           const reasoningText = readReasoningText(delta);
           if (typeof reasoningText === "string" && reasoningText.length > 0) {
-            yield {
-              type: "content_delta",
-              sequence_number: seq++,
-              content: { kind: "reasoning", payload: null, summary: reasoningText },
-            } as CanonicalEvent;
+            const piece = reasonTail + reasoningText;
+            reasonTail = "";
+            if (reasonBuf.length === 0) {
+              const hold = dsmlTailHold(piece);
+              const body = hold.length > 0 ? piece.slice(0, piece.length - hold.length) : piece;
+              if (body.includes("DSML")) {
+                reasonBuf = body;
+                reasonTail = hold;
+                continue;
+              }
+              const visible = stripDsmlCloseTags(body);
+              if (visible.length > 0) {
+                yield {
+                  type: "content_delta",
+                  sequence_number: seq++,
+                  content: { kind: "reasoning", payload: null, summary: visible },
+                } as CanonicalEvent;
+              }
+              reasonTail = hold;
+              continue;
+            }
+            reasonBuf += piece;
+            continue;
           }
           const toolCalls = delta["tool_calls"] as Array<Record<string, unknown>> | undefined;
           if (toolCalls) {
             for (const tc of toolCalls) {
               const fn = tc["function"] as Record<string, unknown> | undefined;
+              const index = typeof tc["index"] === "number" ? (tc["index"] as number) : undefined;
+              const declaredId = typeof tc["id"] === "string" ? (tc["id"] as string) : undefined;
+              const fragName = typeof fn?.["name"] === "string" ? (fn["name"] as string) : undefined;
+              // OpenAI continuation chunks re-identify their call by wire
+              // `index` alone — the `id` appears only once, in the first chunk.
+              // Some bridges omit `index` too, so a fragment then falls back to
+              // the most recently seen call id (mirroring the generic chat
+              // parser's `lastSeenToolId`). Pinning the first id per index and
+              // reusing it for continuations is what keeps fragments attached
+              // to the right call; synthesizing a fresh `call_<index>` id per
+              // chunk instead made every continuation an unknown nameless call
+              // that encoders dropped, so the client saw a call whose arguments
+              // were always empty.
+              let callId: string;
+              if (declaredId !== undefined) {
+                callId = declaredId;
+                if (index !== undefined) indexIds.set(index, callId);
+                lastSeenToolId = callId;
+                if (fragName !== undefined) lastSeenToolName = fragName;
+              } else if (index !== undefined && indexIds.has(index)) {
+                callId = indexIds.get(index)!;
+              } else if (
+                lastSeenToolId !== undefined &&
+                (fragName === undefined || lastSeenToolName === fragName)
+              ) {
+                callId = lastSeenToolId;
+              } else {
+                callId = `call_${String(index ?? 0)}`;
+              }
+              hasEmittedToolCall = true;
               yield {
                 type: "tool_call_delta",
                 sequence_number: seq++,
-                call_id: (tc["id"] as string) ?? `call_${String(tc["index"] ?? 0)}`,
-                name: fn?.["name"] as string | undefined,
+                call_id: callId,
+                ...(index !== undefined ? { index } : {}),
+                ...(fragName === undefined ? {} : { name: fragName }),
                 arguments_delta: (fn?.["arguments"] as string) ?? "",
               } as CanonicalEvent;
             }
@@ -678,6 +1180,114 @@ async function* qoderBodyToCanonicalEvents(
       // Some Qoder chunks carry finish_reason at top level
       if (json["finish_reason"] !== undefined) finishReason = json["finish_reason"];
     }
+  }
+  // End of stream: resolve whatever the DSML buffer collected.
+  if (reasonBuf.length > 0) {
+    const { calls, clean } = parseDsmlToolCalls(reasonBuf);
+    const visible = stripDsmlCloseTags(clean).trim();
+    if (visible.length > 0) {
+      yield {
+        type: "content_delta",
+        sequence_number: seq++,
+        content: { kind: "reasoning", payload: null, summary: visible },
+      } as CanonicalEvent;
+    }
+    // A call recovered here counts exactly like one recovered from the content
+    // channel — the two are deduplicated below, so a model that writes the
+    // block in one channel and its tail in the other still yields one call.
+    if (calls.length > 0) reasonCalls = calls;
+  }
+  if (buf.length > 0) {
+    // Two ways a call can arrive as text: DSML markup, and the marker + JSON
+    // array the upstream itself uses on INTL. The second is tried only when the
+    // first finds nothing, so a DSML stream is never re-read as an echo.
+    let { calls, clean } = parseDsmlToolCalls(buf);
+    if (calls.length === 0) {
+      const leaked = parseLeakedToolCalls(buf);
+      if (leaked.calls.length > 0) {
+        calls = leaked.calls;
+        clean = leaked.clean;
+      }
+    }
+    if (calls.length > 0) {
+      const visible = stripDsmlCloseTags(clean).trim();
+      if (visible.length > 0) {
+        yield {
+          type: "content_delta",
+          sequence_number: seq++,
+          content: { kind: "text", text: visible },
+        } as CanonicalEvent;
+      }
+      for (const call of calls) {
+        hasEmittedToolCall = true;
+        yield {
+          type: "tool_call_delta",
+          sequence_number: seq++,
+          call_id: call.id,
+          name: call.name,
+          arguments_delta: call.arguments,
+        } as CanonicalEvent;
+      }
+      reasonCalls = [];
+      // The turn ended by calling a tool, whatever the upstream reported.
+      finishReason = "tool_calls";
+    } else {
+      // Unparseable markup: emit as prose rather than dropping it, so nothing
+      // the model said is lost.
+      const visible = stripDsmlCloseTags(buf).trim();
+      if (visible.length > 0) {
+        yield {
+          type: "content_delta",
+          sequence_number: seq++,
+          content: { kind: "text", text: visible },
+        } as CanonicalEvent;
+      }
+    }
+  }
+  // Content carried no call of its own: whatever the thinking channel
+  // recovered is the turn's call.
+  for (const call of reasonCalls) {
+    hasEmittedToolCall = true;
+    yield {
+      type: "tool_call_delta",
+      sequence_number: seq++,
+      call_id: call.id,
+      name: call.name,
+      arguments_delta: call.arguments,
+    } as CanonicalEvent;
+  }
+  // The INTL leak marker is plain text, not DSML, so it flowed through to
+  // `plainBuf` instead of the buffered `buf`. Recover it the same way: a
+  // model that answers with `[assistant 请求调用工具] [{"name":…,"arguments":…}]`
+  // intended the tool to run, and left alone the client sees the JSON as
+  // content while nothing executes. Only when no other channel already
+  // claimed the turn.
+  if (plainBuf.length > 0 && !hasEmittedToolCall) {
+    const leaked = parseLeakedToolCalls(plainBuf);
+    if (leaked.calls.length > 0) {
+      for (const call of leaked.calls) {
+        hasEmittedToolCall = true;
+        yield {
+          type: "tool_call_delta",
+          sequence_number: seq++,
+          call_id: call.id,
+          name: call.name,
+          arguments_delta: call.arguments,
+        } as CanonicalEvent;
+      }
+      finishReason = "tool_calls";
+    }
+  }
+  // A recovered call outranks what the upstream reported. It says `stop`
+  // because the markup never became a real tool call on its side, so leaving it
+  // alone ends the turn "finished" with a call the caller never sees run.
+  if (reasonCalls.length > 0) finishReason = "tool_calls";
+  if (tail.length > 0) {
+    yield {
+      type: "content_delta",
+      sequence_number: seq++,
+      content: { kind: "text", text: tail },
+    } as CanonicalEvent;
   }
   // If no terminal arrived, synthesize one (prevents truncation error)
   const stopReason = mapQoderFinishReason(finishReason);
@@ -794,7 +1404,7 @@ class QoderAdapter implements ProviderAdapter {
       const auth = isQoderPat(secret)
         ? await exchangeQoderPat(secret, lifecycle.signal, fetcher, version, this.realm)
         : qoderOAuthAuth(secret, context.credential.auth_state, context.credential.account_id);
-      const qoderBody = buildQoderRequest(modelId, request, modelConfig, auth);
+      const qoderBody = buildQoderRequest(modelId, request, modelConfig, auth, this.realm);
       // A full URL from the route wins, but the fallback is this realm's
       // gateway — not the intl host hardcoded into `MODERN_PROFILE`. Dispatching
       // a CN credential to `*.qoder.sh` is refused outright.

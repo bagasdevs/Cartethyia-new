@@ -1,17 +1,9 @@
 import type { ProviderAdapter, ProviderDispatchTarget } from "../../providers/provider-contracts";
 import { GatewayError } from "../../protocol/gateway-error";
 import { resolveCredentialForAccount } from "../../providers/operations/provider-credential-service";
-import type { OAuthTokenRefresher, OAuthRefreshService } from "../../providers/authentication/oauth-refresh-service";
-import type { ValidatedNetworkBindingFactory } from "../../network/pool/resolver";
-import type { CartethyiaDatabase } from "../../persistence/db-handle";
-import type { RouteSnapshotService } from "../routing/route-model";
 import { metrics } from "../../observability/metrics";
-import type { NetworkPoolSelector } from "../../network/pool/selector";
-import type { TelemetryBatchBuffer } from "../../observability/telemetry-buffer";
-import { ProxyRequestStateStore } from "../request/state";
-import { ProxyRequestPreparer } from "../request/preparer";
-import { parseThinkingSuffix } from "../translation/thinking";
-import { completeAttempt, estimatedUsage } from "./attempt-finalize";
+import { parseThinkingSuffix } from "../../protocol/translation/thinking";
+import { completeAttempt, estimatedUsage, nativeCompletionBase } from "./attempt-finalize";
 import { repriceUsage, usageFromProvider } from "../../providers/provider-usage";
 import { runAttemptLoop } from "./attempt-loop";
 
@@ -26,20 +18,9 @@ import { runAttemptLoop } from "./attempt-loop";
  * route. The provider's adapter method (`ProviderAdapter.systemone`) forwards
  * the body untouched.
  */
-export interface SystemoneHandlerDeps {
-  readonly db: CartethyiaDatabase;
-  readonly providerAdapters: ReadonlyMap<string, ProviderAdapter>;
-  /** Preferred over `providerAdapters`: resolves an adapter on demand and caches it. */
-  readonly resolveProviderAdapter?: (providerId: string) => Promise<ProviderAdapter | undefined>;
-  readonly proxyPreparer: ProxyRequestPreparer;
-  readonly stateStore: ProxyRequestStateStore;
-  readonly poolSelector?: NetworkPoolSelector;
-  readonly networkBindingFactory?: ValidatedNetworkBindingFactory;
-  readonly snapshotService?: RouteSnapshotService;
-  readonly telemetryBuffer?: TelemetryBatchBuffer;
-  readonly resolveOAuthRefresher?: (providerId: string) => Promise<OAuthTokenRefresher | undefined>;
-  readonly oauthRefreshService?: OAuthRefreshService;
-}
+import type { GatewayHandlerDeps } from "./handler-deps";
+
+export type SystemoneHandlerDeps = GatewayHandlerDeps;
 
 /** Adapter that can serve a System One decision request. */
 type SystemoneAdapter = ProviderAdapter & {
@@ -117,9 +98,7 @@ export function createSystemoneHandler(deps: SystemoneHandlerDeps) {
               provider_id: candidate.provider_id as ProviderAdapter["provider_id"],
               credential_kind: "none" as const,
             };
-        const adapter = (deps.resolveProviderAdapter
-          ? await deps.resolveProviderAdapter(candidate.provider_id)
-          : deps.providerAdapters.get(candidate.provider_id)) as SystemoneAdapter | undefined;
+        const adapter = (await deps.resolveProviderAdapter?.(candidate.provider_id)) as SystemoneAdapter | undefined;
         if (!adapter || typeof adapter.systemone !== "function")
           throw new GatewayError(
             "capability_unsupported",
@@ -194,22 +173,23 @@ export function createSystemoneHandler(deps: SystemoneHandlerDeps) {
         );
         await completeAttempt(state, {
           status: "completed",
-          providerId: candidate.provider_id,
-          ...(candidate.provider_account_id ? { accountId: candidate.provider_account_id } : {}),
-          ...(candidate.provider_account_label ? { accountLabel: candidate.provider_account_label } : {}),
-          ...(leases.proxySlot ? { networkPoolId: leases.proxySlot.poolId } : {}),
-          usage,
-          modelId: candidate.model_id,
-          lease: leases.lease,
-          commitUsage: usage,
-          terminal: true,
-          tenantId: prepared.authorization.tenantId,
-          ingressBody: state.ingressBody,
+          ...nativeCompletionBase({
+            providerId: candidate.provider_id,
+            ...(candidate.provider_account_id ? { accountId: candidate.provider_account_id } : {}),
+            ...(candidate.provider_account_label ? { accountLabel: candidate.provider_account_label } : {}),
+            ...(leases.proxySlot ? { networkPoolId: leases.proxySlot.poolId } : {}),
+            usage,
+            modelId: candidate.model_id,
+            lease: leases.lease,
+            commitUsage: usage,
+            tenantId: prepared.authorization.tenantId,
+            ingressBody: state.ingressBody,
+            providerCapture,
+            db: deps.db,
+            ...(deps.telemetryBuffer ? { telemetryBuffer: deps.telemetryBuffer } : {}),
+            ...(deps.snapshotService ? { snapshotService: deps.snapshotService } : {}),
+          }),
           responseBody: null,
-          providerCapture,
-          db: deps.db,
-          ...(deps.telemetryBuffer ? { telemetryBuffer: deps.telemetryBuffer } : {}),
-          ...(deps.snapshotService ? { snapshotService: deps.snapshotService } : {}),
         });
         metrics.proxy_requests_total.inc(1, { status: "completed" });
         return new Response(response.body, {

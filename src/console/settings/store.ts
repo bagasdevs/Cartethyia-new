@@ -5,13 +5,16 @@ import type { CartethyiaDatabase } from "../../persistence/db-handle";
 import { consoleSettings, type ConsoleSettingsPreferences } from "../../persistence/schema";
 import type { RedisBackend } from "../../persistence/redis";
 import { bumpSettingsRevision } from "../../persistence/settings-revision";
+import { resolveTelemetryRetentionDays } from "../../config/telemetry";
+import { resolveUpstreamTimeoutMs } from "../../config/timeouts";
+import { payloadRetentionMs } from "../../observability/payload-capture";
+import { IMAGE_CLAMP_MAX_BYTES } from "../../protocol/image-clamp";
 import {
   PONYTAIL_LEVELS,
   RESPONSES_REASONING_SUMMARIES,
   RTK_LEVELS,
   TELEMETRY_PAYLOAD_DEPTHS,
   TELEMETRY_PAYLOAD_MODES,
-  TELEMETRY_PAYLOAD_RETENTION_MINUTES,
   type PonyTailLevel,
   type ResponsesReasoningSummary,
   type RtkLevel,
@@ -96,7 +99,7 @@ function normalizeUpstreamTimeoutSeconds(value: unknown): number | null {
   return normalizeBoundedNumber(value, 5, 600);
 }
 
-/** Source window in minutes: 1 floor, 1440 (one day) ceiling, matching the env var. */
+/** Captured payload detail lifetime in minutes: 1 floor, one-day ceiling. */
 function normalizeTelemetryWindowMinutes(value: unknown): number | null {
   return normalizeBoundedNumber(value, 1, 1440);
 }
@@ -106,23 +109,10 @@ function normalizeImageClampMaxBytes(value: unknown): number | null {
   return normalizeBoundedNumber(value, 64 * 1024, 100 * 1024 * 1024);
 }
 
-/**
- * How long a captured payload frame is kept, in whole minutes.
- *
- * Only one of the offered values survives; anything else reads as "deployment
- * default" rather than being clamped to the nearest one. A stored value from
- * before this list existed would otherwise be silently rewritten to a window
- * the operator never chose, and dropping it to `null` is the same outcome the
- * operator gets by never having set it.
- */
-function normalizePayloadRetentionMinutes(value: unknown): number | null {
+/** Concurrency slack: 0–1024, and `null`/absent means no allowance. */
+function normalizeConcurrencyTolerance(value: unknown): number | null {
   if (value === null || value === undefined) return null;
-  const parsed = typeof value === "number" ? value : Number(value);
-  if (!Number.isFinite(parsed)) return null;
-  const minutes = Math.floor(parsed);
-  return (TELEMETRY_PAYLOAD_RETENTION_MINUTES as readonly number[]).includes(minutes)
-    ? minutes
-    : null;
+  return normalizeBoundedNumber(value, 0, 1024);
 }
 
 function mapRuntimeSettingsRow(
@@ -140,9 +130,6 @@ function mapRuntimeSettingsRow(
       : "detailed",
     telemetryPayloads: normalizeTelemetryPayloadMode(prefs.telemetryPayloads),
     telemetryPayloadDepth: normalizeTelemetryPayloadDepth(prefs.telemetryPayloadDepth),
-    telemetryPayloadRetentionMinutes: normalizePayloadRetentionMinutes(
-      prefs.telemetryPayloadRetentionMinutes,
-    ),
     privacyMode: prefs.privacyMode === "full" ? "full" : "masked",
     rtkPruneEnabled: prefs.rtkPruneEnabled === true,
     rtkPruneLevel: normalizeRtkLevel(prefs.rtkPruneLevel),
@@ -156,10 +143,23 @@ function mapRuntimeSettingsRow(
     ponyTailEnabled: prefs.ponyTailEnabled === true,
     ponyTailLevel: normalizePonyTailLevel(prefs.ponyTailLevel),
     forceDisableCooldown: prefs.forceDisableCooldown === true,
+    invokeDisabled: prefs.invokeDisabled === true,
+    concurrencyTolerance: normalizeConcurrencyTolerance(prefs.concurrencyTolerance),
     upstreamTimeoutSeconds: normalizeUpstreamTimeoutSeconds(prefs.upstreamTimeoutSeconds),
     telemetryWindowMinutes: normalizeTelemetryWindowMinutes(prefs.telemetryWindowMinutes),
     imageClampMaxBytes: normalizeImageClampMaxBytes(prefs.imageClampMaxBytes),
     updatedAt,
+    /*
+     * Resolved at request time, not at module load: all four come from env the
+     * operator can change without rebuilding, and a cached value would keep
+     * quoting a default the deployment no longer has.
+     */
+    defaults: {
+      upstreamTimeoutSeconds: Math.round(resolveUpstreamTimeoutMs() / 1000),
+      telemetryWindowMinutes: Math.round(payloadRetentionMs() / 60_000),
+      imageClampMaxBytes: IMAGE_CLAMP_MAX_BYTES,
+      telemetryRetentionDays: resolveTelemetryRetentionDays(),
+    },
   };
 }
 
@@ -192,10 +192,6 @@ export class DrizzleRuntimeSettingsStore implements RuntimeSettingsStore {
       patchPrefs.responsesReasoningSummary = patch.responsesReasoningSummary;
     if (patch.telemetryPayloads !== undefined) patchPrefs.telemetryPayloads = patch.telemetryPayloads;
     if (patch.telemetryPayloadDepth !== undefined) patchPrefs.telemetryPayloadDepth = patch.telemetryPayloadDepth;
-    if (patch.telemetryPayloadRetentionMinutes !== undefined)
-      patchPrefs.telemetryPayloadRetentionMinutes = normalizePayloadRetentionMinutes(
-        patch.telemetryPayloadRetentionMinutes,
-      );
     if (patch.privacyMode !== undefined) patchPrefs.privacyMode = patch.privacyMode;
     if (patch.rtkPruneEnabled !== undefined) patchPrefs.rtkPruneEnabled = patch.rtkPruneEnabled;
     if (patch.rtkPruneLevel !== undefined) patchPrefs.rtkPruneLevel = patch.rtkPruneLevel;
@@ -203,6 +199,10 @@ export class DrizzleRuntimeSettingsStore implements RuntimeSettingsStore {
     if (patch.ponyTailLevel !== undefined) patchPrefs.ponyTailLevel = patch.ponyTailLevel;
     if (patch.forceDisableCooldown !== undefined)
       patchPrefs.forceDisableCooldown = patch.forceDisableCooldown === true;
+    if (patch.invokeDisabled !== undefined)
+      patchPrefs.invokeDisabled = patch.invokeDisabled === true;
+    if (patch.concurrencyTolerance !== undefined)
+      patchPrefs.concurrencyTolerance = normalizeConcurrencyTolerance(patch.concurrencyTolerance);
     if (patch.upstreamTimeoutSeconds !== undefined)
       patchPrefs.upstreamTimeoutSeconds = normalizeUpstreamTimeoutSeconds(patch.upstreamTimeoutSeconds);
     if (patch.telemetryWindowMinutes !== undefined)

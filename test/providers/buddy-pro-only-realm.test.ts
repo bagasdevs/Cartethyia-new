@@ -29,6 +29,7 @@ describe("Buddy Pro-only tagging follows measured account scope", () => {
       WORKBUDDY_MODELS.filter((row) => row.proOnly === true).map((row) => row.modelId),
     );
     const expected = new Set([
+      "primary-model",
       "gpt-5.6-terra",
       "gpt-5.6-luna",
       "gpt-5.6-sol",
@@ -41,6 +42,11 @@ describe("Buddy Pro-only tagging follows measured account scope", () => {
       "gemini-3.8-flash",
       "grok-4.6",
       "grok-4.7",
+      "kimi-k3.1-pro-highspeed",
+      // Opus is refused on free while Sonnet 4.6 at the same 1M window is
+      // served, so the tier is not a function of the context size.
+      "claude-opus-4.6",
+      "claude-opus-4.7-1m",
     ]);
     expect(codeBuddyProIds).toEqual(expected);
     expect(workBuddyProIds).toEqual(expected);

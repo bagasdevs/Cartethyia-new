@@ -12,13 +12,14 @@
  * test overrides it through the same env var production uses rather than
  * pretending the two can be pointed apart.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, writeFile, readdir, rm } from "node:fs/promises";
+import { afterAll, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtemp, mkdir, writeFile, readdir, rm, unlink, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const TELEMETRY_DIR = await mkdtemp(join(tmpdir(), "carte-dm-events-"));
 const PAYLOAD_DIR = await mkdtemp(join(tmpdir(), "carte-dm-payload-"));
+const previousPayloadDir = process.env.CARTETHYIA_TELEMETRY_PAYLOAD_DIR;
 process.env.CARTETHYIA_TELEMETRY_PAYLOAD_DIR = PAYLOAD_DIR;
 
 const { createDataManagementOperations } = await import(
@@ -28,12 +29,10 @@ const { PurgeNotWiredError } = await import(
   "../../src/console/data-management/contracts"
 );
 const { writePayloadFrame } = await import("../../src/observability/payload-store");
-const { MAX_PAYLOAD_RETENTION_MS } = await import("../../src/observability/payload-capture");
-
 const OPS = createDataManagementOperations({
   telemetryDir: TELEMETRY_DIR,
   retentionDays: 30,
-  payloadRetentionMs: 15 * 60_000,
+  payloadRetentionMs: async () => 15 * 60_000,
 });
 
 /** A UTC day offset from today, as `YYYY-MM-DD`. */
@@ -56,94 +55,99 @@ beforeEach(async () => {
   await clear();
 });
 
-afterEach(clear);
+afterAll(async () => {
+  await clear();
+  await rm(TELEMETRY_DIR, { recursive: true, force: true });
+  await rm(PAYLOAD_DIR, { recursive: true, force: true });
+  if (previousPayloadDir === undefined) delete process.env.CARTETHYIA_TELEMETRY_PAYLOAD_DIR;
+  else process.env.CARTETHYIA_TELEMETRY_PAYLOAD_DIR = previousPayloadDir;
+});
 
 describe("disk usage", () => {
   test("counts each category separately, not as one total", async () => {
     await writeFile(join(TELEMETRY_DIR, `${dayOffset(1)}.events.jsonl`), "x".repeat(100));
-    await writeFile(join(TELEMETRY_DIR, `${dayOffset(2)}.index.json`), "y".repeat(50));
     // `.jsonl`, matching `FRAME_FILE_SUFFIX`: the scanner matches the suffix the
     // writer actually uses, so a fixture named for an older extension is counted
     // as nothing and the payload bucket silently reads zero.
     await writeFile(join(PAYLOAD_DIR, "frame.jsonl"), "z".repeat(25));
 
-    const usage = await OPS.usage();
+    const usage = await OPS.usage(null);
     const byId = Object.fromEntries(usage.buckets.map((b) => [b.id, b]));
 
     expect(byId.telemetry_events?.bytes).toBe(100);
     expect(byId.telemetry_events?.files).toBe(1);
-    expect(byId.telemetry_index?.bytes).toBe(50);
     expect(byId.payload_frames?.bytes).toBe(25);
-    expect(usage.totalBytes).toBe(175);
+    expect(usage.totalBytes).toBe(125);
   });
 
-  test("a summary past retention is reported reclaimable, a newer one is not", async () => {
-    await writeFile(join(TELEMETRY_DIR, `${dayOffset(90)}.index.json`), "y".repeat(64));
-    await writeFile(join(TELEMETRY_DIR, `${dayOffset(2)}.index.json`), "y".repeat(32));
+  test("retention reclaim targets raw event files, not an index", async () => {
+    await writeFile(join(TELEMETRY_DIR, `${dayOffset(90)}.events.jsonl`), "y".repeat(64));
+    await writeFile(join(TELEMETRY_DIR, `${dayOffset(2)}.events.jsonl`), "y".repeat(32));
 
-    const usage = await OPS.usage();
-    const compacted = usage.buckets.find((b) => b.id === "telemetry_index");
-    // Only the 90-day-old file: the 2-day-old one still answers queries.
-    expect(compacted?.reclaimableBytes).toBe(64);
-    expect(compacted?.reclaimableFiles).toBe(1);
+    const result = await OPS.reclaim("telemetry_retention");
+    expect(result.deletedFiles).toBe(1);
+    expect(result.reclaimedBytes).toBe(64);
+    expect(await readdir(TELEMETRY_DIR)).toEqual([`${dayOffset(2)}.events.jsonl`]);
   });
 
   test("an empty install reports zeroes rather than failing", async () => {
-    const usage = await OPS.usage();
+    const usage = await OPS.usage(null);
     expect(usage.totalBytes).toBe(0);
     expect(usage.buckets.every((b) => b.files === 0)).toBe(true);
   });
 });
 
-describe("payload frames under a raised retention", () => {
-  /**
-   * The same operations, but with a deployment whose tenants may keep frames
-   * for seven days while the default window is fifteen minutes.
-   */
-  const RAISED = createDataManagementOperations({
-    telemetryDir: TELEMETRY_DIR,
-    retentionDays: 30,
-    payloadRetentionMs: 15 * 60_000,
-    payloadRetentionMaxMs: MAX_PAYLOAD_RETENTION_MS,
-  });
-
-  test("a frame younger than the longest retention is not offered for reclaim", async () => {
-    // The regression this guards: judging frames by the *default* window while
-    // a tenant kept theirs for a week offered a reclaim button for frames that
-    // were still live. The operator pressed it and saw "nothing to reclaim",
-    // which reads as broken rather than as "still in use".
+describe("payload frames", () => {
+  test("a live frame is not offered for reclaim", async () => {
     const recent = new Date(Date.now() - 60 * 60_000);
     await writePayloadFrame({ probe: true }, recent);
-    const usage = await RAISED.usage();
+    const usage = await OPS.usage(null);
     const frames = usage.buckets.find((b) => b.id === "payload_frames");
     expect(frames?.files).toBe(1);
     expect(frames?.reclaimableFiles).toBe(0);
     expect(frames?.reclaimableBytes).toBe(0);
   });
 
-  test("the response reports the ceiling it judged frames against", async () => {
-    // The panel cannot derive the bound, and a panel that shows a reclaim
-    // count without saying what it counted against is unauditable.
-    const usage = await RAISED.usage();
-    expect(usage.payloadRetentionMaxMs).toBe(MAX_PAYLOAD_RETENTION_MS);
-    expect(usage.payloadRetentionMs).toBe(15 * 60_000);
-  });
-
-  test("a deployment with no ceiling falls back to its own retention", async () => {
-    const plain = createDataManagementOperations({
+  test("the window is the tenant's, not the deployment's", async () => {
+    // The bug this pins: the panel resolved the payload window once at boot
+    // from the deployment default, so a tenant that set Request detail window
+    // to 60 minutes was still told "expiring 15 min after write" — and frames
+    // the gateway held as live were counted reclaimable.
+    const ops = createDataManagementOperations({
       telemetryDir: TELEMETRY_DIR,
       retentionDays: 30,
-      payloadRetentionMs: 15 * 60_000,
+      payloadRetentionMs: async (tenantId) =>
+        tenantId === "tenant-long" ? 60 * 60_000 : 15 * 60_000,
     });
-    const usage = await plain.usage();
-    expect(usage.payloadRetentionMaxMs).toBe(15 * 60_000);
+    /*
+     * The scan keys staleness off the file's mtime, so what the window is
+     * compared against is when the file was written — the frame's own expiry
+     * lives inside the file and only the prune reads it.
+     */
+    const file = join(PAYLOAD_DIR, "window.jsonl");
+    await writeFile(file, "y".repeat(32));
+    // 30 minutes old: past a 15-minute window, inside a 60-minute one.
+    const stamp = new Date(Date.now() - 30 * 60_000);
+    await utimes(file, stamp, stamp);
+
+    const short = await ops.usage("tenant-short");
+    const shortFrames = short.buckets.find((b) => b.id === "payload_frames");
+    expect(shortFrames?.reclaimableFiles).toBe(1);
+    expect(shortFrames?.note).toContain("15 min");
+
+    const long = await ops.usage("tenant-long");
+    const longFrames = long.buckets.find((b) => b.id === "payload_frames");
+    expect(longFrames?.reclaimableFiles).toBe(0);
+    expect(longFrames?.note).toContain("1 hour");
+    await unlink(file);
   });
+
 });
 
 describe("reclaim", () => {
-  test("removing past-retention summaries leaves newer ones alone", async () => {
-    await writeFile(join(TELEMETRY_DIR, `${dayOffset(90)}.index.json`), "y".repeat(10));
-    await writeFile(join(TELEMETRY_DIR, `${dayOffset(1)}.index.json`), "y".repeat(20));
+  test("removing past-retention raw logs leaves newer ones alone", async () => {
+    await writeFile(join(TELEMETRY_DIR, `${dayOffset(90)}.events.jsonl`), "y".repeat(10));
+    await writeFile(join(TELEMETRY_DIR, `${dayOffset(1)}.events.jsonl`), "y".repeat(20));
 
     const result = await OPS.reclaim("telemetry_retention");
     expect(result.deletedFiles).toBe(1);
@@ -202,13 +206,13 @@ describe("the health & error log purge", () => {
     const ops = createDataManagementOperations({
       telemetryDir: TELEMETRY_DIR,
       retentionDays: 30,
-      payloadRetentionMs: 15 * 60_000,
+      payloadRetentionMs: async () => 15 * 60_000,
       healthEvents: store,
     });
-    const usage = await ops.usage();
+    const usage = await ops.usage(null);
     expect(usage.healthEventCount).toBe(3);
     expect(await ops.purge("health_events")).toBe(3);
-    const after = await ops.usage();
+    const after = await ops.usage(null);
     expect(after.healthEventCount).toBe(0);
   });
 
@@ -220,7 +224,7 @@ describe("the health & error log purge", () => {
   });
 
   test("usage omits the count rather than reporting zero when unwired", async () => {
-    const usage = await OPS.usage();
+    const usage = await OPS.usage(null);
     expect(usage.healthEventCount).toBeUndefined();
   });
 });

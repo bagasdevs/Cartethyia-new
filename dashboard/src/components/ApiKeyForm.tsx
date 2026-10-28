@@ -665,6 +665,18 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose, actionsRef }: 
             disabled={busy}
           />
         </div>
+        {/*
+          * The limit is the number a refusal names. The allowance above it is
+          * tenant-wide — set once in Settings, not per key — so it is named
+          * here only to point at where it lives. Editing it per key was the
+          * double logic this replaced: one number, two places, and the one in
+          * this modal silently won.
+          */}
+        <p className="text-micro leading-normal text-text-tertiary">
+          {concurrent === ""
+            ? "No concurrency limit, so the tenant allowance does nothing."
+            : `Limit ${concurrent} concurrent. Refusals name this number; the allowance above it is tenant-wide and set in Settings.`}
+        </p>
         <div
           className="flex items-center justify-between gap-4 rounded-panel border border-inner-border px-4 py-3 bg-surface-2"
         >

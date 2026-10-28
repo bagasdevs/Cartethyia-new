@@ -36,6 +36,7 @@ import {
 import type { QuotaCollectionContext } from "../../quota/quota-support";
 import { decodeJwtPayload } from "../../authentication/oauth-flow-store";
 import { buildTraeHeaders } from "./trae-headers";
+import { log } from "../../../observability/logger";
 import {
   TRAE_ENT_USAGE_PATH,
   TRAE_REGION_CORE_HOSTS,
@@ -246,7 +247,7 @@ function parseEntitlement(payload: unknown): {
  */
 function logTraeQuotaMiss(errors: readonly string[]): void {
   if (errors.length === 0) return;
-  console.warn(`[quota] trae surfaces unavailable: ${errors.join("; ")}`);
+  log.warn(`[quota] trae surfaces unavailable: ${errors.join("; ")}`);
 }
 
 /**
@@ -298,7 +299,11 @@ export async function fetchTraeQuota(
         // The builder pins `us` for every intl account. An `sg` account sent
         // with a US country code is refused with 401 code 1001 — the country
         // code is part of the identity this surface checks, not a hint.
-        "store-country-code": region || "us",
+        // `sg` rather than `us` for an account with no recorded region: the
+        // default core is SG now, and this header is part of the identity the
+        // commercial surface checks, so it has to agree with the host it is
+        // sent to. An account that *has* a region still sends its own.
+        "store-country-code": region || "sg",
       },
       body: "{}",
     });

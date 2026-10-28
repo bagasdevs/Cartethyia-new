@@ -42,11 +42,13 @@ import { toast } from "../../lib/toast";
 import type { ProviderAccountResponse, ProviderResponse } from "../../data/contracts";
 import { providerCanConfigureUserAgent } from "../../lib/provider-user-agent";
 import { RoutingStrategyCard } from "./sections/RoutingStrategyCard";
+import { InferhubMarket } from "./sections/InferhubMarket";
 import { UsageFloorControl } from "./sections/UsageFloorControl";
 import { CredentialNotice } from "./sections/CredentialNotice";
 import { CustomProviderSettings } from "./sections/CustomProviderSettings";
 import { AccountsList, AddAccountModal } from "./sections/Accounts";
 import { DeviceCodeDialog, OAuthBrowserDialog } from "./sections/OAuthDialogs";
+import { UsageActivityMatrixCard } from "./sections/UsageActivityMatrixCard";
 import {
   ImportCredentialDialog,
   LoginFieldsForm,
@@ -458,6 +460,9 @@ export default function ProviderDetail(): ReactNode {
           userAgentEditable={providerCanConfigureUserAgent(provider)}
         />
       ) : null}
+      {/* Activity Matrix — collapsed by default; its aggregate query only
+          fires when the operator expands it. */}
+      <UsageActivityMatrixCard providerId={id} />
       {/* Accounts */}
       <div id="provider-accounts" tabIndex={-1}>
         {provider.requiresAccount === false ? (
@@ -564,6 +569,10 @@ export default function ProviderDetail(): ReactNode {
 
       {activeService === "llm" ? (
         <>
+          {/* InferHub is the only provider that publishes per-ask prices, so it
+              is the only one with a market section. Sits above Models: price and
+              availability decide which models are worth registering. */}
+          {id === "inferhub" ? <InferhubMarket /> : null}
           {/* LLM models and routing controls */}
           <Card>
           <CardHeader
