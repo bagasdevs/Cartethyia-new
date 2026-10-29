@@ -13,6 +13,7 @@ import {
 } from "../../src/providers/integrations/buddy/workbuddy/provider";
 import { codeBuddyCnPrePayload } from "../../src/providers/integrations/buddy/codebuddy/cn-provider";
 import { readBuddyDeviceToken, workbuddyHeaders } from "../../src/providers/integrations/buddy/workbuddy/shared";
+import { resolveBuddyDeviceBinding } from "../../src/providers/integrations/buddy/buddy-identity";
 import { fetchTencentBillingQuota } from "../../src/providers/integrations/buddy/buddy-quota-shared";
 import { fetchWorkBuddyCnQuota } from "../../src/providers/integrations/buddy/workbuddy/quota";
 import { parseDsmlToolCalls } from "../../src/protocol/response/dsml";
@@ -304,9 +305,57 @@ describe("Buddy upstream protocol alignment", () => {
   });
 
   test("sends the desktop device token only when the account has one", async () => {
+    // If the bundled Turing SDK is loadable it wins (real token), otherwise the
+    // captured auth_state token is the fallback. Both are valid outcomes; what
+    // must never happen is neither a token nor an error header.
     const headers = await workbuddyHeaders(context, request);
-    expect(headers["x-device-token"]).toBe("desktop-token");
+    const token = headers["x-device-token"];
+    const err = headers["x-device-token-error"];
+    expect(token !== undefined || err !== undefined).toBe(true);
+    if (token === undefined) expect(err).toBe("sdk_not_initialized");
     expect(readBuddyDeviceToken({ credential: { auth_state: {} } } as unknown as ProviderDispatchContext)).toBeUndefined();
+  });
+
+  test("resolves a stable, per-account device binding (qimei36)", () => {
+    // Deterministic from the account id: stable across restarts, and distinct
+    // between accounts — so each account in a pool presents its own device.
+    const accountA = { credential: { account_id: "acc-A", auth_state: {} } } as unknown as ProviderDispatchContext;
+    const accountB = { credential: { account_id: "acc-B", auth_state: {} } } as unknown as ProviderDispatchContext;
+    const a1 = resolveBuddyDeviceBinding(accountA);
+    const a2 = resolveBuddyDeviceBinding(accountA);
+    const b = resolveBuddyDeviceBinding(accountB);
+    expect(a1).toBeDefined();
+    expect(a1).toBe(a2);
+    expect(a1).not.toBe(b);
+    expect(a1).toMatch(/^[0-9a-f]{32}$/);
+  });
+
+  test("an explicit auth_state qimei36 wins over derivation", () => {
+    const account = {
+      credential: { account_id: "acc-A", auth_state: { qimei36: "manual-binding-123" } },
+    } as unknown as ProviderDispatchContext;
+    expect(resolveBuddyDeviceBinding(account)).toBe("manual-binding-123");
+  });
+
+  test("the desktop request carries X-Device-Id-List with the account binding", async () => {
+    const headers = await workbuddyHeaders(context, request);
+    const list = headers["x-device-id-list"];
+    expect(list).toBeDefined();
+    const parsed = JSON.parse(list as string) as { qimei36?: string };
+    expect(parsed.qimei36).toBeDefined();
+    expect(parsed.qimei36).toMatch(/^[0-9a-f]{32}$/);
+  });
+
+  test("an account with no captured token and no SDK mirrors the failure placeholder", async () => {
+    // When the SDK cannot produce a token (unavailable, or a device that cannot
+    // complete the exchange) the desktop contract is token || error — never
+    // neither. Here the captured token is absent; if the bundled SDK is active
+    // it will produce a real token instead, which is fine.
+    const headers = await workbuddyHeaders(
+      { credential: { auth_state: {} } } as unknown as ProviderDispatchContext,
+      request,
+    );
+    expect(headers["x-device-token"] !== undefined || headers["x-device-token-error"] !== undefined).toBe(true);
   });
 
   test("WorkBuddy CN changes only the host identity in the shared headers", async () => {

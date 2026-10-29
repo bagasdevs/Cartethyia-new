@@ -8,6 +8,113 @@ current baseline; an existing one applies the numbered files that followed it.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+## [2.7.2] - 2026-10-29
+
+### Added
+
+- **Codex CLI remote model mapping.** Codex now participates in the CLI Tools
+  remote-routing table like Claude Code: the Codex page gains the "CLI asks
+  for → Cartethyia routes to" mapping surface, and the inbound User-Agent
+  (`codex-tui/…`, `codex-cli/…`) is recognised for `routing:cli_mapping`.
+  The Codex `review` slot is first-class with its real source model
+  (`codex-auto-review`), so the Guardian approval-review model can be routed to
+  a serving provider instead of answering `accounts_unavailable`.
+- **Ollama Cloud provider catalog.** A static floor for the six public models
+  (gemma4:31b, gpt-oss:20b/120b, nemotron-3-nano:30b/-super/-ultra) with
+  live limits from the public roster, so the provider works before discovery
+  runs.
+
+### Changed
+
+- **BYOK providers can set a route client identity.** The Routing Strategy
+  "Client identity" control now applies to custom (BYOK) providers too: Codex
+  / Claude Code / None. The operator's explicit choice wins over the adapter's
+  default, and `None` is honored as no identity at all.
+
+### Fixed
+
+- **Qoder "insufficient tool messages" after cancelled/compacted parallel
+  calls.** An assistant `tool_calls` turn whose sibling call had no result
+  used to be withheld while the surviving `tool` result turn was still sent,
+  producing an orphan `tool` turn the upstream rejected
+  ("Messages with role 'tool' must be a response to a preceding message with
+  'tool_calls'"). The assistant `tool_calls` emit and the `tool` result turns
+  now share one source of truth, so a transcript is never half-stripped.
+- **Responses parallel `function_call` items fold into one assistant turn.**
+  Clients that send several `function_call` input items back-to-back (opencode,
+  Codex) decoded into separate canonical assistant turns, so the Qoder/OpenAI
+  wire saw an assistant `tool_calls` turn before the previous one's results —
+  rejected as "An assistant message with 'tool_calls' must be followed by tool
+  messages responding to each 'tool_call_id'". Consecutive tool-call turns now
+  merge (a leading `reasoning` item included).
+- **Responses `additional_tools` item no longer rejects Codex auto-review.**
+  Codex's Guardian approval reviewer declares its review tools with an
+  `additional_tools` input item; parsing it threw
+  ("Unsupported Responses input item type"), which failed the whole
+  auto-review request and made every permission escalation look like an
+  infrastructure error. The item is client-side metadata and is now skipped
+  safely.
+- **Responses "Encrypted reasoning" robust to non-string payloads.** A
+  reasoning item whose `encrypted_content` is not a string no longer throws;
+  it falls back to the readable reasoning, and the encoder only emits
+  `encrypted_content` when it is a string.
+- **Trae context-overflow streams classify as 413.** The upstream error code
+  4026 ("context length exceeded") now maps to `context_length_exceeded`
+  (413) instead of `platform_unavailable` (502).
+- **OAuth browser login no longer completes on a stale account snapshot.** The
+  dialog used a cached account baseline from an earlier login, so a second
+  login could report success before anything happened. The baseline is now
+  taken only after a fresh refetch, and each attempt opens a unique popup so a
+  leftover window is never reused.
+- **Qoder parallel tool echoes are recovered, not leaked.** When Qoder echoes
+  several tool calls as text (`[assistant 请求调用工具] …` JSON) with
+  unescaped inner quotes, the whole block used to be dropped and shown as
+  visible text. Multi-call echoes now salvage into real tool calls, and the
+  same recovery applies to the thinking channel (`reasoning_content`), so
+  DeepSeek-planned parallel batches run instead of leaking.
+- **Routing no longer dials a cooling account through continuation affinity.**
+  A multi-turn request carrying tool results was pinned to the account that
+  owns the live session *before* health was checked, so a session whose
+  account had hit quota kept being dialed and reproduced the refusal — the
+  "still hit a cooled-down account" report. The pin now evaluates eligibility:
+  a hard-cooling account answers `429` with the real reset, and a
+  disabled/locked one answers a clear `400`.
+- **Qoder upstream 499 refusals cool the account as quota.** Qoder closes an
+  exhausted-quota stream with an nginx-style 499, which read as a malformed
+  request (non-retryable, no cooldown) and kept the account in rotation. 499
+  scoped to qoder now classifies as `quota_exceeded` with a cooldown.
+- **Qoder OAuth accounts recover from a cold credential cache.** The loader
+  stores `auth_state` as JSON text, so the adapter received `undefined` after
+  a cache eviction and refused with "missing its user identity; sign in
+  again". The state parser now accepts the JSON-string form too.
+- **Qoder tool-protocol echoes fail closed instead of leaking.** When Qoder
+  echoes a tool-call block (`[assistant 请求调用工具] …`) that cannot be
+  recovered — malformed inner JSON, unescaped quotes that do not repair —
+  the turn now fails with a 502 instead of surfacing the protocol text as
+  visible content and leaving the model looking successful while nothing ran.
+- **Qoder echo recovery holds long, fragmented streams.** A valid echo split
+  across hundreds of tiny stream deltas used to trip the 200-frame hold cap
+  and was released as visible prose — the leak. The cap now counts only
+  frames that add no bytes, so a growing echo is held until recovery, and
+  salvaged arguments are validated (malformed arguments are rejected, not
+  passed through).
+- **Qoder tool-style tag echoes are recovered.** The model sometimes echoes a
+  tool call as an XML-like tag (`<execute code="..." />`) instead of a JSON
+  array. These now recover into structured tool calls instead of leaking as
+  visible text.
+- **Qoder wrapped `<tool_call>` echoes are recovered.** The model also wraps
+  each echoed call in `<tool_call>…</tool_call>` blocks; the stream hold-back
+  now keeps tag-style candidates (not just JSON) so a long, fragmented wrapped
+  echo is recovered instead of released as visible text.
+- **Qoder XML-style echoes use one generic parser.** Self-closing tags
+  (`<execute code="…" />`), paired blocks (`<tool_call>…</tool_call>`), and
+  angle-wrapped JSON (`<{…}>`/`<[…]>`, including a double-brace artifact)
+  are handled by a single parser, and the stream hold-back keeps angle-wrapped
+  candidates until their closing `>` so long fragmented echoes recover instead
+  of leaking.
+
 ## [2.7.1] - 2026-10-28
 
 ### Fixed
@@ -66,6 +173,47 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
   degradation wins (e.g. drop only the image, keep tools) before the
   cumulative chain runs as fallback.
 
+- **Trae stream refusals are classified, not blanket-routed.** Upstream
+  `1001 "we are not able to authenticate you"` now surfaces as an account-scoped
+  `authentication_failed` (401 + credential evidence) instead of a generic 502
+  platform fault, and `4008 "exceeded the quota"` as `quota_exceeded` (429).
+  Error objects carried in frame bodies (HTTP 200 with `{"code":…,"message":…}`)
+  are detected too, not only named `error` events — the wrong classification was
+  hiding the real cause and could drag the proxy pool into the story.
+
+- **The health classifier recognizes Trae's 1001 verdict.** A numeric upstream
+  code was previously excluded from the credential arm, so `1001` fell through
+  to the `unknown` fallback that never mutates — the account stayed in rotation
+  and was re-dialled on every request despite the upstream's auth verdict. Trae
+  `1001` is now `auth_invalidated` (account-scoped, routing-visible), so the
+  account cools/excludes and failover moves to a sibling.
+
+- **Trae prompt-cache estimation is re-adopted and scoped per (session,
+  model).** Trae's agent surface never reports cache usage, so repeated
+  prefixes are estimated locally from per-session history; two models sharing a
+  conversation id cannot cross-hit, and the assessed usage rides the terminal
+  event so non-streaming telemetry records real counts.
+
+- **Buddy desktop device-token follows the official `token || error`
+  contract.** The desktop client sends `X-Device-Token` on every realm (Intl
+  included) and never omits both it and the error header: when no real token
+  exists it sends `X-Device-Token-Error: sdk_not_initialized`. The buddy
+  providers now do the same instead of dropping the header (or sending it only
+  on CN).
+
+- **A first-event timeout is a deadline, not a client cancel.** The
+  empty-stream watchdog used to classify a silent upstream (e.g. a provider
+  holding the request in a queue) as `transport_closed` 499 — "cancelled by
+  client" — hiding a real upstream wait behind a cancellation. It is now
+  `deadline_exceeded` 504 with upstream origin, matching the streaming
+  stall/first-chunk watchdogs.
+
+- **Qoder recovers single-object leak echoes.** The INTL leak marker could be
+  followed by one JSON object (`{"name":…,"arguments":…}`) instead of an array;
+  that shape was rejected, so the whole block was released as prose and the
+  marker leaked to the client as visible text. `parseLeakedToolCalls` now
+  normalizes a single object into a one-entry array.
+
 ### Added
 
 - **Provider Detail "Activity Matrix" usage card.** A collapsible card at the
@@ -112,6 +260,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
 
 - **Validated direct egress uses native fetch by default**, with per-provider
   opt-in and opt-out.
+
+- **The TuringShield SDK is bundled** under `vendor/turing-sdk/` (WorkBuddy
+  desktop 5.8.4 extract) so buddy providers generate real `X-Device-Token`
+  values without any environment setup — `CARTETHYIA_TURING_SDK_PATH` remains
+  an override. Per-provider payload profiles (WorkBuddy vs CodeBuddy product
+  identity on channel 400111) make tokens differ between providers, and the
+  Dockerfile ships the vendor directory into both builder and runtime stages.
+
+- **Per-account device binding (`qimei36`).** Buddy desktop chat now sends
+  `X-Device-Id-List: {"qimei36":"…"}` resolved per account — explicit
+  `auth_state.qimei36` wins, otherwise a deterministic sha256 of the account id
+  (32 hex, stable across restarts, no DB write). Every pooled account presents
+  a distinct device alongside the machine-bound Turing token.
+
+- **Mistral catalog expanded to models verified live.** The static roster was
+  re-checked against a live key: `codestral-2508/latest`,
+  `mistral-code-latest`, the ministral family, `voxtral-small-2507/latest`,
+  the `mistral-medium-latest` aliases, `mistral-vibe-cli-*`, and
+  `magistral-*` now ship, while rows that answer 403
+  (`tier_not_allowed` — e.g. `mistral-large*`) or 400 (`invalid_model` —
+  Labs, embed/OCR/transcribe/TTS/realtime) are excluded, so every model the
+  catalog offers can actually serve.
 
 ### Fixed
 
@@ -160,6 +330,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
 - **The gateway surfaces the upstream's full error prose** instead of
   truncating it to 500 bytes, and an upstream socket drop is classified as
   `502/upstream` — not `500/cartethyia`.
+
+- **Vercel relay deployments are public again.** The deploy flow left the
+  project under Vercel's SSO Protection, so a deployed relay answered 401 for
+  anonymous traffic — "deploynya sukses tapi gak public". Deploys now set
+  `ssoProtection: null` (via the project settings PATCH) so the front door
+  serves any caller.
+
+- **Hosted relay dials are direct fetches, not CONNECT.** A relay front door
+  (Vercel/Workers/Deno) answers application HTTP and refuses CONNECT, but the
+  validated egress handed the relay URL to the runtime fetch as its `proxy`
+  option, so every relay dial failed with "Proxy refused to open a tunnel:
+  400 Bad Request" — including pool health checks and the Add Proxy "Test
+  URL" probe. Relay dials now fetch the relay directly, carrying the target
+  origin/path in `x-relay-target`/`x-relay-path`, and the relay worker strips
+  `content-encoding`/`content-length` from the upstream response — Vercel
+  Edge already decodes the stream it hands back, so re-sending gzip headers
+  made callers decompress twice (ZlibError on gzip targets). Verified live:
+  the canary probe reports healthy and gzip/OpenCode targets return 200
+  through a deployed relay.
 
 ### Changed
 

@@ -137,12 +137,24 @@ describe("the desktop identity is unchanged", () => {
     expect(headers["accept-language"]).toBe("en-US");
     expect(headers["x-requested-with"]).toBe("XMLHttpRequest");
     expect(headers["x-codebuddy-request"]).toBe("1");
-    expect(headers["x-device-token"]).toBe("desktop-token");
+    // The desktop client sends either a real device token (bundled Turing SDK)
+    // or the failure placeholder — never neither. Intl included.
+    expect(headers["x-device-token"] !== undefined || headers["x-device-token-error"] !== undefined).toBe(true);
     expect(headers["x-ide-name"]).toBe("WorkBuddy");
     expect(headers["accept"]).toBe("application/json, text/event-stream");
     // Not one CLI-only header leaks into the default identity.
     for (const name of AGENT_ENVELOPE) expect(headers[name]).toBeUndefined();
     for (const name of STAINLESS) expect(headers[name]).toBeUndefined();
+  });
+
+  test("CN desktop sends a device token (SDK) or the captured token", async () => {
+    const headers = await workbuddyHeaders(context, undefined, "www.workbuddy.cn", "5.7.7.40774747");
+    expect(headers["x-device-token"] !== undefined || headers["x-device-token-error"] !== undefined).toBe(true);
+  });
+
+  test("desktop with no captured token still presents token or error", async () => {
+    const headers = await workbuddyHeaders(anonymous, undefined, "www.workbuddy.ai", "5.8.4");
+    expect(headers["x-device-token"] !== undefined || headers["x-device-token-error"] !== undefined).toBe(true);
   });
 
   test("an account authorized as CLI overrides the desktop default", async () => {

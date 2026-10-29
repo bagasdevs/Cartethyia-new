@@ -1,14 +1,12 @@
 /**
- * Pins the donor-adapted Qoder recovery behaviors:
- * - the INTL tool-call leak marker is recognized in its variants (angle
- *   brackets, missing closing bracket, ``` fence, trailing DSML residue);
+ * Pins donor-adapted Qoder behaviors:
  * - DeepSeek multi-turn backfills `reasoning_content` on every assistant turn
  *   once the conversation carries a reasoning trace.
+ * - Qoder speaks structured `tool_calls` (no DSML/XML text-echo recovery).
  */
 import { expect, test } from "bun:test";
 import {
   buildQoderRequest,
-  parseLeakedToolCalls,
 } from "../../../src/providers/integrations/qoder/qoder";
 import type { CanonicalRequest, ContentPart } from "../../../src/protocol/canonical-model";
 
@@ -52,37 +50,6 @@ function build(parts: CanonicalRequest["messages"], model = "deepseek-v4.1-flash
   return buildQoderRequest(model, req, CONFIG, AUTH, "intl");
 }
 
-test("leak echo is recovered from the angle-bracket marker variant", () => {
-  const text = '<assistant 请求调用工具>\n[{"name":"Read","arguments":"{\\"file_path\\":\\"a.ts\\"}"}]';
-  const { calls, clean } = parseLeakedToolCalls(text, new Set(["Read"]));
-  expect(calls).toHaveLength(1);
-  expect(calls[0]!.name).toBe("Read");
-  expect(clean).toBe("");
-});
-
-test("leak echo is recovered when the marker misses its closing bracket", () => {
-  const text = '[assistant 请求调用工具\n[{"name":"Read","arguments":"{\\"file_path\\":\\"a.ts\\"}"}]';
-  const { calls } = parseLeakedToolCalls(text, new Set(["Read"]));
-  expect(calls).toHaveLength(1);
-  expect(calls[0]!.name).toBe("Read");
-});
-
-test("leak echo is recovered from inside a ``` fence", () => {
-  const text = "```json\n[assistant 请求调用工具]\n[{\"name\":\"Read\",\"arguments\":\"{\\\"file_path\\\":\\\"a.ts\\\"}\"}]\n```";
-  const { calls, clean } = parseLeakedToolCalls(text, new Set(["Read"]));
-  expect(calls).toHaveLength(1);
-  expect(calls[0]!.name).toBe("Read");
-  expect(clean).toBe("");
-});
-
-test("leak echo tolerates trailing DSML residue after the array", () => {
-  const text =
-    '[assistant 请求调用工具]\n[{"name":"Read","arguments":"{\\"file_path\\":\\"a.ts\\"}"}]\n</｜DSML｜parameter> </｜DSML｜invoke>';
-  const { calls } = parseLeakedToolCalls(text, new Set(["Read"]));
-  expect(calls).toHaveLength(1);
-  expect(calls[0]!.name).toBe("Read");
-});
-
 test("DeepSeek backfills reasoning_content on assistant turns without a trace field", () => {
   const body = build([
     { role: "user", content: [{ kind: "text", text: "hint" }] },
@@ -115,7 +82,7 @@ test("non-DeepSeek models are not backfilled", () => {
   expect(plain!["reasoning_content"]).toBeUndefined();
 });
 
-test("structured epoch fall back to prose when a call lacks an id", () => {
+test("a past call without an id is not written as text", () => {
   const body = build(
     [
       { role: "user", content: [{ kind: "text", text: "go" }] },
@@ -129,9 +96,34 @@ test("structured epoch fall back to prose when a call lacks an id", () => {
   );
   const messages = body["messages"] as Array<Record<string, unknown>>;
   const assistant = messages.find((m) => m["role"] === "assistant");
-  // No structured `tool_calls` field, and the call is recorded in prose.
+  // No structured `tool_calls` field (the call carries no id), and crucially
+  // no prose marker — the text-echo contamination must never be written.
   expect(assistant!["tool_calls"]).toBeUndefined();
-  expect(String(assistant!["content"])).toContain("[assistant 请求调用工具]");
+  expect(String(assistant!["content"])).not.toContain("[assistant 请求调用工具]");
+});
+
+test("INTL sends structured tool_calls history, not the prose marker", () => {
+  const body = build([
+    { role: "user", content: [{ kind: "text", text: "go" }] },
+    {
+      role: "assistant",
+      content: [{ kind: "toolCall", call_id: "call_1", name: "Read", arguments: '{"path":"a.ts"}' }],
+    },
+    { role: "user", content: [RESULT] },
+  ]);
+  const messages = body["messages"] as Array<Record<string, unknown>>;
+  const assistant = messages.find((m) => m["role"] === "assistant");
+  expect(assistant!["tool_calls"]).toHaveLength(1);
+  expect(((assistant!["tool_calls"] as Array<Record<string, unknown>>)[0])).toEqual({
+    id: "call_1",
+    type: "function",
+    function: { name: "Read", arguments: '{"path":"a.ts"}' },
+  });
+  expect(String(assistant!["content"])).not.toContain("[assistant 请求调用工具]");
+  // The tool result is a structured `tool` turn, not text.
+  const tool = messages.find((m) => m["role"] === "tool");
+  expect(tool).toBeDefined();
+  expect(tool!["tool_call_id"]).toBe("call_1");
 });
 
 test("image parts are carried as structured OpenAI parts, not dropped", () => {

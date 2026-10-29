@@ -20,7 +20,7 @@ import type {
   ToolChoice,
   ToolDefinition,
 } from "../../../protocol/canonical-model";
-import { toolResultParts } from "../../../protocol/canonical-model";
+import { toolResultParts, toolCallParts } from "../../../protocol/canonical-model";
 import { decodeSseEvents } from "../../../protocol/sse-decoder";
 import { usageFromProvider, readReasoningText } from "../../provider-usage";
 import { readCredentialSecret, type ProviderDispatchTarget, type ProviderAdapter, type ProviderDispatchContext, type ProviderId } from "../../provider-contracts";
@@ -29,9 +29,62 @@ import { parseQoderOAuthState } from "./qoder-oauth";
 import { getQoderVersion } from "../../operations/client-versions";
 import { abortGatewayError, createUpstreamDeadlineLifecycle } from "../../operations/upstream-deadline";
 import { qoderMachineOs } from "../../operations/cli-platform";
-import { qoderGatewayCandidates, QODER_CHAT_PATH, QODER_REALMS, type QoderRealm } from "./qoder-realm";
+import { qoderInferenceCandidates, QODER_CHAT_PATH, QODER_REALMS, type QoderRealm } from "./qoder-realm";
 import { QODER_CN_MODEL_CONFIGS, QODER_INTL_MODEL_CONFIGS, QODER_INTL_MODELS } from "./qoder-catalog";
 import { isQoderVirtualModel, qoderDispatchModelId } from "./qoder-virtual";
+import {
+  LEAK_MARKER_ANY_RE,
+  LEAK_MARKER_LITERALS,
+  parseQoderTextToolCalls,
+  isQoderEchoAttempt,
+} from "./qoder-text-tools";
+
+/** How long a trailing partial marker may be before it is held for the next frame. */
+const LEAK_HOLD_WINDOW = 24;
+/** Fail-open caps so an endless lookalike cannot hold text forever. */
+const LEAK_HOLD_MAX_CHARS = 32_768;
+const LEAK_HOLD_MAX_FRAMES = 200;
+
+const BAD_ECHO_MESSAGE =
+  "Qoder returned an unparseable tool-call echo; no tools were emitted";
+
+function badEchoError(): GatewayError {
+  return new GatewayError(
+    "platform_unavailable",
+    502,
+    BAD_ECHO_MESSAGE,
+    { providerId: QODER_PROVIDER_ID },
+    "upstream",
+  );
+}
+
+/** True when `suffix` is a strict prefix of some marker literal. */
+function isLeakMarkerPrefix(suffix: string): boolean {
+  if (suffix.length === 0 || suffix.length >= LEAK_HOLD_WINDOW) return false;
+  return LEAK_MARKER_LITERALS.some((literal) => literal.startsWith(suffix));
+}
+
+/**
+ * True when `text` is still plausibly the INTL marker echo block (marker +
+ * JSON array/object, or a tool-style tag). Used to keep holding across frames;
+ * false means it is ordinary prose and can be released.
+ */
+function qoderStillLeakCandidate(text: string): boolean {
+  if (text.length === 0) return true;
+  const marker = LEAK_MARKER_ANY_RE.exec(text);
+  if (!marker) {
+    return isLeakMarkerPrefix(text) || LEAK_MARKER_ANY_RE.test(text);
+  }
+  const rest = text.slice(marker.index + marker[0].length).trim();
+  if (rest.length === 0) return true;
+  if (rest.startsWith("[") || rest.startsWith("{")) return true;
+  if (/^<[a-zA-Z0-9_.:-]+\b/.test(rest)) return true;
+  // Angle-wrapped JSON: `<{` / `<[` — candidate until a closing `>` appears.
+  if (rest.startsWith("<{") || rest.startsWith("<[")) {
+    return !rest.includes(">") || rest.endsWith(">");
+  }
+  return false;
+}
 
 interface QoderModeProfile {
   readonly chatUrl: string;
@@ -127,9 +180,24 @@ interface QoderModelConfig {
   source?: string;
 }
 
-
 function qoderMd5(value: string | Uint8Array): string {
   return createHash("md5").update(value).digest("hex");
+}
+
+/**
+ * Canonical compact JSON used by Qoder's COSY signing: keys sorted
+ * lexicographically, no whitespace, null/undefined rendered as empty string.
+ * The upstream verifies the signature against this exact serialization, so a
+ * payload built with plain `JSON.stringify` (insertion order) fails with
+ * `code 101 / Signature invalid`.
+ */
+function qoderJsonSortedCompact(mapping: Record<string, unknown>): string {
+  const parts: string[] = [];
+  for (const key of Object.keys(mapping).sort()) {
+    const value = mapping[key] === null || mapping[key] === undefined ? "" : mapping[key];
+    parts.push(`${JSON.stringify(key)}:${JSON.stringify(value)}`);
+  }
+  return `{${parts.join(",")}}`;
 }
 function qoderPathSignature(url: string): string {
   const path = new URL(url).pathname;
@@ -246,7 +314,7 @@ function qoderBuildCosyHeaders(
   version = getQoderVersion(),
 ): Record<string, string> {
   const key = randomUUID().replaceAll("-", "").slice(0, 16);
-  const identity = JSON.stringify({
+  const identity = qoderJsonSortedCompact({
     name: auth.userName,
     aid: auth.userId,
     uid: auth.userId,
@@ -261,7 +329,7 @@ function qoderBuildCosyHeaders(
   const info = Buffer.concat([cipher.update(identity), cipher.final()]).toString("base64");
   const cosyKey = publicEncrypt({ key: QODER_RSA_PUBLIC_KEY, padding: constants.RSA_PKCS1_PADDING }, Buffer.from(key)).toString("base64");
   const payload = Buffer.from(
-    JSON.stringify({ version: "v1", requestId: randomUUID(), info, cosyVersion: version, ideVersion: "" }),
+    qoderJsonSortedCompact({ version: "v1", requestId: randomUUID(), info, cosyVersion: version, ideVersion: "" }),
   ).toString("base64");
   const date = String(Math.floor(Date.now() / 1000));
   const signature = qoderMd5(`${payload}\n${cosyKey}\n${date}\n${Buffer.from(body).toString("latin1")}\n${qoderPathSignature(url)}`);
@@ -586,7 +654,6 @@ function qoderTools(
   return out;
 }
 
-
 /**
  * Projects the canonical tool choice onto the upstream's field.
  *
@@ -609,25 +676,17 @@ function qoderToolChoice(choice: ToolChoice | undefined): unknown {
 }
 
 /**
- * Marks a tool call recorded into the text of an assistant turn.
- *
- * The upstream only reads structured turns on its CN realm, so on INTL a past
- * call has to be described in prose or the model loses the record of what it
- * asked for. The wording matches the reference bridge, which is what the
- * upstream has been trained to read back.
- */
-const QODER_TOOL_MARKER = "[assistant 请求调用工具]";
-
-/**
  * Whether this request sends its tool history as structured turns.
  *
- * The upstream honours the structured form on its CN realm only. On INTL it is
- * not enabled, and sending it anyway yields tool calls that come back right in
- * name but with no arguments filled in — a call that cannot run. So the shape
- * follows the realm rather than being assumed everywhere.
+ * Qoder's wire is OpenAI-compatible `tool_calls` deltas on every realm; the
+ * model is fed the same structured turns in both INTL and CN. Writing a past
+ * call as prose (`[assistant 请求调用工具] …`) contaminates the conversation
+ * history with a text echo the model starts imitating — the origin of the
+ * text-leak feedback loop. Structured history keeps the model seeing only real
+ * tool calls, so it never learns the prose marker.
  */
-function qoderStructuredTools(realm: QoderRealm): boolean {
-  return realm === "cn";
+function qoderStructuredTools(_realm: QoderRealm): boolean {
+  return true;
 }
 
 export function buildQoderRequest(
@@ -666,6 +725,45 @@ export function buildQoderRequest(
       content: systemPrompt,
     });
   }
+  // Every tool result across the whole conversation, keyed by call id. An
+  // assistant `tool_calls` turn is only sent structured when every call has a
+  // matching result somewhere in the history — otherwise the upstream rejects
+  // the transcript ("An assistant message with 'tool_calls' must be followed by
+  // tool messages responding to each 'tool_call_id'"). Calls without a result
+  // are left out of the structured turn instead of poisoning it.
+  const toolResultsById = new Map<string, string>();
+  for (const msg of allMessages) {
+    for (const part of toolResultParts(msg)) {
+      if (typeof part.call_id === "string" && part.call_id.length > 0) {
+        toolResultsById.set(part.call_id, part.call_id);
+      }
+    }
+  }
+  // The tool calls that actually survive onto the wire. A call only makes it
+  // when every call on its assistant turn carries an id AND a matching result
+  // exists in the history. This is the single source of truth for both sides
+  // of the transcript: the assistant `tool_calls` emit and the `tool` result
+  // turns. If a result's call is not here, its `tool` turn is dropped too —
+  // leaving it would emit an orphan `tool` turn with no preceding call, which
+  // the upstream rejects ("Messages with role 'tool' must be a response to a
+  // preceding message with 'tool_calls'"). This is what a cancelled or
+  // compacted parallel call looks like, and it is the "insufficient tool
+  // messages" failure the client sees on the turn after.
+  const emittableCallIds = new Set<string>();
+  for (const msg of allMessages) {
+    if (msg.role !== "assistant") continue;
+    const calls = toolCallParts(msg);
+    if (calls.length === 0) continue;
+    const idsOk = calls.every(
+      (part) => typeof part.call_id === "string" && part.call_id.length > 0,
+    );
+    const everyCallHasResult = calls.every((part) =>
+      typeof part.call_id === "string" ? toolResultsById.has(part.call_id) : false,
+    );
+    if (idsOk && everyCallHasResult) {
+      for (const part of calls) emittableCallIds.add(part.call_id as string);
+    }
+  }
   for (const m of allMessages) {
     if (m.role === "system" || m.role === "developer") continue;
     // Answers may live in a `user` turn (the Messages ledger re-homes them),
@@ -674,7 +772,13 @@ export function buildQoderRequest(
     // is emitted after, so nothing is duplicated or lost.
     const results = structuredTools ? toolResultParts(m) : [];
     if (results.length > 0) {
+      let emittedAnyTool = false;
       for (const block of results) {
+        // Drop orphan results: their assistant `tool_calls` turn was filtered
+        // out (a sibling call has no result), and emitting the `tool` turn
+        // anyway would make the upstream reject the whole transcript.
+        if (!emittableCallIds.has(block.call_id)) continue;
+        emittedAnyTool = true;
         const text = flattenCanonicalContent(
           typeof block.content === "string"
             ? [{ kind: "text", text: block.content }]
@@ -692,11 +796,13 @@ export function buildQoderRequest(
       // same content, which doubled the payload for no reason.
       const remaining = m.content.filter((part) => part.kind !== "toolResult");
       const flat = flattenCanonicalContent(remaining);
-      if (flat.length === 0) continue;
-      qoderMessages.push({
-        role: "user",
-        content: flat,
-      });
+      if (flat.length === 0 && !emittedAnyTool) continue;
+      if (flat.length > 0) {
+        qoderMessages.push({
+          role: "user",
+          content: flat,
+        });
+      }
       continue;
     }
     // An assistant turn that called tools must carry the calls, not just its
@@ -706,34 +812,15 @@ export function buildQoderRequest(
     // response to a preceding message with 'tool_calls'".
     const allCalls = m.content.filter((part) => part.kind === "toolCall");
     const reasoningEcho = qoderReasoningEcho(m, modelId, hasReasoningTrace);
-    // Structured tool turns are only safe when every call carries an id — the
-    // upstream drops or rejects a transcript whose `tool` result answers a call
-    // without one. Fall back to prose history exactly like INTL in that case.
-    const structuredIdsOk = allCalls.every(
-      (part) => typeof part.call_id === "string" && part.call_id.length > 0,
-    );
-    if ((!structuredTools || !structuredIdsOk) && allCalls.length > 0) {
-      // INTL does not read structured turns, so the call is written into the
-      // text instead of being dropped. Dropping it left the next `tool` turn
-      // answering a call that was never made, and the model had no record of
-      // what it had asked for — so it re-emitted a call with no arguments.
-      //
-      // The marker and the JSON shape mirror the reference bridge, which is
-      // what the upstream has actually been trained to read back.
-      const textParts = m.content.filter((part) => part.kind !== "toolCall");
-      const prose = flattenCanonicalContent(textParts);
-      const recorded = allCalls.map((part) => ({
-        name: part.name,
-        arguments: typeof part.arguments === "string" ? part.arguments : "",
-      }));
-      qoderMessages.push({
-        role: "assistant",
-        content: (prose.length > 0 ? prose + "\n\n" : "") + QODER_TOOL_MARKER + "\n" + JSON.stringify(recorded),
-        ...reasoningEcho,
-      });
-      continue;
-    }
-    const calls = structuredTools && structuredIdsOk ? allCalls : [];
+    // Structured tool turns are only safe when every call carries an id AND a
+    // matching result exists in the history — the upstream rejects a transcript
+    // whose `tool_calls` is not fully answered by `tool` turns. The same set
+    // that gates the `tool` emit above decides this, so the two halves of the
+    // transcript can never disagree.
+    const calls =
+      structuredTools && allCalls.every((part) => emittableCallIds.has(part.call_id))
+        ? allCalls
+        : [];
     if (calls.length > 0) {
       const textParts = m.content.filter((part) => part.kind !== "toolCall");
       const flat = flattenCanonicalContent(textParts);
@@ -746,7 +833,12 @@ export function buildQoderRequest(
           type: "function",
           function: {
             name: part.name,
-            arguments: typeof part.arguments === "string" ? part.arguments : "",
+            arguments:
+              typeof part.arguments === "string"
+                ? part.arguments
+                : part.arguments !== undefined && part.arguments !== null
+                  ? JSON.stringify(part.arguments)
+                  : "",
           },
         })),
       });
@@ -857,217 +949,6 @@ export function buildQoderRequest(
   };
 }
 
-// ---------------------------------------------------------------------------
-// DSML tool-call recovery — DeepSeek's native markup in the text stream
-// ---------------------------------------------------------------------------
-// Some DeepSeek-family models write their tool calls as XML-like DSML markup
-// inside the plain-text `content` stream instead of the structured
-// `tool_calls` field. Left alone, the markup reaches the caller as visible
-// prose and the tool never runs — which is exactly the symptom reported.
-//
-// The parser lives in `src/protocol/dsml.ts`, shared with the CodeBuddy
-// family; Qoder selects the fuzzy dialect, which mirrors the reference bridge's
-// Python regexes (`qoder_proxy.py`, `parse_dsml_tool_calls`).
-import {
-  parseFuzzyDsmlToolCalls,
-  dsmlTailHold,
-  stripDsmlCloseTags,
-  type DsmlToolCall,
-} from "../../../protocol/dsml";
-
-/** Qoder's dialect bounds the shared parser to the fuzzy (non-strict) form. */
-export const parseDsmlToolCalls = (text: string) => parseFuzzyDsmlToolCalls(text);
-export { dsmlTailHold, stripDsmlCloseTags } from "../../../protocol/dsml";
-
-/** One recovered call, in the shape the canonical events want. */
-export type DsmlCall = DsmlToolCall;
-
-/**
- * Escapes the bare quotes that belong inside a JSON string value.
- *
- * Escaped quotes are parked first so they are not escaped twice, then every
- * remaining quote is escaped, then the parked ones are restored.
- */
-function repairJsonQuotes(text: string): string {
-  const ph = "\u0000";
-  return text.replace(/\\"/g, ph).replace(/"/g, '\\"').replaceAll(ph, '\\"');
-}
-
-/** `[{"name":"…","arguments":"<unescaped JSON>"}]`, one call only. */
-const ECHO_LOOSE_RE = /^\[\s*\{\s*"name"\s*:\s*"([^"]{1,200})"\s*,\s*"arguments"\s*:\s*"(.*)"\s*\}\s*\]$/s;
-
-/**
- * Any spelling of the INTL tool-call leak marker — the square-bracket
- * canonical form, the angle-bracket variant the upstream also emits
- * (`<assistant 请求调用工具>`), and partial variants missing the closing
- * bracket. Mirrors `_LEAK_MARKER_RE` in the reference bridge.
- */
-const LEAK_MARKER_ANY_RE = /[\[<(]*\s*assistant\s*请求调用工具\s*[\]>)]?/;
-
-/** Canonical marker literal used to seed prefix matching. */
-const LEAK_MARKER_LITERALS: readonly string[] = [
-  "[assistant 请求调用工具]",
-  "<assistant 请求调用工具>",
-  "assistant 请求调用工具",
-];
-
-/** Longest partial marker we hold across frames (mirrors `_MARKER_HOLD_WINDOW`). */
-const LEAK_HOLD_WINDOW = 24;
-/** Fail-open caps so an endless lookalike cannot hold text forever. */
-const LEAK_HOLD_MAX_CHARS = 32_768;
-const LEAK_HOLD_MAX_FRAMES = 200;
-
-/**
- * True when `suffix` is a strict prefix of some marker literal — the stream
- * may be mid-marker and the rest arrives in the next frame.
- */
-function isLeakMarkerPrefix(suffix: string): boolean {
-  if (suffix.length === 0 || suffix.length >= LEAK_HOLD_WINDOW) return false;
-  return LEAK_MARKER_LITERALS.some((literal) => literal.startsWith(suffix));
-}
-
-/**
- * Splits one content chunk into `{ emit, hold }`, mirroring the reference
- * bridge's `_find_marker_split`: prose before a complete marker is emitted
- * immediately, the marker and everything after it is held, and a partial
- * marker at the very end is held for the next frame.
- */
-function qoderLeakSplit(text: string): { emit: string; hold: string } {
-  if (text.length === 0) return { emit: "", hold: "" };
-  const marker = LEAK_MARKER_ANY_RE.exec(text);
-  if (marker) {
-    return { emit: text.slice(0, marker.index), hold: text.slice(marker.index) };
-  }
-  // No complete marker: hold a trailing partial-marker suffix only.
-  const tail = text.slice(-LEAK_HOLD_WINDOW);
-  for (let n = tail.length; n >= 1; n -= 1) {
-    const seg = tail.slice(-n);
-    if (isLeakMarkerPrefix(seg)) {
-      return { emit: text.slice(0, text.length - n), hold: text.slice(text.length - n) };
-    }
-  }
-  return { emit: text, hold: "" };
-}
-
-/**
- * True when `text` is still plausibly the INTL leak block (marker + JSON
- * array). Used to keep holding across frames; false means it is ordinary
- * prose and can be released. Mirrors `_still_leak_candidate`.
- */
-function qoderStillLeakCandidate(text: string): boolean {
-  if (text.length === 0) return true;
-  const marker = LEAK_MARKER_ANY_RE.exec(text);
-  if (!marker) {
-    // No complete marker yet: still a candidate only while it could grow into
-    // one (full prefix or pending marker remainder).
-    return isLeakMarkerPrefix(text) || LEAK_MARKER_ANY_RE.test(text);
-  }
-  const rest = text.slice(marker.index + marker[0].length).trim();
-  if (rest.length === 0) return true;
-  if (rest.startsWith("[")) return true;
-  if (rest.startsWith("{")) return true;
-  return false;
-}
-
-/**
- * Rebuilds the single-call echo shape when strict parsing fails.
- *
- * Returns `null` when the text is not that shape at all, so a caller can fall
- * back rather than accepting a guess. The result still goes through the same
- * strict checks as a normally-parsed array.
- */
-function salvageEchoArray(rest: string): unknown {
-  const m = ECHO_LOOSE_RE.exec(rest.trim());
-  if (!m) return null;
-  const name = m[1] ?? "";
-  const raw = m[2] ?? "";
-  for (const candidate of [raw, repairJsonQuotes(raw)]) {
-    try {
-      JSON.parse(candidate);
-      return [{ name, arguments: candidate }];
-    } catch {
-      continue;
-    }
-  }
-  return null;
-}
-
-/**
- * Recovers a tool call the model echoed back as text.
- *
- * On INTL the upstream reads tool calls as prose, so a turn that called a tool
- * is described with `QODER_TOOL_MARKER` followed by a JSON array of
- * `{name, arguments}`. The model occasionally reproduces that shape verbatim as
- * its answer instead of calling again, and left alone the client shows the JSON
- * as content while the tool never runs.
- *
- * Only a well-formed array whose every entry names a tool and carries parseable
- * arguments is accepted. Anything else returns no calls and the original text,
- * so a model merely talking about the format is never mistaken for a call.
- */
-export function parseLeakedToolCalls(
-  text: string,
-  allowedNames?: ReadonlySet<string>,
-): { calls: DsmlCall[]; clean: string } {
-  if (text.length === 0) {
-    return { calls: [], clean: text };
-  }
-  // The upstream occasionally echoes the marker in variants — angle brackets,
-  // a missing closing bracket, or wrapped inside a ``` fence. Strip a leading
-  // fence, then locate any marker spelling, mirroring the reference bridge's
-  // `_normalize_leak_marker`.
-  const fence = text.match(/^```[a-z]*\s*\n?/i);
-  const src = fence && fence[0] ? text.slice(fence[0].length) : text;
-  const marker = LEAK_MARKER_ANY_RE.exec(src);
-  if (!marker) {
-    return { calls: [], clean: text };
-  }
-  const head = src.slice(0, marker.index).trim();
-  let rest = src.slice(marker.index + marker[0].length).trim();
-  // The model occasionally leaves raw DSML closing tags after the echo array
-  // (`</｜DSML｜parameter>` etc.), and a ``` fence may close the block. Strip
-  // trailing residue so the JSON parse is not poisoned by "Extra data".
-  rest = stripDsmlCloseTags(rest);
-  rest = rest.replace(/\s*```\s*$/, "").trim();
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(rest);
-  } catch {
-    // A model echoing the call writes the inner quotes unescaped:
-    // `[{"name":"Read","arguments":"{"file_path":"a.ts"}"}]`. That is not
-    // valid JSON at either level, so the array has to be rebuilt before it can
-    // be trusted. Only the single-call shape is salvaged, which is what an echo
-    // almost always is.
-    const salvaged = salvageEchoArray(rest);
-    if (salvaged === null) return { calls: [], clean: text };
-    parsed = salvaged;
-  }
-  if (!Array.isArray(parsed) || parsed.length === 0) return { calls: [], clean: text };
-
-  const calls: DsmlCall[] = [];
-  for (const item of parsed) {
-    if (typeof item !== "object" || item === null) return { calls: [], clean: text };
-    const rec = item as Record<string, unknown>;
-    const name = typeof rec["name"] === "string" ? rec["name"].trim() : "";
-    if (name.length === 0) return { calls: [], clean: text };
-    if (allowedNames && !allowedNames.has(name)) return { calls: [], clean: text };
-    let args = rec["arguments"];
-    if (typeof args === "object" && args !== null) args = JSON.stringify(args);
-    if (typeof args !== "string") return { calls: [], clean: text };
-    // Arguments that do not parse are not a call this can trust.
-    if (args.trim().length > 0) {
-      try {
-        JSON.parse(args);
-      } catch {
-        return { calls: [], clean: text };
-      }
-    }
-    calls.push({ id: `call_${randomUUID().replace(/-/g, "").slice(0, 16)}`, name, arguments: args });
-  }
-  return { calls, clean: head };
-}
-
 // Stream transformation — decode SSE, unwrap COSY envelope, map OpenAI chat chunks to CanonicalEvent
 
 function mapQoderFinishReason(raw: unknown): CanonicalStopReason | undefined {
@@ -1092,32 +973,11 @@ export async function* qoderBodyToCanonicalEvents(
   /** Last seen call id/name, for index-less continuation fragments. */
   let lastSeenToolId: string | undefined = undefined;
   let lastSeenToolName: string | undefined = undefined;
-  // DSML recovery state. While `buf` is empty the text passes through
-  // untouched; once a chunk carries DSML the rest is buffered so the markup can
-  // be parsed whole at end of stream. `tail` holds a possible half-tag that
-  // straddles a frame boundary.
-  let buf = "";
-  let tail = "";
-  // Text that flowed through while not in a DSML stream. The INTL leak marker
-  // (`[assistant 请求调用工具] …`) is not DSML, so it was never buffered and
-  // recovered; keeping the plain text lets the end-of-stream recovery see it.
-  let plainBuf = "";
-  // INTL leak-marker hold-back. Text that may grow into the leak block is
-  // withheld from the client (not yielded) until the stream proves it is
-  // either a tool-call echo (recovered at end of stream) or ordinary prose
-  // (released). Mirrors the reference bridge's `hold` logic.
+  // INTL leak-marker hold-back: text that may grow into the marker+JSON echo
+  // is withheld from the client until end of stream proves it is a tool call
+  // (recovered) or ordinary prose (released).
   let leakBuf = "";
   let leakFrames = 0;
-  /** Calls recovered from the thinking channel, emitted if content had none. */
-  let reasonCalls: readonly DsmlCall[] = [];
-  /** True once any tool call has been emitted by any channel this turn. */
-  let hasEmittedToolCall = false;
-  // The same recovery for the thinking channel. A model that plans its call
-  // inside `reasoning_content` writes the markup there instead of in `content`,
-  // so recovering only the content channel loses the call *and* leaves the
-  // tags visible in the user's thinking.
-  let reasonBuf = "";
-  let reasonTail = "";
 
   for await (const sse of decodeSseEvents(body, { signal })) {
     const sseData = sse.data;
@@ -1146,101 +1006,79 @@ export async function* qoderBodyToCanonicalEvents(
         const delta = choice["delta"] as Record<string, unknown> | undefined;
         if (delta) {
           if (typeof delta["content"] === "string" && (delta["content"] as string).length > 0) {
-            const piece = tail + (delta["content"] as string);
-            tail = "";
-            if (buf.length === 0) {
-              // Not yet in a DSML stream: hold back only a possible tag start,
-              // and pass everything before it through unchanged.
-              const hold = dsmlTailHold(piece);
-              const body = hold.length > 0 ? piece.slice(0, piece.length - hold.length) : piece;
-              if (body.includes("DSML")) {
-                buf = body;
-                tail = hold;
-                continue;
-              }
-              // INTL leak-marker hold-back: do not let a marker echo reach the
-              // client as text. Prose before a complete marker is emitted now;
-              // the marker and anything after it are held until the stream
-              // decides (a valid echo → tool calls; anything else → released).
-              if (leakBuf.length > 0) {
-                leakBuf += body;
-                leakFrames += 1;
-                if (
-                  leakBuf.length > LEAK_HOLD_MAX_CHARS ||
-                  leakFrames > LEAK_HOLD_MAX_FRAMES ||
-                  !qoderStillLeakCandidate(leakBuf)
-                ) {
-                  // Released as ordinary prose: it was already shown, so it
-                  // must not re-enter `plainBuf` (the end-of-stream recovery
-                  // would re-parse it and emit a duplicate tool call).
-                  if (leakBuf.length > 0) {
-                    yield {
-                      type: "content_delta",
-                      sequence_number: seq++,
-                      content: { kind: "text", text: leakBuf },
-                    } as CanonicalEvent;
-                  }
-                  leakBuf = "";
-                  leakFrames = 0;
+            const piece = delta["content"] as string;
+            // Marker+JSON hold-back. A complete marker and everything after it is
+            // held until end of stream; prose before it is emitted now.
+            if (leakBuf.length > 0) {
+              leakBuf += piece;
+              leakFrames = piece.length === 0 ? leakFrames + 1 : 0;
+              if (
+                leakBuf.length > LEAK_HOLD_MAX_CHARS ||
+                leakFrames > LEAK_HOLD_MAX_FRAMES ||
+                !qoderStillLeakCandidate(leakBuf)
+              ) {
+                if (leakBuf.length > 0) {
+                  yield {
+                    type: "content_delta",
+                    sequence_number: seq++,
+                    content: { kind: "text", text: leakBuf },
+                  } as CanonicalEvent;
                 }
-                tail = hold;
-                continue;
+                leakBuf = "";
+                leakFrames = 0;
               }
-              const { emit, hold: leakHold } = qoderLeakSplit(body);
+              continue;
+            }
+            const marker = LEAK_MARKER_ANY_RE.exec(piece);
+            if (marker) {
+              const emit = piece.slice(0, marker.index);
               if (emit.length > 0) {
-                plainBuf += emit;
                 yield {
                   type: "content_delta",
                   sequence_number: seq++,
                   content: { kind: "text", text: emit },
                 } as CanonicalEvent;
               }
-              if (leakHold.length > 0) {
-                leakBuf = leakHold;
-                leakFrames = 1;
-                tail = hold;
-                continue;
+              leakBuf = piece.slice(marker.index);
+              leakFrames = 1;
+              continue;
+            }
+            // No marker: hold only a possible partial-marker suffix.
+            const tail = piece.slice(-LEAK_HOLD_WINDOW);
+            let heldFrom = -1;
+            for (let n = tail.length; n >= 1; n -= 1) {
+              if (isLeakMarkerPrefix(tail.slice(-n))) {
+                heldFrom = piece.length - n;
+                break;
               }
-              // No marker at all: `emit` already covered the whole body, so
-              // only yield here when the split held nothing and emitted nothing.
-              if (emit.length === 0 && body.length > 0) {
-                plainBuf += body;
+            }
+            if (heldFrom >= 0) {
+              const emit = piece.slice(0, heldFrom);
+              if (emit.length > 0) {
                 yield {
                   type: "content_delta",
                   sequence_number: seq++,
-                  content: { kind: "text", text: body },
+                  content: { kind: "text", text: emit },
                 } as CanonicalEvent;
               }
-              tail = hold;
+              leakBuf = piece.slice(heldFrom);
+              leakFrames = 1;
               continue;
             }
-            buf += piece;
+            yield {
+              type: "content_delta",
+              sequence_number: seq++,
+              content: { kind: "text", text: piece },
+            } as CanonicalEvent;
             continue;
           }
           const reasoningText = readReasoningText(delta);
           if (typeof reasoningText === "string" && reasoningText.length > 0) {
-            const piece = reasonTail + reasoningText;
-            reasonTail = "";
-            if (reasonBuf.length === 0) {
-              const hold = dsmlTailHold(piece);
-              const body = hold.length > 0 ? piece.slice(0, piece.length - hold.length) : piece;
-              if (body.includes("DSML")) {
-                reasonBuf = body;
-                reasonTail = hold;
-                continue;
-              }
-              const visible = stripDsmlCloseTags(body);
-              if (visible.length > 0) {
-                yield {
-                  type: "content_delta",
-                  sequence_number: seq++,
-                  content: { kind: "reasoning", payload: null, summary: visible },
-                } as CanonicalEvent;
-              }
-              reasonTail = hold;
-              continue;
-            }
-            reasonBuf += piece;
+            yield {
+              type: "content_delta",
+              sequence_number: seq++,
+              content: { kind: "reasoning", payload: null, summary: reasoningText },
+            } as CanonicalEvent;
             continue;
           }
           const toolCalls = delta["tool_calls"] as Array<Record<string, unknown>> | undefined;
@@ -1276,7 +1114,6 @@ export async function* qoderBodyToCanonicalEvents(
               } else {
                 callId = `call_${String(index ?? 0)}`;
               }
-              hasEmittedToolCall = true;
               yield {
                 type: "tool_call_delta",
                 sequence_number: seq++,
@@ -1297,45 +1134,13 @@ export async function* qoderBodyToCanonicalEvents(
       if (json["finish_reason"] !== undefined) finishReason = json["finish_reason"];
     }
   }
-  // End of stream: resolve whatever the DSML buffer collected.
-  if (reasonBuf.length > 0) {
-    const { calls, clean } = parseDsmlToolCalls(reasonBuf);
-    const visible = stripDsmlCloseTags(clean).trim();
-    if (visible.length > 0) {
-      yield {
-        type: "content_delta",
-        sequence_number: seq++,
-        content: { kind: "reasoning", payload: null, summary: visible },
-      } as CanonicalEvent;
-    }
-    // A call recovered here counts exactly like one recovered from the content
-    // channel — the two are deduplicated below, so a model that writes the
-    // block in one channel and its tail in the other still yields one call.
-    if (calls.length > 0) reasonCalls = calls;
-  }
-  if (buf.length > 0) {
-    // Two ways a call can arrive as text: DSML markup, and the marker + JSON
-    // array the upstream itself uses on INTL. The second is tried only when the
-    // first finds nothing, so a DSML stream is never re-read as an echo.
-    let { calls, clean } = parseDsmlToolCalls(buf);
-    if (calls.length === 0) {
-      const leaked = parseLeakedToolCalls(buf);
-      if (leaked.calls.length > 0) {
-        calls = leaked.calls;
-        clean = leaked.clean;
-      }
-    }
-    if (calls.length > 0) {
-      const visible = stripDsmlCloseTags(clean).trim();
-      if (visible.length > 0) {
-        yield {
-          type: "content_delta",
-          sequence_number: seq++,
-          content: { kind: "text", text: visible },
-        } as CanonicalEvent;
-      }
-      for (const call of calls) {
-        hasEmittedToolCall = true;
+  // End of stream: recover a held-back marker+JSON echo. A valid echo becomes
+  // tool calls; anything else is released as ordinary prose (or fails closed
+  // when it is unmistakably an echo that cannot be parsed).
+  if (leakBuf.length > 0) {
+    const leaked = parseQoderTextToolCalls(leakBuf);
+    if (leaked.calls.length > 0) {
+      for (const call of leaked.calls) {
         yield {
           type: "tool_call_delta",
           sequence_number: seq++,
@@ -1344,13 +1149,14 @@ export async function* qoderBodyToCanonicalEvents(
           arguments_delta: call.arguments,
         } as CanonicalEvent;
       }
-      reasonCalls = [];
-      // The turn ended by calling a tool, whatever the upstream reported.
       finishReason = "tool_calls";
     } else {
-      // Unparseable markup: emit as prose rather than dropping it, so nothing
-      // the model said is lost.
-      const visible = stripDsmlCloseTags(buf).trim();
+      // An echo that could not be recovered must fail the turn (502) so the
+      // harness retries — never surface protocol text as visible content.
+      if (isQoderEchoAttempt(leakBuf)) {
+        throw badEchoError();
+      }
+      const visible = leaked.clean.trim();
       if (visible.length > 0) {
         yield {
           type: "content_delta",
@@ -1359,78 +1165,6 @@ export async function* qoderBodyToCanonicalEvents(
         } as CanonicalEvent;
       }
     }
-  }
-  // Content carried no call of its own: whatever the thinking channel
-  // recovered is the turn's call.
-  for (const call of reasonCalls) {
-    hasEmittedToolCall = true;
-    yield {
-      type: "tool_call_delta",
-      sequence_number: seq++,
-      call_id: call.id,
-      name: call.name,
-      arguments_delta: call.arguments,
-    } as CanonicalEvent;
-  }
-  // The INTL leak marker is plain text, not DSML, so it flowed through to
-  // `plainBuf` instead of the buffered `buf`. Recover it the same way: a
-  // model that answers with `[assistant 请求调用工具] [{"name":…,"arguments":…}]`
-  // intended the tool to run, and left alone the client sees the JSON as
-  // content while nothing executes. Only when no other channel already
-  // claimed the turn.
-  if (!hasEmittedToolCall) {
-    // Held-back marker block first: it was withheld from the client, so a
-    // recovery here never duplicates text already shown. A valid echo becomes
-    // tool calls; anything else is released as ordinary prose.
-    if (leakBuf.length > 0) {
-      const leaked = parseLeakedToolCalls(leakBuf);
-      if (leaked.calls.length > 0) {
-        for (const call of leaked.calls) {
-          hasEmittedToolCall = true;
-          yield {
-            type: "tool_call_delta",
-            sequence_number: seq++,
-            call_id: call.id,
-            name: call.name,
-            arguments_delta: call.arguments,
-          } as CanonicalEvent;
-        }
-        finishReason = "tool_calls";
-      } else if (leaked.clean.length > 0) {
-        yield {
-          type: "content_delta",
-          sequence_number: seq++,
-          content: { kind: "text", text: leaked.clean },
-        } as CanonicalEvent;
-      }
-    }
-    if (plainBuf.length > 0 && !hasEmittedToolCall) {
-      const leaked = parseLeakedToolCalls(plainBuf);
-      if (leaked.calls.length > 0) {
-        for (const call of leaked.calls) {
-          hasEmittedToolCall = true;
-          yield {
-            type: "tool_call_delta",
-            sequence_number: seq++,
-            call_id: call.id,
-            name: call.name,
-            arguments_delta: call.arguments,
-          } as CanonicalEvent;
-        }
-        finishReason = "tool_calls";
-      }
-    }
-  }
-  // A recovered call outranks what the upstream reported. It says `stop`
-  // because the markup never became a real tool call on its side, so leaving it
-  // alone ends the turn "finished" with a call the caller never sees run.
-  if (reasonCalls.length > 0) finishReason = "tool_calls";
-  if (tail.length > 0) {
-    yield {
-      type: "content_delta",
-      sequence_number: seq++,
-      content: { kind: "text", text: tail },
-    } as CanonicalEvent;
   }
   // If no terminal arrived, synthesize one (prevents truncation error)
   const stopReason = mapQoderFinishReason(finishReason);
@@ -1550,11 +1284,13 @@ class QoderAdapter implements ProviderAdapter {
       const qoderBody = buildQoderRequest(modelId, request, modelConfig, auth, this.realm);
       // A full URL from the route wins, but the fallback is this realm's
       // gateway — not the intl host hardcoded into `MODERN_PROFILE`. Dispatching
-      // a CN credential to `*.qoder.sh` is refused outright.
+      // a CN credential to `*.qoder.sh` is refused outright. The host order
+      // follows the token kind: job tokens (`jt-...`) belong on `api2`, which
+      // is the only intl host that serves them (`api3` answers "Login expired").
       const url =
         candidate.endpoint_path && candidate.endpoint_path.startsWith("http")
           ? candidate.endpoint_path
-          : `${qoderGatewayCandidates(this.realm)[0] ?? ""}${QODER_CHAT_PATH}`;
+          : `${qoderInferenceCandidates(this.realm, auth.securityOauthToken)[0] ?? ""}${QODER_CHAT_PATH}`;
 
       const response = await callQoder(url, qoderBody, modelId, auth, lifecycle.signal, fetcher, version);
       if (!response.ok) throw await mapUpstreamHttpError(response, "qoder");
