@@ -88,4 +88,33 @@ describe("usage cache hit rate", () => {
       fx.cleanup();
     }
   });
+
+  test("cache writes are summed from telemetry, not hardcoded to zero", async () => {
+    const fx = await fixture();
+    try {
+      await fx.db.insert(telemetryEvents).values({
+        id: crypto.randomUUID(),
+        tenantId: fx.tenantId,
+        requestId: crypto.randomUUID(),
+        createdAt: new Date(),
+        sourceSurface: "chat",
+        requestedModel: "wk/hy4",
+        clientName: "bun",
+        providerId: "p",
+        apiKeyId: fx.apiKeyId,
+        status: "completed",
+        httpStatus: 200,
+        inputTokens: 1_000,
+        cachedInputTokens: 400,
+        cacheWriteTokens: 250,
+        outputTokens: 500,
+      });
+      const cache = await new DrizzleObservabilityStore(fx.db, undefined).usageCache(fx.tenantId, "24h");
+      expect(cache.value.cacheWriteTokens).toBe(250);
+      // Writes are not reads: the hit rate still divides cached reads by input.
+      expect(cache.value.hitRate).toBe(40);
+    } finally {
+      fx.cleanup();
+    }
+  });
 });

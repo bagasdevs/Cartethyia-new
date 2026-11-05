@@ -210,14 +210,28 @@ export function normalizeUsage(input: Record<string, unknown>): UsageRecord {
     cached_input_tokens = input.cachedContentTokenCount;
   }
 
-  // Handle cache write tokens: Anthropic uses cache_creation_input_tokens
+  // Handle cache write tokens: Anthropic uses cache_creation_input_tokens;
+  // the DeepSeek/buddy bridges spell the same volume prompt_cache_write_tokens
+  // and often stamp the Anthropic field with a constant 0. A positive count
+  // from either field wins over a zeroed sibling; an all-zero pair is still a
+  // measured zero, not "unavailable".
   let cache_write_tokens: number | "unavailable" = "unavailable";
   const anthropic_cache_write =
     typeof input.cache_creation_input_tokens === "number"
       ? input.cache_creation_input_tokens
       : null;
-  if (anthropic_cache_write !== null) {
-    cache_write_tokens = anthropic_cache_write;
+  const bridge_cache_write =
+    typeof input.prompt_cache_write_tokens === "number"
+      ? input.prompt_cache_write_tokens
+      : null;
+  const reported_cache_write =
+    anthropic_cache_write !== null && anthropic_cache_write > 0
+      ? anthropic_cache_write
+      : bridge_cache_write !== null && bridge_cache_write > 0
+        ? bridge_cache_write
+        : (anthropic_cache_write ?? bridge_cache_write);
+  if (reported_cache_write !== null) {
+    cache_write_tokens = reported_cache_write;
   } else if (input.cache_creation && typeof input.cache_creation === "object") {
     const breakdown = input.cache_creation as Record<string, unknown>;
     const ephemeral5m =
@@ -244,7 +258,19 @@ export function normalizeUsage(input: Record<string, unknown>): UsageRecord {
   // under-reporting prompt by the entire cached span. `as-is` keeps the raw
   // upstream semantics (and the legacy heuristic for already-inclusive bridges).
   const accountInputInclusive = resolveUsageInputMode() === "inclusive";
-  const cacheIsSeparate = anthropic_cache_read !== null;
+  // The buddy/DeepSeek bridges emit ALL cache spellings at once, including a
+  // zeroed `cache_read_input_tokens`. Its mere presence does not make the frame
+  // Anthropic-shaped: when the bridge's own hit + miss counters add up to the
+  // reported prompt, `prompt_tokens` is already all-in and folding the cached
+  // count in again doubles the prompt. A lone `prompt_cache_hit_tokens` beside
+  // a real Anthropic read keeps the legacy additive behaviour.
+  const bridgeMiss =
+    typeof input.prompt_cache_miss_tokens === "number" ? input.prompt_cache_miss_tokens : null;
+  const bridgeBreakdownIsInclusive =
+    deepseekCacheHit !== null &&
+    bridgeMiss !== null &&
+    deepseekCacheHit + bridgeMiss === input_tokens;
+  const cacheIsSeparate = anthropic_cache_read !== null && !bridgeBreakdownIsInclusive;
   const shouldFoldCache = accountInputInclusive
     ? cacheIsSeparate
     : cacheIsSeparate && !inputAlreadyIncludesCache;

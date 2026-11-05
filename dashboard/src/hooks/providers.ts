@@ -285,6 +285,7 @@ export interface ProviderUsageDayRow {
   readonly requests: number;
   readonly inputTokens: number;
   readonly cachedInputTokens: number;
+  readonly cacheWriteTokens: number;
   readonly outputTokens: number;
   readonly costUsd: number;
 }
@@ -308,6 +309,7 @@ function assertUsageMatrix(raw: unknown): ProviderUsageMatrixResponse {
       requests?: unknown;
       inputTokens?: unknown;
       cachedInputTokens?: unknown;
+      cacheWriteTokens?: unknown;
       outputTokens?: unknown;
       costUsd?: unknown;
     }[];
@@ -325,6 +327,7 @@ function assertUsageMatrix(raw: unknown): ProviderUsageMatrixResponse {
       requests: asNumber(row.requests),
       inputTokens: asNumber(row.inputTokens),
       cachedInputTokens: asNumber(row.cachedInputTokens),
+      cacheWriteTokens: asNumber(row.cacheWriteTokens),
       outputTokens: asNumber(row.outputTokens),
       costUsd: asNumber(row.costUsd),
     })),

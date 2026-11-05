@@ -47,6 +47,7 @@ export interface TelemetryEventRecord {
   readonly errorCategory: string | null;
   readonly inputTokens: number | null;
   readonly cachedInputTokens: number | null;
+  readonly cacheWriteTokens: number | null;
   readonly outputTokens: number | null;
   readonly reasoningTokens: number | null;
   readonly estimatedCostUsd: number | null;
@@ -107,6 +108,7 @@ function normalize(raw: Record<string, unknown>): TelemetryEventRecord | undefin
     errorCategory: asString(raw["errorCategory"]),
     inputTokens: asNumber(raw["inputTokens"]),
     cachedInputTokens: asNumber(raw["cachedInputTokens"]),
+    cacheWriteTokens: asNumber(raw["cacheWriteTokens"]),
     outputTokens: asNumber(raw["outputTokens"]),
     reasoningTokens: asNumber(raw["reasoningTokens"]),
     estimatedCostUsd: asNumber(raw["estimatedCostUsd"]),
@@ -387,6 +389,7 @@ interface EventTotals {
   truncated: number;
   inputTokens: number;
   cachedTokens: number;
+  cacheWriteTokens: number;
   outputTokens: number;
   estimatedCost: number;
   unpriced: number;
@@ -397,10 +400,8 @@ interface EventTotals {
 }
 
 export function emptyTotals(): EventTotals {
-  return { requests: 0, succeeded: 0, failed: 0, cancelled: 0, truncated: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, estimatedCost: 0, unpriced: 0, latencySum: 0, latencyCount: 0, tokensPerSecSum: 0, tokensPerSecCount: 0 };
+  return { requests: 0, succeeded: 0, failed: 0, cancelled: 0, truncated: 0, inputTokens: 0, cachedTokens: 0, cacheWriteTokens: 0, outputTokens: 0, estimatedCost: 0, unpriced: 0, latencySum: 0, latencyCount: 0, tokensPerSecSum: 0, tokensPerSecCount: 0 };
 }
-
-/**
 
 /** Folds one event into a totals bucket. `failed` counts any non-completed terminal status. */
 export function accumulate(totals: EventTotals, event: TelemetryEventRecord): void {
@@ -411,6 +412,7 @@ export function accumulate(totals: EventTotals, event: TelemetryEventRecord): vo
   else if (event.status !== null) totals.failed += 1;
   totals.inputTokens += event.inputTokens ?? 0;
   totals.cachedTokens += event.cachedInputTokens ?? 0;
+  totals.cacheWriteTokens += event.cacheWriteTokens ?? 0;
   totals.outputTokens += event.outputTokens ?? 0;
   if (event.estimatedCostUsd !== null) totals.estimatedCost += event.estimatedCostUsd;
   else if (event.status === "completed") totals.unpriced += 1;

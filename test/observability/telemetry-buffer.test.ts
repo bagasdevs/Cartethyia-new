@@ -127,7 +127,7 @@ function fullUsage(): NonNullable<TelemetryEventInput["usage"]> {
   return {
     input_tokens: 900,
     cached_input_tokens: 800,
-    cache_write_tokens: 0,
+    cache_write_tokens: 70,
     uncached_input_tokens: 100,
     output_tokens: 120,
     reasoning_tokens: 40,
@@ -382,6 +382,7 @@ dbDescribe("telemetry row mapping, read back from Postgres", () => {
       expect(row?.resolveMs).toBe(55);
       expect(row?.inputTokens).toBe(900);
       expect(row?.cachedInputTokens).toBe(800);
+      expect(row?.cacheWriteTokens).toBe(70);
       expect(row?.outputTokens).toBe(120);
       expect(row?.reasoningTokens).toBe(40);
       expect(row?.estimatedCostUsd).toBe(0.012345);
@@ -426,6 +427,7 @@ dbDescribe("telemetry row mapping, read back from Postgres", () => {
       expect(row?.inputTokens).toBeNull();
       expect(row?.cachedInputTokens).toBeNull();
       expect(row?.outputTokens).toBeNull();
+      expect(row?.cacheWriteTokens).toBeNull();
       expect(row?.reasoningTokens).toBeNull();
       expect(row?.estimatedCostUsd).toBeNull();
       expect(row?.creditUsed).toBeNull();

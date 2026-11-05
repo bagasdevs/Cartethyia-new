@@ -1,0 +1,13 @@
+-- Adds `telemetry_events.cache_write_tokens` (integer, nullable).
+--
+-- Cache WRITES are a distinct counter from cache READS (`cached_input_tokens`).
+-- A provider that reports a large fresh/uncached span may be writing that span
+-- into its prefix cache; without this column the Usage surfaces silently report
+-- zero writes and the `input - cached` remainder has no explanation.
+--
+-- NULL means the upstream reported no write counter. It must stay NULL, not 0:
+-- "unmeasured" and "measured zero" are different facts.
+--
+-- `ADD COLUMN IF NOT EXISTS` keeps the file idempotent: a database built from a
+-- newer baseline that already carries the column must not fail startup.
+ALTER TABLE "telemetry_events" ADD COLUMN IF NOT EXISTS "cache_write_tokens" integer;

@@ -102,6 +102,7 @@ export function assertUsageSummary(value: unknown): UsageSummaryResponse {
     "requests",
     "inputTokens",
     "cachedTokens",
+    "cacheWriteTokens",
     "outputTokens",
     "errors",
     "cancelled",
@@ -138,7 +139,7 @@ export function assertUsageChart(value: unknown): UsageChartResponse {
     if (
       !isRecord(bucket) ||
       typeof bucket.t !== "string" ||
-      !["requests", "input", "cached", "output"].every((field) => isFiniteNumber(bucket[field]))
+      !["requests", "input", "cached", "cacheWriteTokens", "output"].every((field) => isFiniteNumber(bucket[field]))
     ) {
       throw invalidResponse("Invalid usage chart response");
     }
@@ -157,7 +158,7 @@ export function assertUsageBy(value: unknown): UsageByResponse {
     if (
       !isRecord(row) ||
       typeof row.name !== "string" ||
-      !["requests", "input", "output", "cached", "total", "errors"].every((field) =>
+      !["requests", "input", "output", "cached", "cacheWriteTokens", "total", "errors"].every((field) =>
         isFiniteNumber(row[field]),
       ) ||
       !(row.costUsd === null || isFiniteNumber(row.costUsd)) ||
@@ -195,6 +196,7 @@ function assertUsageRequestItem(value: unknown): void {
     "inputTokens",
     "outputTokens",
     "cachedTokens",
+    "cacheWriteTokens",
     "reasoningTokens",
     "totalTokens",
     "ttfbMs",

@@ -310,6 +310,7 @@ function requestLogMetadata(
             inputTokens: state.outcome.usage.input_tokens,
             outputTokens: state.outcome.usage.output_tokens,
             cachedInputTokens: state.outcome.usage.cached_input_tokens,
+            cacheWriteTokens: state.outcome.usage.cache_write_tokens,
             reasoningTokens: state.outcome.usage.reasoning_tokens,
             estimatedCost: state.outcome.usage.estimated_cost,
             ...(state.outcome.degenerateStop ? { degenerateStop: true } : {}),

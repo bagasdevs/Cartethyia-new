@@ -49,12 +49,14 @@ export const IS_GATEWAY_ERROR_SQL = gatewayErrorSql(telemetryEvents.status, tele
  * list, and this SQL reader must agree on the same column.
  */
 const CACHED_INPUT_TOKENS_SQL = sql<number>`coalesce(sum(${telemetryEvents.cachedInputTokens}), 0)`;
+const CACHE_WRITE_TOKENS_SQL = sql<number>`coalesce(sum(${telemetryEvents.cacheWriteTokens}), 0)`;
 
 const AGGREGATE_SELECT = {
   errors: sql<number>`sum(case when ${IS_GATEWAY_ERROR_SQL} then 1 else 0 end)`,
   inputTokens: sql<number>`coalesce(sum(${telemetryEvents.inputTokens}), 0)`,
   outputTokens: sql<number>`coalesce(sum(${telemetryEvents.outputTokens}), 0)`,
   cachedInputTokens: CACHED_INPUT_TOKENS_SQL,
+  cacheWriteTokens: CACHE_WRITE_TOKENS_SQL,
 } as const;
 
 /** One bounded page of events, newest first. */
@@ -106,6 +108,7 @@ export interface UsageSummary {
   readonly inputTokens: number;
   readonly outputTokens: number;
   readonly cachedInputTokens: number;
+  readonly cacheWriteTokens: number;
   readonly reasoningTokens: number;
   readonly estimatedCostUsd: number;
   /** Requests whose latency was recorded — the denominator for `latencyMs`. */
@@ -132,6 +135,8 @@ interface BreakdownGroup {
   readonly avgTokensPerSec: number;
   /** Cached-input share of the prompt, summed for the group. */
   readonly cachedInputTokens: number;
+  /** Prompt-cache writes, summed for the group. Distinct from cached reads. */
+  readonly cacheWriteTokens: number;
 }
 
 export interface ChartBucket {
@@ -142,6 +147,7 @@ export interface ChartBucket {
   readonly outputTokens: number;
   /** Cached-input share of the prompt, summed for the bucket. */
   readonly cachedInputTokens: number;
+  readonly cacheWriteTokens: number;
 }
 
 const DEFAULT_LIMIT = 50;
@@ -184,6 +190,7 @@ function eventRecordFromRow(row: {
   readonly errorCategory: string | null;
   readonly inputTokens: number | null;
   readonly cachedInputTokens: number | null;
+  readonly cacheWriteTokens: number | null;
   readonly outputTokens: number | null;
   readonly reasoningTokens: number | null;
   readonly estimatedCostUsd: string | number | null;
@@ -220,6 +227,7 @@ function eventRecordFromRow(row: {
     errorCategory: row.errorCategory,
     inputTokens: row.inputTokens,
     cachedInputTokens: row.cachedInputTokens,
+    cacheWriteTokens: row.cacheWriteTokens,
     outputTokens: row.outputTokens,
     reasoningTokens: row.reasoningTokens,
     estimatedCostUsd: numericNullable(row.estimatedCostUsd),
@@ -555,6 +563,7 @@ export async function breakdownTelemetry(
     inputTokens: numeric(row.inputTokens),
     outputTokens: numeric(row.outputTokens),
     cachedInputTokens: numeric(row.cachedInputTokens),
+    cacheWriteTokens: numeric(row.cacheWriteTokens),
     // A group whose rows carried no price reports null, matching the console's
     // "cost is unknown" reading rather than a false zero.
     costUsd: numeric(row.costUsd) > 0 ? numeric(row.costUsd) : null,
@@ -592,6 +601,7 @@ export async function chartTelemetry(
     inputTokens: numeric(row.inputTokens),
     outputTokens: numeric(row.outputTokens),
     cachedInputTokens: numeric(row.cachedInputTokens),
+    cacheWriteTokens: numeric(row.cacheWriteTokens),
   }));
 }
 
@@ -604,6 +614,7 @@ export interface ProviderUsageDayRow {
   readonly requests: number;
   readonly inputTokens: number;
   readonly cachedInputTokens: number;
+  readonly cacheWriteTokens: number;
   readonly outputTokens: number;
   readonly costUsd: number;
 }
@@ -629,6 +640,7 @@ export async function providerUsageMatrix(
       requests: sql<number>`count(*)`,
       inputTokens: AGGREGATE_SELECT.inputTokens,
       cachedInputTokens: CACHED_INPUT_TOKENS_SQL,
+      cacheWriteTokens: CACHE_WRITE_TOKENS_SQL,
       outputTokens: AGGREGATE_SELECT.outputTokens,
       costUsd: sql<number>`coalesce(sum(${telemetryEvents.estimatedCostUsd}), 0)`,
     })
@@ -643,6 +655,7 @@ export async function providerUsageMatrix(
     inputTokens: numeric(row.inputTokens),
     cachedInputTokens: numeric(row.cachedInputTokens),
     outputTokens: numeric(row.outputTokens),
+    cacheWriteTokens: numeric(row.cacheWriteTokens),
     costUsd: numeric(row.costUsd),
   }));
 }
@@ -821,6 +834,7 @@ export async function familyHourlyTelemetry(
     inputTokens: numeric(row.inputTokens),
     outputTokens: numeric(row.outputTokens),
     cachedInputTokens: numeric(row.cachedInputTokens),
+    cacheWriteTokens: numeric(row.cacheWriteTokens),
   }));
 }
 
@@ -870,6 +884,7 @@ export async function summarizeUsageWithPerformance(
       inputTokens: AGGREGATE_SELECT.inputTokens,
       outputTokens: AGGREGATE_SELECT.outputTokens,
       cachedInputTokens: CACHED_INPUT_TOKENS_SQL,
+      cacheWriteTokens: CACHE_WRITE_TOKENS_SQL,
       reasoningTokens: sql<number>`coalesce(sum(${telemetryEvents.reasoningTokens}), 0)`,
       estimatedCostUsd: sql<number>`coalesce(sum(${telemetryEvents.estimatedCostUsd}), 0)`,
       sampled: sql<number>`count(${telemetryEvents.latencyMs})`,
@@ -891,6 +906,7 @@ export async function summarizeUsageWithPerformance(
       inputTokens: 0,
       outputTokens: 0,
       cachedInputTokens: 0,
+      cacheWriteTokens: 0,
       reasoningTokens: 0,
       estimatedCostUsd: 0,
       sampled: 0,
@@ -922,6 +938,7 @@ export async function summarizeUsageWithPerformance(
       inputTokens: numeric(row.inputTokens),
       outputTokens: numeric(row.outputTokens),
       cachedInputTokens: numeric(row.cachedInputTokens),
+      cacheWriteTokens: numeric(row.cacheWriteTokens),
       reasoningTokens: numeric(row.reasoningTokens),
       estimatedCostUsd: numeric(row.estimatedCostUsd),
       sampled,

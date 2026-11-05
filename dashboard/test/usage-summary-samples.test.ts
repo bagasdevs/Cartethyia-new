@@ -17,6 +17,7 @@ const BASE_TOTALS: Record<string, unknown> = {
   requests: 100,
   inputTokens: 1,
   cachedTokens: 0,
+  cacheWriteTokens: 0,
   outputTokens: 1,
   errors: 0,
   cancelled: 0,
@@ -69,5 +70,11 @@ describe("assertUsageSummary sample counts", () => {
 
   test("rejects a non-numeric count", () => {
     expect(() => assertUsageSummary(summaryWith({ latencySampleCount: "100" }))).toThrow();
+  });
+
+  test("rejects a response missing cacheWriteTokens", () => {
+    // An older backend reported `cacheWriteTokens: 0` because the schema had
+    // no such column. Rendering that as "no writes" would be a false zero.
+    expect(() => assertUsageSummary(summaryWithout("cacheWriteTokens"))).toThrow();
   });
 });

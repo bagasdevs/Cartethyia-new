@@ -228,6 +228,7 @@ const USAGE_SUMMARY_STUB = {
     requests: 0,
     inputTokens: 0,
     cachedTokens: 0,
+    cacheWriteTokens: 0,
     outputTokens: 0,
     errors: 0,
     cancelled: 0,

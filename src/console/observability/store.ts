@@ -137,6 +137,9 @@ function mapUsageRequestItem(
     ...(event.cachedInputTokens !== null
       ? { cachedTokens: event.cachedInputTokens ?? undefined }
       : {}),
+    ...(event.cacheWriteTokens !== null
+      ? { cacheWriteTokens: event.cacheWriteTokens ?? undefined }
+      : {}),
     ...(event.reasoningTokens !== null
       ? { reasoningTokens: event.reasoningTokens ?? undefined }
       : {}),
@@ -490,6 +493,7 @@ export class DrizzleObservabilityStore implements ObservabilityStore {
     ]);
     const inputTokens = summary.inputTokens;
     const cachedTokens = summary.cachedInputTokens;
+    const cacheWriteTokens = summary.cacheWriteTokens;
     return {
       period,
       totals: {
@@ -500,6 +504,7 @@ export class DrizzleObservabilityStore implements ObservabilityStore {
         requests: summary.requests,
         inputTokens,
         cachedTokens,
+        cacheWriteTokens,
         outputTokens: summary.outputTokens,
         errors: summary.errors,
         cancelled: summary.cancelled,
@@ -541,6 +546,7 @@ export class DrizzleObservabilityStore implements ObservabilityStore {
         // `cached` is the cached share of the prompt: the SQL reader sums
         // cached_input_tokens, which is the same number the old JS loop used.
         cached: bucket.cachedInputTokens,
+        cacheWriteTokens: bucket.cacheWriteTokens,
         output: bucket.outputTokens,
       });
     }
@@ -551,7 +557,7 @@ export class DrizzleObservabilityStore implements ObservabilityStore {
     const out: UsageChartBucket[] = [];
     for (let at = aligned; at <= Date.now(); at += stepMs) {
       out.push(
-        byTime.get(at) ?? { t: new Date(at).toISOString(), requests: 0, input: 0, cached: 0, output: 0 },
+        byTime.get(at) ?? { t: new Date(at).toISOString(), requests: 0, input: 0, cached: 0, cacheWriteTokens: 0, output: 0 },
       );
     }
     return { buckets: out };
@@ -593,6 +599,7 @@ export class DrizzleObservabilityStore implements ObservabilityStore {
           input,
           output,
           cached: group.cachedInputTokens,
+          cacheWriteTokens: group.cacheWriteTokens,
           total: input + output,
           errors: group.errors,
           costUsd: group.costUsd,
@@ -634,6 +641,7 @@ export class DrizzleObservabilityStore implements ObservabilityStore {
               ? null
               : (existing.costUsd ?? 0) + (row.costUsd ?? 0),
           cacheHitRate: input > 0 ? (existing.cached + row.cached) / input * 100 : 0,
+          cacheWriteTokens: (existing.cacheWriteTokens ?? 0) + (row.cacheWriteTokens ?? 0),
         });
       }
       return {
@@ -677,7 +685,7 @@ export class DrizzleObservabilityStore implements ObservabilityStore {
       period,
       inputTokens,
       cachedTokens,
-      cacheWriteTokens: 0,
+      cacheWriteTokens: summary.cacheWriteTokens,
       // Same `cached / input` definition as computeSummary and computeHealth;
       // including output tokens in the denominator made two Usage surfaces
       // disagree on the same window.

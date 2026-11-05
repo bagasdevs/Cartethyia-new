@@ -1461,6 +1461,14 @@ export const telemetryEvents = pgTable(
     errorCategory: text("error_category"),
     inputTokens: integer("input_tokens"),
     cachedInputTokens: integer("cached_input_tokens"),
+    /**
+     * Prompt-cache writes reported by the provider, separate from cache reads.
+     * NULL when the upstream reported no write count — never a measured zero:
+     * a provider that omits the field is silent, not write-free. Displayed
+     * alongside cached reads so `input − cached` can be interpreted instead
+     * of being mistaken for a cache miss.
+     */
+    cacheWriteTokens: integer("cache_write_tokens"),
     outputTokens: integer("output_tokens"),
     reasoningTokens: integer("reasoning_tokens"),
     estimatedCostUsd: numeric("estimated_cost_usd", { precision: 12, scale: 6 }),

@@ -161,6 +161,19 @@ describe("canonical SQL telemetry reader", () => {
     }
   });
 
+  test("cache-write tokens are summed in SQL, distinct from cached reads", async () => {
+    const fx = await fixture();
+    try {
+      await insertEvent(fx, { inputTokens: 1_000, cachedInputTokens: 300, cacheWriteTokens: 30 });
+      await insertEvent(fx, { inputTokens: 500, cachedInputTokens: 0, cacheWriteTokens: null });
+      const { summary } = await summarizeUsageWithPerformance(fx.db, fx.tenantId, new Date(0));
+      expect(summary.cachedInputTokens).toBe(300);
+      expect(summary.cacheWriteTokens).toBe(30);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
   test("breakdown groups in SQL, bounded to 100 groups", async () => {
     const fx = await fixture();
     try {

@@ -144,6 +144,7 @@ function telemetryEventRow(event: TelemetryEventInput) {
     errorOrigin: event.errorOrigin ?? null,
     inputTokens: event.usage?.input_tokens ?? null,
     cachedInputTokens: tokenCountToInt(event.usage?.cached_input_tokens) ?? null,
+    cacheWriteTokens: tokenCountToInt(event.usage?.cache_write_tokens) ?? null,
     outputTokens: event.usage?.output_tokens ?? null,
     reasoningTokens: tokenCountToInt(event.usage?.reasoning_tokens) ?? null,
     // `estimated_cost` is `null` when the route is unpriced; persist NULL so

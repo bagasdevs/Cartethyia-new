@@ -3,6 +3,7 @@ import { ArrowUpFromLine, Database, DollarSign } from "lucide-react";
 import type { UsageSummaryTotals } from "../../../data/contracts";
 import { StatCard } from "../../../components/ui/layout";
 import { tokenScaleValue } from "../../../lib/format/tokens";
+import { formatNumber } from "../../../lib/format/numbers";
 import { RequestsStatCard } from "./in-flight";
 import { TokenScaleSwitch } from "./token-scale-switch";
 import { formatUsd } from "./formatters";
@@ -51,7 +52,7 @@ export function SummaryMetricCards({
         detail={
           pending
             ? "Cache hit rate"
-            : `${summary?.cacheHitRate !== undefined ? Math.round(summary.cacheHitRate * 10) / 10 : 0}% cache hit rate`
+            : `${summary?.cacheHitRate !== undefined ? Math.round(summary.cacheHitRate * 10) / 10 : 0}% hit rate · ${summary?.cacheWriteTokens !== undefined ? formatNumber(summary.cacheWriteTokens) : "—"} cache writes`
         }
         tone="purple"
         icon={<Database size={13} />}

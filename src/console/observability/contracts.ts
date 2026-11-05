@@ -84,6 +84,13 @@ export interface UsageSummaryTotals {
   requests: number;
   inputTokens: number;
   cachedTokens: number;
+  /**
+   * Prompt-cache writes reported by the provider, summed over the period.
+   * Separate from `cachedTokens` (cache reads); NULL/unset rows contribute 0.
+   * Lets `input − cached` be read as writes + genuinely fresh tokens instead
+   * of being mistaken for cache misses.
+   */
+  cacheWriteTokens: number;
   outputTokens: number;
   /**
    * Failed and truncated requests. Client aborts (`cancelled`, rendered 499)
@@ -129,6 +136,8 @@ export interface UsageChartBucket {
   requests: number;
   input: number;
   cached: number;
+  /** Prompt-cache writes summed for this bucket. */
+  cacheWriteTokens: number;
   output: number;
 }
 export interface UsageChartResponse {
@@ -142,6 +151,8 @@ export interface UsageByRow {
   cached: number;
   total: number;
   errors: number;
+  /** Prompt-cache writes summed for this group. */
+  cacheWriteTokens: number;
   /** Null when no row in the group carries persisted cost. */
   costUsd: number | null;
   /** Resolved API key label for the `key` dimension; absent otherwise. */
@@ -169,7 +180,7 @@ export interface UsageCacheResponse {
   period: string;
   inputTokens: number;
   cachedTokens: number;
-  /** Always zero: cache-write tokens are not tracked by the telemetry schema. */
+  /** Prompt-cache writes, summed from `telemetry_events.cache_write_tokens`. */
   cacheWriteTokens: number;
   hitRate: number;
 }
@@ -218,6 +229,7 @@ export interface UsageRequestItem {
   inputTokens?: number;
   outputTokens?: number;
   cachedTokens?: number;
+  cacheWriteTokens?: number;
   reasoningTokens?: number;
   totalTokens?: number;
   ttfbMs?: number;

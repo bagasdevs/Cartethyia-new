@@ -11,7 +11,7 @@
 import { describe, expect, test } from "bun:test";
 import { accumulate, emptyTotals, type TelemetryEventRecord } from "../../src/observability/event-log";
 
-function event(inputTokens: number, cachedInputTokens: number | null): TelemetryEventRecord {
+function event(inputTokens: number, cachedInputTokens: number | null, cacheWriteTokens: number | null = null): TelemetryEventRecord {
   return {
     id: "e",
     createdAt: "2026-01-01T00:00:00.000Z",
@@ -36,6 +36,7 @@ function event(inputTokens: number, cachedInputTokens: number | null): Telemetry
     errorCategory: null,
     inputTokens,
     cachedInputTokens,
+    cacheWriteTokens,
     outputTokens: 0,
     reasoningTokens: null,
     estimatedCostUsd: null,
@@ -54,5 +55,13 @@ describe("cached token totals", () => {
     accumulate(totals, event(500, null));
     expect(totals.inputTokens).toBe(1_500);
     expect(totals.cachedTokens).toBe(900);
+  });
+
+  test("cache-write tokens are accumulated separately from cached reads", () => {
+    const totals = emptyTotals();
+    accumulate(totals, event(1_000, 900, 250));
+    accumulate(totals, event(500, null));
+    expect(totals.cachedTokens).toBe(900);
+    expect(totals.cacheWriteTokens).toBe(250);
   });
 });

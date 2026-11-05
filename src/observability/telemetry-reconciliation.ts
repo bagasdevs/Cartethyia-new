@@ -174,6 +174,7 @@ function toRow(event: TelemetryEventRecord): typeof telemetryEvents.$inferInsert
     errorOrigin: event.errorOrigin,
     inputTokens: event.inputTokens,
     cachedInputTokens: event.cachedInputTokens,
+    cacheWriteTokens: event.cacheWriteTokens,
     outputTokens: event.outputTokens,
     reasoningTokens: event.reasoningTokens,
     estimatedCostUsd:

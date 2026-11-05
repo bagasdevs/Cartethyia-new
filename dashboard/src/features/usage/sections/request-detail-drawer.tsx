@@ -388,7 +388,7 @@ export function RequestDetailDrawer({
               <FlowNode
                 icon={<Route size={13} />}
                 title="Gateway"
-                meta={`${formatDuration(detail.durationMs)} total · TTFT ${formatDuration(detail.ttfbMs)} · ${formatSpeed(detail.tokensPerSec)} · ${detail.cachedTokens !== undefined ? formatNumber(detail.cachedTokens) : "—"} from cache`}
+                meta={`${formatDuration(detail.durationMs)} total · TTFT ${formatDuration(detail.ttfbMs)} · ${formatSpeed(detail.tokensPerSec)} · ${detail.cachedTokens !== undefined ? formatNumber(detail.cachedTokens) : "—"} from cache${detail.cacheWriteTokens !== undefined ? ` · ${formatNumber(detail.cacheWriteTokens)} cache writes` : ""}`}
               />
               <FlowNode
                 icon={<Server size={13} />}
