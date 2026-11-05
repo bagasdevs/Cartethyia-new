@@ -42,19 +42,13 @@ export const IS_GATEWAY_ERROR_SQL = gatewayErrorSql(telemetryEvents.status, tele
  * zero rather than null.
  */
 /**
- * Cached-token aggregate under the "eligible request" rule.
- *
- * A request that carried any cached input (`cached_input_tokens > 0`) is a
- * cache hit, and the WHOLE prompt is read as cached — the operator's rule is
- * binary per request, not proportional (see the Usage page's "Cached tokens"
- * tile and the provider Activity Matrix). So the aggregate is the sum of
- * `input_tokens` over rows with a positive cached count, not the sum of the
- * cached counts themselves.
- *
- * This reuses the same column the row-level estimator writes
- * (`cached_input_tokens`), so it stays consistent across SQLite and Postgres.
+ * Cached tokens are the sum of the provider-reported cached subset, not the
+ * whole input of every cache-touching request. A partial hit still carries
+ * fresh tokens, and counting the whole prompt made live WorkBuddy traffic read
+ * ~99% while its counters summed to ~49%. Row-level `accumulate`, the request
+ * list, and this SQL reader must agree on the same column.
  */
-const CACHED_INPUT_TOKENS_SQL = sql<number>`coalesce(sum(case when ${telemetryEvents.cachedInputTokens} > 0 then ${telemetryEvents.inputTokens} else 0 end), 0)`;
+const CACHED_INPUT_TOKENS_SQL = sql<number>`coalesce(sum(${telemetryEvents.cachedInputTokens}), 0)`;
 
 const AGGREGATE_SELECT = {
   errors: sql<number>`sum(case when ${IS_GATEWAY_ERROR_SQL} then 1 else 0 end)`,

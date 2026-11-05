@@ -672,15 +672,16 @@ export class DrizzleObservabilityStore implements ObservabilityStore {
   private async computeCache(tenantId: string, period: string): Promise<UsageCacheResponse> {
     const { summary } = await summarizeUsageWithPerformance(this.db, tenantId, this.periodSince(period));
     const inputTokens = summary.inputTokens;
-    const outputTokens = summary.outputTokens;
     const cachedTokens = summary.cachedInputTokens;
-    const tokenTotal = inputTokens + outputTokens;
     return {
       period,
       inputTokens,
       cachedTokens,
       cacheWriteTokens: 0,
-      hitRate: tokenTotal > 0 ? (cachedTokens / tokenTotal) * 100 : 0,
+      // Same `cached / input` definition as computeSummary and computeHealth;
+      // including output tokens in the denominator made two Usage surfaces
+      // disagree on the same window.
+      hitRate: inputTokens > 0 ? (cachedTokens / inputTokens) * 100 : 0,
     };
   }
 

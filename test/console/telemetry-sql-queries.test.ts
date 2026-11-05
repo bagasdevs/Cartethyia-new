@@ -105,9 +105,9 @@ describe("canonical SQL telemetry reader", () => {
       expect(summary.requests).toBe(10);
       expect(summary.inputTokens).toBe(100);
       expect(summary.outputTokens).toBe(50);
-      // The "eligible request" rule: every row carries a positive cached count
-      // (1), so the whole prompt counts as cached.
-      expect(summary.cachedInputTokens).toBe(100);
+      // A partial hit contributes only its reported cached subset, not the
+      // whole prompt; ten rows of (10 input, 1 cached) sum to 10 cached.
+      expect(summary.cachedInputTokens).toBe(10);
       expect(summary.sampled).toBe(10);
       // Nearest-rank percentiles on SQLite: p50 <= p95 <= p99, in range.
       expect(summary.latencyMs.p50).not.toBeNull();
@@ -140,22 +140,22 @@ describe("canonical SQL telemetry reader", () => {
     }
   });
 
-  test("cached totals follow the eligible-request rule (any cache => whole input)", async () => {
+  test("cached totals sum the reported subset, not the whole input of hits", async () => {
     const fx = await fixture();
     try {
-      // Hit: carries cache -> whole input counts as cached.
+      // Partial hit: only 900 of the 1,000 prompt tokens came from cache.
       await insertEvent(fx, { inputTokens: 1_000, cachedInputTokens: 900 });
-      // Miss: no cache -> nothing counts as cached.
+      // Miss: no counter -> nothing counts as cached.
       await insertEvent(fx, { inputTokens: 500, cachedInputTokens: null });
-      // Miss: zero cache (reported unavailable as 0) -> nothing counts.
+      // Miss: a measured zero contributes nothing.
       await insertEvent(fx, { inputTokens: 300, cachedInputTokens: 0 });
       const { summary } = await summarizeUsageWithPerformance(fx.db, fx.tenantId, new Date(0));
       expect(summary.inputTokens).toBe(1_800);
-      expect(summary.cachedInputTokens).toBe(1_000);
+      expect(summary.cachedInputTokens).toBe(900);
 
       const groups = await breakdownTelemetry(fx.db, fx.tenantId, "model", new Date(0));
       const byKey = new Map(groups.map((group) => [group.key, group]));
-      expect(byKey.get("p/m")?.cachedInputTokens).toBe(1_000);
+      expect(byKey.get("p/m")?.cachedInputTokens).toBe(900);
     } finally {
       fx.cleanup();
     }
