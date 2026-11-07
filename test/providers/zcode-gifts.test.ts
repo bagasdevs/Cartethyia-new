@@ -156,7 +156,7 @@ describe("ZCode gift preview", () => {
     const incentive = {
       code: 0,
       data: { inviter: { invite_code: "REF123", rewards: [
-        { reward_type: "done", title: "Done Task", state: "completed", plan: { plan_id: "plan-done" } },
+        { reward_type: "done", title: "Done Task", state: "achieved", plan: { plan_id: "plan-done" } },
         { reward_type: "wip", title: "Wip Task", state: "in_progress", current: 1, target: 5, plan: { plan_id: "plan-wip" } },
       ] } },
     };
@@ -167,6 +167,7 @@ describe("ZCode gift preview", () => {
     expect(result.claimableCount).toBe(3);
     expect(result.plans.map((plan) => plan.source)).toEqual(["marketing", "preview", "incentive", "incentive"]);
     expect(result.plans[1]?.entitlements?.[0]?.grantUnits).toBe(500_000_000);
+    expect(result.plans[2]?.progress).toBeUndefined();
     expect(result.plans[3]?.progress).toEqual({ current: 1, target: 5, state: "in_progress" });
     expect(result.plans[2]?.inviteCode).toBe("REF123");
     expect(result.unread).toEqual([]);

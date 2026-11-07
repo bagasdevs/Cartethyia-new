@@ -231,7 +231,7 @@ async function toClaim(
         const target = Number(reward?.["target"]);
         const state = asTrimmedString(reward?.["state"]) ?? null;
         const hasProgress = Number.isFinite(current) && Number.isFinite(target);
-        const eligible = state === "completed" || (hasProgress && target > 0 && current >= target);
+        const eligible = (state === "completed" || state === "achieved") || (hasProgress && target > 0 && current >= target);
         // A reward with neither progress fields nor the completed state is a
         // malformed entry, not an unmet requirement — skip it like the claim
         // path always did.
@@ -348,7 +348,7 @@ export async function claimZcodeGifts(args: {
     // the claim skips it.
     const plans = discovered.filter((plan) =>
       plan.source !== "incentive" || plan.progress === undefined ||
-      plan.progress.state === "completed" ||
+      (plan.progress.state === "completed" || plan.progress.state === "achieved") ||
       (plan.progress.target > 0 && plan.progress.current >= plan.progress.target)
     );
     const skipped = discovered.length - plans.length;
@@ -418,7 +418,7 @@ export async function previewZcodeGifts(args: {
     const claimableCount = plans.filter((plan) =>
       plan.source !== "incentive" ||
       plan.progress === undefined ||
-      plan.progress.state === "completed" ||
+      (plan.progress.state === "completed" || plan.progress.state === "achieved") ||
       (plan.progress.target > 0 && plan.progress.current >= plan.progress.target)
     ).length;
     return { plans, claimableCount, unread };
