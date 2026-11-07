@@ -198,6 +198,19 @@ spendable balance.
 An upstream reset timestamp of zero means no reset deadline is available, not
 a reset in January 1970.
 
+ZCode **reset cards** (the regular Coding Plan, provider `zcode`) are the
+saved 5-hour and weekly rate-limit resets. The quota page's reset dialog reads
+them from `GET /api/v1/coding-plan/reset/status` (buckets
+`available_five_hour_resets` / `available_week_resets`, each entry a bare
+`expire_at` epoch second) and redeems through
+`POST /api/v1/coding-plan/reset/use` with `{ idempotency_key, reset_type }` —
+the upstream burns its own choice of card in that bucket, so a card id selects
+the type only. Unexpired cards are listed soonest-expiry first; expired
+entries are dropped, never shown. A failed status read is a retryable error,
+not an authoritative empty list. A confirmed redemption repairs the account in
+place exactly like the Codex/Claude resets (status `active`, cooldowns and
+model cooldowns cleared, health event written).
+
 `zcode-start` (displayed as **ZCode Start**) is separate from `zcode` (the regular Z.AI Coding Plan). Sign in
 with its device flow or import the ZCode login JWT; a Coding Plan API key or
 the short-lived Z.AI access token is not interchangeable. There is no refresh
@@ -232,11 +245,14 @@ Generation business-error envelopes are failures even when the upstream HTTP
 status is 200; they must not produce successful empty completions.
 
 The **Claim gifts** button in the provider account row is an explicit manual
-action; quota cards do not expose gift claims. It reads marketing banners, billing preview, and the
-incentive referral summary, then
-posts each offered `plan_id` to `/api/v1/zcode-plan/billing/claim`. An
-incentive reward is only claimed once its progress reached its target or it
-reports the completed state. A `zcode-v*-start-plan-*` id is never POSTed:
+action; quota cards do not expose gift claims. It opens a preview dialog that
+reads marketing banners, billing preview, and the
+incentive referral summary — every discovered plan shows its source,
+entitlements, and (for referral tasks) progress and invite code — without
+claiming anything. **Claim all** then
+posts each claimable `plan_id` to `/api/v1/zcode-plan/billing/claim`; a
+referral reward whose target is unmet is listed as **In progress** and skipped
+by the claim instead of drawing a rejection. A `zcode-v*-start-plan-*` id is never POSTed:
 activating the Start Plan free tier replays the client handshake
 (marketing touch → incentive summary → billing preview → billing balance) and
 judges success solely by an active start-plan row in the final balance. Claim codes

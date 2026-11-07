@@ -151,6 +151,37 @@ export interface GiftClaimResult {
   readonly detail: string | null;
 }
 
+/** One gift plan the preview dialog shows, mirroring the console GET payload. */
+export interface GiftPreviewPlan {
+  readonly planId: string;
+  readonly name: string | null;
+  readonly source: "marketing" | "preview" | "incentive";
+  readonly progress?: { readonly current: number; readonly target: number; readonly state: string | null };
+  readonly inviteCode?: string;
+  readonly entitlements?: readonly { readonly showName: string | null; readonly grantUnits: number | null }[];
+}
+
+/** Result of `GET /accounts/:id/claim-gifts` — what the upstream currently offers. */
+export interface GiftPreview {
+  readonly plans: readonly GiftPreviewPlan[];
+  readonly claimableCount: number;
+  readonly unread: readonly string[];
+}
+
+/** Reads the claimable-gift discovery without claiming; backs the preview dialog. */
+export function useAccountGiftPreview(accountId: string, enabled: boolean) {
+  return useQuery<GiftPreview>({
+    queryKey: queryKeys.quota.giftPreview(accountId),
+    queryFn: ({ signal }) =>
+      consoleRequest<GiftPreview & { readonly id: string }>(
+        `/accounts/${encodeURIComponent(accountId)}/claim-gifts`,
+        signal ? { signal } : undefined,
+      ),
+    enabled,
+    staleTime: 30_000,
+  });
+}
+
 /** Explicit operator action; new entitlements invalidate the cached quota views. */
 export function useClaimAccountGifts(accountId: string) {
   const queryClient = useQueryClient();
@@ -163,11 +194,14 @@ export function useClaimAccountGifts(accountId: string) {
       return result.data;
     },
     onSuccess: async (result) => {
-      if (result.claimed.length === 0) return;
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: queryKeys.quota.account(accountId), exact: true }),
-        queryClient.invalidateQueries({ queryKey: queryKeys.quota.all }),
-        queryClient.invalidateQueries({ queryKey: queryKeys.providers.all }),
+        // The preview dialog reads this key; a claim changes what is claimable.
+        queryClient.invalidateQueries({ queryKey: queryKeys.quota.giftPreview(accountId) }),
+        ...(result.claimed.length === 0 ? [] : [
+          queryClient.invalidateQueries({ queryKey: queryKeys.quota.account(accountId), exact: true }),
+          queryClient.invalidateQueries({ queryKey: queryKeys.quota.all }),
+          queryClient.invalidateQueries({ queryKey: queryKeys.providers.all }),
+        ]),
       ]);
     },
   });
@@ -524,11 +558,19 @@ export interface AccountResetResult {
   readonly creditId?: string;
 }
 
-const RESET_PROVIDER_IDS = new Set(["codex", "claude", "anthropic"]);
+/** Providers whose accounts carry redeemable saved rate-limit resets. */
+const RESET_ENABLED_PROVIDERS: Record<string, true> = {
+  anthropic: true,
+  claude: true,
+  codex: true,
+  // The Coding Plan hands out saved 5-hour/weekly reset cards that expire
+  // unused if nobody spends them.
+  zcode: true,
+};
 
-/** True when the account supports rate-limit reset redemption (Codex & Claude). */
+/** True when the account supports rate-limit reset redemption (Codex, Claude, ZCode). */
 export function supportsAccountReset(providerId: string): boolean {
-  return RESET_PROVIDER_IDS.has(providerId.trim().toLowerCase());
+  return RESET_ENABLED_PROVIDERS[providerId.trim().toLowerCase()] === true;
 }
 
 /**

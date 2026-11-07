@@ -28,6 +28,7 @@ import { authCredential, codexJwtAccountId, text } from "../quota/quota-contract
 import { getCodexVersion } from "./client-versions";
 import { buildCodexUserAgent } from "./cli-platform";
 import { TtlCache } from "../../persistence/ttl-cache";
+import { fetchZcodeResetCards, redeemZcodeResetCard, type ZcodeResetType } from "../integrations/zcode/reset-cards";
 
 /** One redeemable (or already-spent) saved reset. */
 export interface ResetCredit {
@@ -111,7 +112,9 @@ export function invalidateResetCreditsCache(accountId: string): void {
 
 export function supportsAccountReset(providerId: string): boolean {
   const norm = providerId.trim().toLowerCase();
-  return norm === "codex" || norm === "claude" || norm === "anthropic";
+  // zcode (the Coding Plan) hands out saved 5-hour/weekly reset cards that
+  // expire unused if nobody spends them; see `integrations/zcode/reset-cards`.
+  return norm === "codex" || norm === "claude" || norm === "anthropic" || norm === "zcode";
 }
 
 function isClaude(providerId: string): boolean {
@@ -256,6 +259,20 @@ export async function listAccountResetCredits(
     // Cedar answered authoritatively with nothing to spend.
     if (cedar !== null) return normalizeCedar(cedar);
     return null;
+  }
+
+  if (providerId.trim().toLowerCase() === "zcode") {
+    const list = await fetchZcodeResetCards(credentialRaw, fetcher);
+    if (list === null) return null;
+    return {
+      credits: list.cards.map((card) => ({
+        id: card.id,
+        status: "available",
+        title: card.type === "FIVE_HOUR" ? "5-hour rate-limit reset" : "Weekly rate-limit reset",
+        expiresAt: card.expiresAt,
+      })),
+      availableCount: list.availableCount,
+    };
   }
 
   return null;
@@ -615,6 +632,50 @@ export async function consumeAccountResetCredit(args: {
         }
       }
     }
+  } else if (norm === "zcode") {
+    // The ZCode endpoint burns a card from the named bucket and carries no
+    // per-card id, so the caller's creditId (`FIVE_HOUR_*` / `WEEK_*`) picks
+    // the type only. Without one, spend the soonest-expiring card — the same
+    // perishability rule the Codex/Claude branches follow.
+    let type: ZcodeResetType | null = null;
+    if (args.creditId) {
+      if (args.creditId.startsWith("WEEK_")) type = "WEEK";
+      else if (args.creditId.startsWith("FIVE_HOUR_")) type = "FIVE_HOUR";
+      else {
+        return {
+          ok: false,
+          code: "invalid_credit",
+          status: 400,
+          message: "The reset credit id is not valid for ZCode",
+          creditId: args.creditId,
+        };
+      }
+    } else {
+      const list = await listAccountResetCredits(providerId, credentialRaw, fetcher);
+      const selected = pickSoonestExpiringCredit(list?.credits ?? []);
+      const selectedType = selected === undefined
+        ? null
+        : selected.id.startsWith("WEEK_")
+          ? "WEEK"
+          : selected.id.startsWith("FIVE_HOUR_")
+            ? "FIVE_HOUR"
+            : null;
+      type = selectedType;
+    }
+    if (type === null) {
+      result = {
+        ok: false,
+        code: "no_credit",
+        status: 0,
+        message: "No available reset credits found",
+      };
+    } else {
+      result = await redeemZcodeResetCard(credentialRaw, type, fetcher);
+      // The shared repair path reads `creditId`; surface the bucket card here.
+      if (result.code !== "missing_credential") {
+        result = { ...result, creditId: `${type}_spent` };
+      }
+    }
   } else {
     return {
       ok: false,
@@ -642,6 +703,8 @@ function describeResetCode(code: string): string {
       return "That reset was already redeemed";
     case "nothing_to_reset":
       return "No window is currently limited";
+    case "already_used":
+      return "That reset was already redeemed";
     case "no_credit":
       return "No saved reset credit is available";
     case "auth_error":

@@ -10,6 +10,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- **ZCode: gift claims now show what they will claim before claiming.** The
+  Claim gifts button opens a preview dialog listing every discovered plan with
+  its source (marketing banner, billing preview, referral task), entitlements,
+  and task progress; only claimable plans are counted, and an unmet referral
+  target is skipped by the claim instead of surfacing a rejection. Backed by
+  `GET /accounts/:id/claim-gifts` (preview) beside the existing claim POST.
+- **ZCode: saved rate-limit reset cards are now redeemable in the dashboard.**
+  The regular Coding Plan hands out 5-hour and weekly reset credits that
+  expire unused if nobody spends them; xrouter carried the only implementation.
+  The quota page's existing reset dialog now lists a `zcode` account's unexpired
+  cards (soonest expiry first) and redeems through
+  `POST /api/v1/coding-plan/reset/use` with an idempotency key; a confirmed
+  redemption repairs the account in place like the Codex/Claude resets.
+
 ### Changed
 
 - **ZCode Start: official request identity, gift discovery, and current client
