@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { claimZcodeGifts } from "../../src/providers/integrations/zcode-start-plan/gifts";
+import { claimZcodeGifts, previewZcodeGifts } from "../../src/providers/integrations/zcode-start-plan/gifts";
 import type { ValidatedFetch } from "../../src/network/outbound-fetch";
 
 const emptyFeed = { code: 0, data: { deliveries: [] } };
@@ -145,5 +145,47 @@ describe("ZCode gift outcomes", () => {
     const upstream = fixture(feed, emptyPreview);
     expect((await claim(upstream.fetcher)).state).toBe("error");
     expect(upstream.posts()).toBe(0);
+  });
+});
+
+describe("ZCode gift preview", () => {
+  const previewOf = (fetcher: ValidatedFetch) =>
+    previewZcodeGifts({ accountId: "fixture", credential: "dummy-secret", fetcher });
+
+  test("lists sources with metadata and counts only claimable plans", async () => {
+    const incentive = {
+      code: 0,
+      data: { inviter: { invite_code: "REF123", rewards: [
+        { reward_type: "done", title: "Done Task", state: "completed", plan: { plan_id: "plan-done" } },
+        { reward_type: "wip", title: "Wip Task", state: "in_progress", current: 1, target: 5, plan: { plan_id: "plan-wip" } },
+      ] } },
+    };
+    const previewList = { code: 0, data: { plans: [{ plan_id: "plan-bill", name: "Billing Gift", entitlements: [{ show_name: "Tokens", grant_units: 500_000_000 }] }] } };
+    const feed = { code: 0, data: { deliveries: [{ banner: { buttons: [{ action: { type: "claim_zcode_plan", args: { plan_id: "plan-banner" } } }] } }] } };
+    const result = await previewOf(fixture(feed, previewList, [], incentive).fetcher);
+    // banner + billing + completed task are claimable; the in-progress task is not.
+    expect(result.claimableCount).toBe(3);
+    expect(result.plans.map((plan) => plan.source)).toEqual(["marketing", "preview", "incentive", "incentive"]);
+    expect(result.plans[1]?.entitlements?.[0]?.grantUnits).toBe(500_000_000);
+    expect(result.plans[3]?.progress).toEqual({ current: 1, target: 5, state: "in_progress" });
+    expect(result.plans[2]?.inviteCode).toBe("REF123");
+    expect(result.unread).toEqual([]);
+  });
+
+  test("a preview that read nothing is an error state, not an empty success", async () => {
+    const result = await previewOf(fixture("not-json", "not-json", [], "not-json").fetcher);
+    expect(result.plans).toEqual([]);
+    expect(result.claimableCount).toBe(0);
+    expect(result.unread).toHaveLength(3);
+  });
+
+  test("preview never issues a claim POST", async () => {
+    let posts = 0;
+    const fetcher: ValidatedFetch = async (_url, init) => {
+      if (init?.method === "POST") posts += 1;
+      return Response.json({ code: 0, data: {} });
+    };
+    await previewOf(fetcher);
+    expect(posts).toBe(0);
   });
 });

@@ -57,7 +57,7 @@ import {
   DrizzleQoderNativeIdentityStore,
   type QoderNativeIdentityStore,
 } from "../../providers/integrations/qoder/qoder-native-identity-store";
-import { claimZcodeGifts, type ZcodeGiftResult } from "../../providers/integrations/zcode-start-plan/gifts";
+import { claimZcodeGifts, previewZcodeGifts, type ZcodeGiftPreview, type ZcodeGiftResult } from "../../providers/integrations/zcode-start-plan/gifts";
 import { ZCODE_START_PLAN_PROVIDER_ID } from "../../providers/integrations/zcode-start-plan/provider";
 import {
   supportsAccountReset,
@@ -1073,6 +1073,58 @@ export function registerAccountQuotaTenantRoutes(
       };
     })
     // Gift grants are an explicit action, not a side effect of a quota read.
+    // GET previews what the upstream currently offers (marketing banners,
+    // billing preview, incentive rewards) without claiming anything; POST
+    // claims every claimable plan.
+    .get("/accounts/:id/claim-gifts", async ({ request, params, set }) => {
+      const access = requireTenantScope(accessResolver(request), "dashboard:read");
+      const rows = await db
+        .select()
+        .from(providerAccounts)
+        .where(
+          and(eq(providerAccounts.id, params.id), eq(providerAccounts.tenantId, access.tenantId)),
+        )
+        .limit(1);
+      const account = rows[0];
+      if (!account) {
+        set.status = 404;
+        return { error: `Account ${params.id} not found`, code: "not_found" };
+      }
+      if (account.providerId !== ZCODE_START_PLAN_PROVIDER_ID) {
+        set.status = 400;
+        return {
+          error: `Gift plans are only claimable for ${ZCODE_START_PLAN_PROVIDER_ID}`,
+          code: "gifts_unsupported",
+        };
+      }
+      let preview: ZcodeGiftPreview;
+      try {
+        const credential = await refreshDeps.resolveCredential(account.providerId as ProviderId, account.id);
+        const fetcher = networkBindingFactory
+          ? await dailyCheckinEgressForPass({ db, networkBindingFactory })(account.id, access.tenantId)
+          : globalThis.fetch;
+        preview = await previewZcodeGifts({ accountId: account.id, credential, fetcher });
+      } catch {
+        set.status = 502;
+        return {
+          ok: false,
+          status: 502,
+          data: { plans: [], claimableCount: 0, unread: ["Gift preview request failed"] },
+          message: "Gift preview request failed",
+          code: "gift_preview_failed",
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        data: { id: account.id, ...preview },
+        message: preview.claimableCount > 0
+          ? `${preview.claimableCount} gift plan(s) claimable`
+          : preview.plans.length > 0
+            ? "No claimable gift plan yet"
+            : (preview.unread.join("; ") || "No gift plan offered"),
+      };
+    })
     .post("/accounts/:id/claim-gifts", async ({ request, params, set }) => {
       const access = requireTenantScope(accessResolver(request), "dashboard:write");
       const rows = await db

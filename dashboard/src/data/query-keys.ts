@@ -89,6 +89,7 @@ export const queryKeys = {
     all: ["console", "quota"] as const,
     account: (accountId: string) => ["console", "quota", "account", accountId] as const,
     resets: (accountId: string) => ["console", "quota", "account", accountId, "resets"] as const,
+    giftPreview: (accountId: string) => ["console", "quota", "account", accountId, "gift-preview"] as const,
   },
   /**
    * InferHub market data. Deliberately has **no** `refetchInterval` anywhere it

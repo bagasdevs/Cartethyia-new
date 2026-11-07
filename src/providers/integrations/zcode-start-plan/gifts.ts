@@ -21,7 +21,7 @@
  */
 import { createHash } from "node:crypto";
 import { sleep } from "../../../shared/sleep";
-import { asRecord, asTrimmedString } from "../../../shared/coerce";
+import { asCoercedNumber, asRecord, asTrimmedString } from "../../../shared/coerce";
 import type { ValidatedFetch } from "../../../network/outbound-fetch";
 
 const ZCODE = "https://zcode.z.ai";
@@ -122,6 +122,19 @@ async function read(
   return { ok: data !== undefined && data !== null, data: data ?? null };
 }
 
+/** One discovered gift plan, as the preview dialog renders it. */
+export interface ZcodeGiftPlan {
+  readonly planId: string;
+  readonly name: string | null;
+  /** Where the plan was discovered: a marketing banner, billing preview, or a referral reward. */
+  readonly source: "marketing" | "preview" | "incentive";
+  /** Referral task progress; present only for incentive rewards. */
+  readonly progress?: { readonly current: number; readonly target: number; readonly state: string | null };
+  readonly inviteCode?: string | undefined;
+  /** Billing-preview entitlements, when the plan lists them. */
+  readonly entitlements?: readonly { readonly showName: string | null; readonly grantUnits: number | null }[];
+}
+
 /**
  * Every plan the account may claim, once each. A `null` for a list means it
  * did not read — never "nothing to claim".
@@ -130,14 +143,14 @@ async function toClaim(
   fetcher: ValidatedFetch,
   credential: string,
   accountId: string,
-): Promise<{ plans: Array<{ planId: string; name: string | null }>; unread: string[] }> {
-  const plans: Array<{ planId: string; name: string | null }> = [];
+): Promise<{ plans: ZcodeGiftPlan[]; unread: string[] }> {
+  const plans: ZcodeGiftPlan[] = [];
   const unread: string[] = [];
   const seen = new Set<string>();
-  const add = (planId: string, name: string | null): void => {
-    if (seen.has(planId)) return;
-    seen.add(planId);
-    plans.push({ planId, name });
+  const add = (plan: ZcodeGiftPlan): void => {
+    if (seen.has(plan.planId)) return;
+    seen.add(plan.planId);
+    plans.push(plan);
   };
 
   try {
@@ -151,7 +164,7 @@ async function toClaim(
       for (const delivery of Array.isArray(deliveries) ? deliveries : []) {
         const banner = bannerClaims(delivery);
         if (banner.malformed) unread.push("marketing feed has an invalid claim action");
-        for (const claim of banner.plans) add(claim.planId, claim.name ?? claim.planId);
+        for (const claim of banner.plans) add({ planId: claim.planId, name: claim.name ?? claim.planId, source: "marketing" });
       }
     }
   } catch {
@@ -176,7 +189,19 @@ async function toClaim(
           unread.push("billing preview has an invalid plan");
           continue;
         }
-        add(planId, asTrimmedString(plan?.["name"]) ?? planId);
+        const entitlements = Array.isArray(plan?.["entitlements"]) ? plan?.["entitlements"] : [];
+        add({
+          planId,
+          name: asTrimmedString(plan?.["name"]) ?? planId,
+          source: "preview",
+          ...(entitlements.length > 0 ? { entitlements: entitlements.map((raw) => {
+            const entitlement = asRecord(raw);
+            return {
+              showName: asTrimmedString(entitlement?.["show_name"]) ?? null,
+              grantUnits: asCoercedNumber(entitlement?.["grant_units"]) ?? null,
+            };
+          }) } : {}),
+        });
       }
     }
   } catch {
@@ -185,7 +210,9 @@ async function toClaim(
 
   // Referral/incentive rewards (event gifts such as Weekend/Global Build)
   // live on their own endpoint, not in billing preview. A reward that reached
-  // its target (or the completed state) is claimable via the same claim POST.
+  // its target (or the completed state) is claimable via the same claim POST;
+  // an in-progress one is listed so the operator sees the requirement instead
+  // of a bare "nothing to claim".
   try {
     const incentive = await read(fetcher, `${ZCODE}/api/v1/incentive/referral/summary`, credential, accountId);
     if (!incentive.ok) unread.push("incentive summary did not read");
@@ -193,6 +220,7 @@ async function toClaim(
       const inviter = asRecord(incentive.data?.["inviter"]);
       const rewards = inviter?.["rewards"];
       if (rewards != null && !Array.isArray(rewards)) unread.push("incentive summary has no reward list");
+      const inviteCode = asTrimmedString(inviter?.["invite_code"]);
       for (const entry of Array.isArray(rewards) ? rewards : []) {
         const reward = asRecord(entry);
         const plan = asRecord(reward?.["plan"]);
@@ -201,10 +229,20 @@ async function toClaim(
         if (planId === undefined) continue;
         const current = Number(reward?.["current"]);
         const target = Number(reward?.["target"]);
-        const eligible = reward?.["state"] === "completed" ||
-          (Number.isFinite(current) && Number.isFinite(target) && target > 0 && current >= target);
-        if (!eligible) continue;
-        add(planId, asTrimmedString(reward?.["title"]) ?? asTrimmedString(plan?.["name"]) ?? planId);
+        const state = asTrimmedString(reward?.["state"]) ?? null;
+        const hasProgress = Number.isFinite(current) && Number.isFinite(target);
+        const eligible = state === "completed" || (hasProgress && target > 0 && current >= target);
+        // A reward with neither progress fields nor the completed state is a
+        // malformed entry, not an unmet requirement — skip it like the claim
+        // path always did.
+        if (!eligible && !hasProgress && state !== "in_progress") continue;
+        add({
+          planId,
+          name: asTrimmedString(reward?.["title"]) ?? asTrimmedString(plan?.["name"]) ?? planId,
+          source: "incentive",
+          ...(hasProgress ? { progress: { current, target, state } } : {}),
+          ...(inviteCode !== undefined ? { inviteCode } : {}),
+        });
       }
     }
   } catch {
@@ -304,11 +342,20 @@ export async function claimZcodeGifts(args: {
   const { accountId, credential, fetcher } = args;
   if (!credential) return { state: "error", claimed: [], detail: "account has no credential" };
   try {
-    const { plans, unread } = await toClaim(fetcher, credential, accountId);
+    const { plans: discovered, unread } = await toClaim(fetcher, credential, accountId);
+    // An incentive reward whose target is unmet would only draw a rejection
+    // from the claim POST; it is "not yet", not a failure. Preview lists it;
+    // the claim skips it.
+    const plans = discovered.filter((plan) =>
+      plan.source !== "incentive" || plan.progress === undefined ||
+      plan.progress.state === "completed" ||
+      (plan.progress.target > 0 && plan.progress.current >= plan.progress.target)
+    );
+    const skipped = discovered.length - plans.length;
     if (plans.length === 0) {
       return unread.length > 0
         ? { state: "error", claimed: [], detail: unread.join("; ") }
-        : { state: "nothing", claimed: [], detail: null };
+        : { state: "nothing", claimed: [], detail: skipped > 0 ? `${skipped} reward(s) have not met their target yet` : null };
     }
     const claimed: string[] = [];
     const already: string[] = [];
@@ -339,5 +386,43 @@ export async function claimZcodeGifts(args: {
       claimed: [],
       detail: "Gift claim request failed",
     };
+  }
+}
+
+/** Result of {@link previewZcodeGifts}: what the account could claim right now. */
+export interface ZcodeGiftPreview {
+  readonly plans: readonly ZcodeGiftPlan[];
+  /**
+   * Claimable now = marketing/preview plans (they answer the claim POST) plus
+   * incentive rewards whose target is met. In-progress rewards are listed but
+   * flagged, so the operator sees the requirement instead of an empty list.
+   */
+  readonly claimableCount: number;
+  readonly unread: readonly string[];
+}
+
+/**
+ * Reads every discovery source without claiming anything. The read failures
+ * surface as `unread` — a preview that read nothing is an error state, never
+ * a silent "no gifts".
+ */
+export async function previewZcodeGifts(args: {
+  readonly accountId: string;
+  readonly credential: string;
+  readonly fetcher: ValidatedFetch;
+}): Promise<ZcodeGiftPreview> {
+  const { accountId, credential, fetcher } = args;
+  if (!credential) return { plans: [], claimableCount: 0, unread: ["account has no credential"] };
+  try {
+    const { plans, unread } = await toClaim(fetcher, credential, accountId);
+    const claimableCount = plans.filter((plan) =>
+      plan.source !== "incentive" ||
+      plan.progress === undefined ||
+      plan.progress.state === "completed" ||
+      (plan.progress.target > 0 && plan.progress.current >= plan.progress.target)
+    ).length;
+    return { plans, claimableCount, unread };
+  } catch {
+    return { plans: [], claimableCount: 0, unread: ["Gift preview request failed"] };
   }
 }
