@@ -10,6 +10,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+
+- **ZCode Start: official request identity, gift discovery, and current client
+  version (xrouter reference).** Dispatches now carry the desktop client's
+  `metadata.user_id` (JSON `{ device_id, account_uuid, session_id }`, device id
+  = the persisted install id), whose absence is a documented upstream soft-block
+  trigger. Claim-gift discovery additionally reads the incentive referral
+  summary so event rewards (Weekend/Global Build style) become claimable once
+  their progress target is met, and a `zcode-v*-start-plan-*` id activates
+  through the client's four-step handshake instead of a claim POST that the
+  endpoint rejects. Billing/gift requests identify as `ZCode/3.17.1`.
+
 ### Fixed
 
 - **Qoder: provider request/response capture now shows the gRPC chat call,

@@ -5,7 +5,7 @@ import type { ValidatedFetch } from "../../src/network/outbound-fetch";
 const emptyFeed = { code: 0, data: { deliveries: [] } };
 const emptyPreview = { code: 0, msg: "" };
 
-function fixture(feed: unknown, preview: unknown, codes: readonly unknown[] = []) {
+function fixture(feed: unknown, preview: unknown, codes: readonly unknown[] = [], incentive: unknown = { code: 0, data: {} }) {
   let posts = 0;
   const signals: (AbortSignal | null | undefined)[] = [];
   const fetcher: ValidatedFetch = async (url, init) => {
@@ -14,7 +14,11 @@ function fixture(feed: unknown, preview: unknown, codes: readonly unknown[] = []
       const code = codes[posts++];
       return code === "not-json" ? new Response("not-json") : Response.json({ code });
     }
-    const body = String(url).includes("marketing/touch") ? feed : preview;
+    const body = String(url).includes("marketing/touch")
+      ? feed
+      : String(url).includes("incentive/referral")
+        ? incentive
+        : preview;
     return body === "not-json" ? new Response("not-json") : Response.json(body);
   };
   return { fetcher, signals, posts: () => posts };
@@ -56,7 +60,7 @@ describe("ZCode gift outcomes", () => {
       const result = await claim(upstream.fetcher);
       expect(result.state).toBe(state);
       expect(result.claimed).toEqual(code === 0 ? ["Gift 0"] : []);
-      expect(upstream.signals).toHaveLength(3);
+      expect(upstream.signals).toHaveLength(4);
       expect(upstream.signals.every((signal) => signal instanceof AbortSignal)).toBe(true);
     });
   }
@@ -98,5 +102,48 @@ describe("ZCode gift outcomes", () => {
     const result = await claim(async () => { throw new Error("Bearer dummy-secret"); });
     expect(result.state).toBe("error");
     expect(JSON.stringify(result)).not.toContain("dummy-secret");
+  });
+
+  test("a completed incentive reward is discovered and claimed", async () => {
+    const incentive = {
+      code: 0,
+      data: { inviter: { rewards: [{ reward_type: "build", title: "Weekend Build", state: "completed", plan: { plan_id: "plan-wk", name: "Weekend Build" } }] } },
+    };
+    const upstream = fixture(emptyFeed, emptyPreview, [0], incentive);
+    expect(await claim(upstream.fetcher)).toEqual({ state: "claimed", claimed: ["Weekend Build"], detail: null });
+    expect(upstream.posts()).toBe(1);
+  });
+
+  test("an in-progress incentive reward is not claimable", async () => {
+    const incentive = {
+      code: 0,
+      data: { inviter: { rewards: [{ reward_type: "build", title: "Weekend Build", state: "in_progress", current: 1, target: 5, plan: { plan_id: "plan-wk", name: "Weekend Build" } }] } },
+    };
+    expect((await claim(fixture(emptyFeed, emptyPreview, [], incentive).fetcher)).state).toBe("nothing");
+  });
+
+  test("an unread incentive summary is an error, never an empty list", async () => {
+    expect((await claim(fixture(emptyFeed, emptyPreview, [], "not-json").fetcher)).state).toBe("error");
+  });
+
+  test("a start-plan id activates through the handshake instead of the claim POST", async () => {
+    const feed = { code: 0, data: { deliveries: [{ banner: { buttons: [{ action: { type: "claim_zcode_plan", args: { plan_id: "zcode-v3-start-plan-0817" } } }] } }] } };
+    const balance = { code: 0, data: { plans: [{ plan_id: "zcode-v3-start-plan-0817", status: "active" }] } };
+    const fetcher: ValidatedFetch = async (url, init) => {
+      const target = String(url);
+      if (init?.method === "POST") throw new Error("claim POST must not run for the start plan");
+      if (target.includes("billing/balance")) return Response.json(balance);
+      if (target.includes("marketing/touch")) return Response.json(feed);
+      return Response.json({ code: 0, data: {} });
+    };
+    expect(await claimZcodeGifts({ accountId: "fixture", credential: "dummy-secret", fetcher }))
+      .toEqual({ state: "claimed", claimed: ["zcode-v3-start-plan-0817"], detail: null });
+  });
+
+  test("a start-plan handshake without an active plan is a failure, not a success", async () => {
+    const feed = { code: 0, data: { deliveries: [{ banner: { buttons: [{ action: { type: "claim_zcode_plan", args: { plan_id: "zcode-v3-start-plan-0817" } } }] } }] } };
+    const upstream = fixture(feed, emptyPreview);
+    expect((await claim(upstream.fetcher)).state).toBe("error");
+    expect(upstream.posts()).toBe(0);
   });
 });

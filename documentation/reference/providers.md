@@ -205,6 +205,10 @@ grant: sign in again if the session is expired or revoked. Requests use
 `https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages`, bearer auth,
 ZCode identity headers and the three-block client prompt. Caller instructions
 are appended inside the third block, not discarded or sent as a fourth block.
+Every dispatch carries the official `metadata.user_id` — a JSON string of
+`{ device_id, account_uuid, session_id }` — where `device_id` is the persisted
+install id and `session_id` is fresh per request; the edge validates the field
+and its absence is a documented soft-block trigger.
 
 Quota reads `GET /api/v1/zcode-plan/billing/balance`. Each balance keeps its
 `capabilities` model IDs, owning `user_plan_id`/`plan_id`, entitlement period,
@@ -228,8 +232,14 @@ Generation business-error envelopes are failures even when the upstream HTTP
 status is 200; they must not produce successful empty completions.
 
 The **Claim gifts** button in the provider account row is an explicit manual
-action; quota cards do not expose gift claims. It reads marketing banners and billing preview, then
-posts each offered `plan_id` to `/api/v1/zcode-plan/billing/claim`. Claim codes
+action; quota cards do not expose gift claims. It reads marketing banners, billing preview, and the
+incentive referral summary, then
+posts each offered `plan_id` to `/api/v1/zcode-plan/billing/claim`. An
+incentive reward is only claimed once its progress reached its target or it
+reports the completed state. A `zcode-v*-start-plan-*` id is never POSTed:
+activating the Start Plan free tier replays the client handshake
+(marketing touch → incentive summary → billing preview → billing balance) and
+judges success solely by an active start-plan row in the final balance. Claim codes
 `0`, `1003`, and `3007` mean claimed, already claimed, and CAPTCHA respectively.
 Complete CAPTCHA in the ZCode app. Unknown/unreadable replies are failures;
 mixed outcomes are partial, never an unconditional success. A successful

@@ -27,7 +27,7 @@ import type { ValidatedFetch } from "../../../network/outbound-fetch";
 const ZCODE = "https://zcode.z.ai";
 const BILLING = `${ZCODE}/api/v1/zcode-plan/billing`;
 const TOUCH = `${ZCODE}/api/v1/marketing/touch`;
-const APP_VERSION = "3.16.3";
+const APP_VERSION = "3.17.1";
 const PLATFORM = "linux-x64";
 const TIMEOUT_MS = 15_000;
 const CLAIMED_ALREADY = 1003;
@@ -56,6 +56,7 @@ function headers(credential: string, accountId: string): Record<string, string> 
     Authorization: `Bearer ${credential}`,
     Accept: "application/json",
     "Content-Type": "application/json",
+    "User-Agent": `ZCode/${APP_VERSION}`,
     "X-Device-Mid": deviceMid(accountId),
     "X-Client-Language": "en-US",
     "X-ZCode-App-Version": APP_VERSION,
@@ -182,7 +183,76 @@ async function toClaim(
     unread.push("billing preview did not read");
   }
 
+  // Referral/incentive rewards (event gifts such as Weekend/Global Build)
+  // live on their own endpoint, not in billing preview. A reward that reached
+  // its target (or the completed state) is claimable via the same claim POST.
+  try {
+    const incentive = await read(fetcher, `${ZCODE}/api/v1/incentive/referral/summary`, credential, accountId);
+    if (!incentive.ok) unread.push("incentive summary did not read");
+    else {
+      const inviter = asRecord(incentive.data?.["inviter"]);
+      const rewards = inviter?.["rewards"];
+      if (rewards != null && !Array.isArray(rewards)) unread.push("incentive summary has no reward list");
+      for (const entry of Array.isArray(rewards) ? rewards : []) {
+        const reward = asRecord(entry);
+        const plan = asRecord(reward?.["plan"]);
+        const planId = asTrimmedString(plan?.["plan_id"]) ?? asTrimmedString(reward?.["reward_type"])
+          ?? undefined;
+        if (planId === undefined) continue;
+        const current = Number(reward?.["current"]);
+        const target = Number(reward?.["target"]);
+        const eligible = reward?.["state"] === "completed" ||
+          (Number.isFinite(current) && Number.isFinite(target) && target > 0 && current >= target);
+        if (!eligible) continue;
+        add(planId, asTrimmedString(reward?.["title"]) ?? asTrimmedString(plan?.["name"]) ?? planId);
+      }
+    }
+  } catch {
+    unread.push("incentive summary did not read");
+  }
+
   return { plans, unread };
+}
+
+/**
+ * Runs the Start Plan activation handshake and confirms the plan went active.
+ * The individual GETs are best-effort — activation is judged only by the final
+ * balance read, the same signal the desktop client uses.
+ */
+async function startPlanHandshake(
+  fetcher: ValidatedFetch,
+  credential: string,
+  accountId: string,
+): Promise<boolean> {
+  const steps = [
+    `${TOUCH}?seq=1`,
+    `${ZCODE}/api/v1/incentive/referral/summary`,
+    `${BILLING}/preview?app_version=${APP_VERSION}`,
+  ];
+  for (const url of steps) {
+    try {
+      await fetcher(url, { method: "GET", headers: headers(credential, accountId), signal: AbortSignal.timeout(TIMEOUT_MS) });
+    } catch {
+      // A failed step does not stop the sequence; the balance read decides.
+    }
+  }
+  try {
+    const balance = await read(
+      fetcher,
+      `${BILLING}/balance?app_version=${APP_VERSION}`,
+      credential,
+      accountId,
+    );
+    if (!balance.ok || !balance.data) return false;
+    const plans = Array.isArray(balance.data["plans"]) ? balance.data["plans"] : [];
+    return plans.some((entry) => {
+      const plan = asRecord(entry);
+      return asTrimmedString(plan?.["status"])?.toLowerCase() === "active" &&
+        /^zcode-v\d+-start-plan-/.test(asTrimmedString(plan?.["plan_id"]) ?? "");
+    });
+  } catch {
+    return false;
+  }
 }
 
 /** Posts one claim and says what the body's own code means. */
@@ -192,6 +262,14 @@ async function claimOne(
   accountId: string,
   planId: string,
 ): Promise<"claimed" | "already_claimed" | "captcha" | "failed"> {
+  // The Start Plan free tier is provisioned by the client's sequential
+  // handshake (marketing touch → incentive summary → billing preview →
+  // billing balance), not by POSTing to the claim endpoint; that POST answers
+  // a rejection for this plan id.
+  if (/^zcode-v\d+-start-plan-/.test(planId)) {
+    const activated = await startPlanHandshake(fetcher, credential, accountId);
+    return activated ? "claimed" : "failed";
+  }
   let response = await fetcher(`${BILLING}/claim`, {
     method: "POST",
     headers: headers(credential, accountId),

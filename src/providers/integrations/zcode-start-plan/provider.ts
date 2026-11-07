@@ -42,6 +42,10 @@ function environmentBlock(provider: string, model: string): string {
 
 /** Identity headers every dispatch carries; the adapter adds Authorization. */
 async function identityHeaders(): Promise<Record<string, string>> {
+  const deviceMid = await getOrCreateInstallId("zcode-start-plan");
+  // `dress` reads this in the same dispatch; `prepareHeaders` runs before
+  // `preparePayload` (base-adapter dispatch order), so the value is always set.
+  memoizedDeviceMid = deviceMid;
   return {
     "user-agent": `ZCode/${APP_VERSION} ai-sdk/anthropic/3.0.81`,
     "http-referer": "https://zcode.z.ai",
@@ -58,7 +62,7 @@ async function identityHeaders(): Promise<Record<string, string>> {
     "x-zcode-session-type": "main",
     "x-zcode-trace-id": randomUUID(),
     // Keep the persisted install-id filename stable across the provider-ID rename.
-    "x-device-mid": await getOrCreateInstallId("zcode-start-plan"),
+    "x-device-mid": deviceMid,
     "anthropic-version": "2023-06-01",
   };
 }
@@ -67,8 +71,16 @@ async function identityHeaders(): Promise<Record<string, string>> {
  * Replaces the payload's system prompt with the ZCode three-block fingerprint.
  * A caller-supplied system prompt is folded into the third block, after the
  * environment text: a separate block is rejected with 3012.
+ *
+ * `prePayload` is a sync hook — the adapter does not await it — so the device
+ * id is memoized by `identityHeaders` (which runs first in the same dispatch)
+ * instead of being read from disk here.
  */
+let memoizedDeviceMid: string | undefined;
+
 function dress(payload: Loose, provider = "zcode"): void {
+  const deviceMid = memoizedDeviceMid ?? "unknown";
+  const sessionId = randomUUID();
   const model = typeof payload.model === "string" ? payload.model : "";
   const own: string[] = [];
   const system = payload.system;
@@ -93,6 +105,19 @@ function dress(payload: Loose, provider = "zcode"): void {
     cached(STABLE_SECTIONS.join("\n\n")),
     cached(tail),
   ];
+  // Official client identity: the JSON-serialized metadata.user_id the desktop
+  // app sends (ZCode repo `anthropic-request-metadata.ts`). The edge validates
+  // it; a missing field is a documented soft-block trigger (3012 under load).
+  payload.metadata = {
+    ...(payload.metadata && typeof payload.metadata === "object" && !Array.isArray(payload.metadata)
+      ? payload.metadata as Loose
+      : {}),
+    user_id: JSON.stringify({
+      device_id: deviceMid,
+      account_uuid: "",
+      session_id: sessionId,
+    }),
+  };
 }
 
 export const ZCODE_START_PLAN_MODELS: readonly ModelDefinition[] = [
@@ -125,7 +150,7 @@ export const ZCODE_START_PLAN_SPEC: ApiKeyProviderSpec = {
   base_url: ZCODE_START_PLAN_BASE_URL,
   endpoint_paths_by_wire_family: { messages: ZCODE_START_PLAN_ENDPOINT_PATH },
   buildExtraHeaders: () => identityHeaders(),
-  prePayload: (payload) => {
-    dress(payload as Loose);
+  prePayload: async (payload) => {
+    await dress(payload as Loose);
   },
 };

@@ -1,9 +1,9 @@
 import { asCoercedNumber, asRecord, asTrimmedString } from "../../../shared/coerce";
 import type { FetchLike, ProviderQuotaResult, ProviderQuotaWindow } from "../../quota/quota-contracts";
 
-const BALANCE_URL = "https://zcode.z.ai/api/v1/zcode-plan/billing/balance?app_version=3.16.3";
+const BALANCE_URL = "https://zcode.z.ai/api/v1/zcode-plan/billing/balance?app_version=3.17.1";
 const DEVICE_MID = "9f1b0d4e-3c2a-4e7b-9f1d-6a2c8b5e0d31";
-const APP_VERSION = "3.16.3";
+const APP_VERSION = "3.17.1";
 
 function instant(value: unknown): string | null {
   const seconds = asCoercedNumber(value);
@@ -64,6 +64,7 @@ export async function fetchZcodeStartPlanQuota(
       headers: {
         authorization: `Bearer ${credential}`,
         accept: "application/json",
+        "user-agent": `ZCode/${APP_VERSION}`,
         "x-device-mid": DEVICE_MID,
         "x-zcode-app-version": APP_VERSION,
         "x-client-language": "en-US",
