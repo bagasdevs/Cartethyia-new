@@ -188,6 +188,12 @@ export async function readMigrationLedgerStatus(
     sql.raw(`SELECT migration_id FROM ${MIGRATION_LEDGER_TABLE}`),
   );
   const applied = new Set(result.rows.map((row) => row.migration_id));
-  const pending = expected.filter((migrationId) => !applied.has(migrationId));
-  return { expected, pending, applied: pending.length === 0 };
+  const pending = expected.filter((migrationId) => {
+    if (applied.has(migrationId)) return false;
+    // If this migration was renamed and the old id is in the ledger, treat as applied.
+    for (const [oldId, newId] of Object.entries(KNOWN_RENAMED_MIGRATIONS)) {
+      if (migrationId === newId && applied.has(oldId)) return false;
+    }
+    return true;
+  });
 }
