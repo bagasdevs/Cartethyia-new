@@ -544,6 +544,7 @@ export async function applySqliteMigrations(
   for (const file of files) {
     const migrationId = migrationIdFor(file);
     if (applied.has(migrationId)) continue;
+    if (applied.has("0044_add_telemetry_cache_write_tokens.sql") && migrationId === "0046_add_telemetry_cache_write_tokens.sql") continue;
     const source = readFileSync(file, "utf8");
     const record = sqlite.prepare(
       `INSERT INTO ${MIGRATION_LEDGER_TABLE} (migration_id) VALUES (?)`,
