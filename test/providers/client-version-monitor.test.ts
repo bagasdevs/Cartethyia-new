@@ -4,7 +4,6 @@ import {
   _resetCodeBuddyCnVersionCache,
   _resetCodeBuddyVersionCache,
   _resetClineCliVersionCache,
-  _resetWorkBuddyCnClientVersionCache,
   buildCodeBuddyUserAgent,
   buildKiroAmzUserAgent,
   buildKiroSsoAmzUserAgent,
@@ -122,7 +121,7 @@ describe("opencode client version fallback", () => {
   test("the fallback is the current latest release", () => {
     // A cold process sends this before discovery resolves; if it lags the
     // upstream release the UA advertises a client build that no longer ships.
-    expect(VERSION_SOURCES.opencode.fallback).toBe("2.2.5");
+    expect(VERSION_SOURCES.opencode.fallback).toBe("2.2.6");
   });
 });
 
@@ -167,32 +166,14 @@ describe("client version monitor snapshot", () => {
     }
   });
 
-  test("uses the WorkBuddy CN update feed and keeps its client version independent", async () => {
-    expect(VERSION_SOURCES.workbuddyCnClient.sources[0]?.url).toBe(
-      "https://www.workbuddy.cn/v2/update?platform=workbuddy-win32-x64-user",
-    );
-    expect(VERSION_SOURCES.workbuddyCnClient.fallback).toBe("5.9.3.42398134");
-    await expect(
-      VERSION_SOURCES.workbuddyCnClient.sources[0]?.extract?.(
-        new Response(JSON.stringify({ productVersion: "5.7.7.40774747" })),
-      ),
-    ).resolves.toBe("5.7.7.40774747");
-    _resetWorkBuddyCnClientVersionCache("5.7.7.40774747");
-    try {
-      expect(pinnedClientVersions().some((entry) => entry.client === "workbuddy-cn")).toBe(false);
-    } finally {
-      _resetWorkBuddyCnClientVersionCache();
-    }
-  });
-
   test("uses current client feeds for Claude Code and Kiro", async () => {
-    expect(VERSION_SOURCES.claudeCli.fallback).toBe("2.1.314");
+    expect(VERSION_SOURCES.claudeCli.fallback).toBe("2.1.319");
     expect(VERSION_SOURCES.claudeCli.sources[0]?.url).toBe(
       "https://registry.npmjs.org/@anthropic-ai/claude-code/latest",
     );
     expect(VERSION_SOURCES.claudeSdk.fallback).toBe("0.128.0");
     expect(VERSION_SOURCES.claudeSdk.sources).toEqual([]);
-    expect(VERSION_SOURCES.kiro.fallback).toBe("1.4.62");
+    expect(VERSION_SOURCES.kiro.fallback).toBe("1.4.121");
     expect(VERSION_SOURCES.kiro.sources[0]?.url).toBe(
       "https://formulae.brew.sh/api/cask/kiro.json",
     );

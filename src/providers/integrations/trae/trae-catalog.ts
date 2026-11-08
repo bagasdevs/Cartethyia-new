@@ -37,7 +37,7 @@ export interface TraeModelRow {
 /** Which upstream endpoint serves a row. */
 export type TraeSurface = "chat" | "agent";
 
-/** CN roster: 20 chat-face models from the donor's client-state snapshot. */
+/** CN roster: 20 chat-face models from the client-state snapshot. */
 const TRAE_CN_ROWS: readonly TraeModelRow[] = [
   { id: "Doubao-Seed-Code", displayName: "Seed-Code", ctx: 256000, out: 224000, vision: true, reasoning: true },
   { id: "DeepSeek-V4-Flash-Official", displayName: "DeepSeek-V4-Flash", ctx: 1000000, out: 936000, vision: false, reasoning: true },
@@ -100,21 +100,16 @@ const TRAE_CN_ROWS: readonly TraeModelRow[] = [
  */
 const TRAE_INTL_ROWS: readonly TraeModelRow[] = [
   { id: "gpt-5.4", displayName: "GPT-5.4", ctx: 1_000_000, out: 128_000, vision: true, reasoning: true, surface: "agent" },
-  { id: "gpt-5.2", displayName: "GPT-5.2", ctx: 272000, out: 128_000, vision: true, reasoning: true, surface: "agent" },
   { id: "gpt-5.2-codex-paygo", displayName: "GPT-5.2-Codex", ctx: 272000, out: 128_000, vision: true, reasoning: true, surface: "agent" },
-  { id: "gpt-5.1-paygo", displayName: "GPT-5.1", ctx: 272000, out: 128_000, vision: true, reasoning: true, surface: "agent" },
-  { id: "gpt-5-paygo", displayName: "GPT-5", ctx: 272000, out: 128_000, vision: true, reasoning: true, surface: "agent" },
   { id: "Dola-Seed-2.0-Code", displayName: "Seed-2.1-Turbo", ctx: 1000000, out: 131_072, vision: true, reasoning: true, surface: "agent" },
-  { id: "deepseek-v4.1-flash", displayName: "DeepSeek-V4.1-Flash", ctx: 1000000, out: 384_000, vision: true, reasoning: true, surface: "agent" },
-  { id: "deepseek-v4-flash-0731", displayName: "DeepSeek-V4-Flash", ctx: 1000000, out: 384_000, vision: false, reasoning: true, surface: "agent" },
-  { id: "deepseek-v4-pro-0813", displayName: "DeepSeek-V4-Pro", ctx: 1000000, out: 384_000, vision: false, reasoning: true, surface: "agent" },
-  { id: "kimi-k3", displayName: "Kimi-K3", ctx: 1000000, out: 131_072, vision: true, reasoning: true, surface: "agent" },
-  { id: "kimi-k2.7-code", displayName: "Kimi-K2.7-Code", ctx: 1000000, out: 65_536, vision: true, reasoning: true, surface: "agent" },
-  { id: "kimi-k2.5", displayName: "Kimi-K2.5", ctx: 200000, out: 262_144, vision: false, reasoning: true, surface: "agent" },
-  { id: "gemini-3.1-pro", displayName: "Gemini-3.1-Pro-Preview", ctx: 1000000, out: 65_536, vision: true, reasoning: true, surface: "agent" },
-  { id: "gemini-3-flash-solo", displayName: "Gemini-3-Flash-Preview", ctx: 1000000, out: 65_536, vision: true, reasoning: true, surface: "agent" },
-  { id: "minimax-m3", displayName: "MiniMax-M3", ctx: 1000000, out: 512_000, vision: true, reasoning: true, surface: "agent" },
-  { id: "minimax-m2.7", displayName: "MiniMax-M2.7", ctx: 200000, out: 131_072, vision: false, reasoning: true, surface: "agent" },
+  { id: "gemini-3.1-pro-paygo", displayName: "Gemini-3.1-Pro-PayGo", ctx: 1000000, out: 65_536, vision: true, reasoning: true, surface: "agent" },
+  // Search-agent configs from the live picker (batch_get_detail_param). They
+  // resolve to real chat models — gpt-5.4 / gpt-5.3-codex / gemini-3-flash —
+  // and accept the same tool-calling wire as any agent row, so their specs
+  // mirror the model they resolve to (verified live 2026-11-06).
+  { id: "search_agent_gpt-5.4", displayName: "Search Agent (GPT-5.4)", ctx: 1_000_000, out: 128_000, vision: true, reasoning: true, surface: "agent" },
+  { id: "search_agent_gpt-5.3-codex", displayName: "Search Agent (GPT-5.3-Codex)", ctx: 272000, out: 128_000, vision: true, reasoning: true, surface: "agent" },
+  { id: "search_agent_gemini_3_pro_with_g3f", displayName: "Search Agent (Gemini-3-Flash)", ctx: 1000000, out: 65_536, vision: true, reasoning: true, surface: "agent" },
 ];
 
 function traeModels(rows: readonly TraeModelRow[], providerId: string): readonly ModelDefinition[] {

@@ -8,10 +8,9 @@
  * declarations.
  *
  * Only the row shape and the builder are shared. Identity headers are not:
- * `codebuddyHeaders` and `workbuddyHeaders` send genuinely different bytes
- * (`X-Product`/`X-IDE-Type`/`X-Domain` versus `origin`/`referer` and the
- * account-derived `x-user-id`/`x-machine-id`/`x-session-id`), and those stay
- * with their own provider.
+ * `codebuddyHeaders` sends genuinely different bytes per realm
+ * (`X-Product`/`X-IDE-Type`/`X-Domain` versus the CN CLI profile), and those
+ * stay with the provider.
  */
 import { GatewayError } from "../../../protocol/gateway-error";
 import { defineModel } from "../../provider-model-definition";
@@ -43,6 +42,7 @@ export const BUDDY_INTL_EFFORTS: Readonly<Record<string, readonly string[]>> = {
   "glm-5.3": ["low", "high", "max"],
   hy3: ["low", "high"],
   hy4: ["high"],
+  hy4free: ["high"],
 };
 export const BUDDY_CN_EFFORTS: Readonly<Record<string, readonly string[]>> = {
   "deepseek-v4-flash": ["low", "high", "max"],
@@ -54,6 +54,7 @@ export const BUDDY_CN_EFFORTS: Readonly<Record<string, readonly string[]>> = {
   "glm-5.3-flash": ["low", "high", "max"],
   hy3: ["low", "high"],
   hy4: ["high"],
+  hy4free: ["high"],
 };
 
 /** The image-generation ids the international buddy providers serve. */
@@ -75,9 +76,9 @@ const BUDDY_IMAGE_MODEL_IDS: readonly { id: string; endpoint: string; ctx: numbe
  * `seedance-2.5` is the text-to-video model the buddy facade exposes. It is a
  * distinct service kind (`videoGeneration`), not a chat or image row, so it is
  * built by {@link makeBuddyVideoModels} and reached through
- * `/videos/generations` (relative to each variant's own base, which is why the
- * WorkBuddy rows carry the `/v2` segment themselves) rather than a chat wire.
- * CodeBuddy CN is deliberately absent — it publishes a different roster.
+ * `/videos/generations` (relative to each variant's own base) rather than a
+ * chat wire. CodeBuddy CN is deliberately absent — it publishes a different
+ * roster.
  */
 const BUDDY_VIDEO_MODEL_IDS: readonly { id: string; endpoint: string; ctx: number; out: number }[] = [
   { id: "seedance-2.5", endpoint: "/videos/generations", ctx: 1_000_000, out: 128_000 },
@@ -191,7 +192,7 @@ export function makeBuddyCnVideoModels(
 /**
  * Ids the buddy facade refuses on a free plan.
  *
- * The international CodeBuddy and WorkBuddy catalogs share this roster and
+ * The international CodeBuddy catalog shares this roster and
  * the same Pro-tier model classification.
  *
  * Nothing in the console directory predicts it. `credits` does not — `kimi-k3`
@@ -229,12 +230,12 @@ export const BUDDY_PRO_ONLY_MODEL_IDS: ReadonlySet<string> = new Set([
 /**
  * Builds the image-generation rows for one buddy provider.
  *
- * Shared rather than copied per provider: cb and WorkBuddy serve the same image
+ * Shared rather than copied per provider: cb serves the same image
  * models from the same facade, so the roster and the declared capabilities are
  * one decision instead of two that drift. CodeBuddy CN is deliberately absent —
  * it publishes a different roster.
  *
- * `endpoint` is explicit because the two families disagree about the path their
+ * `endpoint` is explicit because the realms disagree about the path their
  * base URL expects, and a bare `defineModel` would infer the generic default
  * and produce a URL the upstream rejects.
  */
@@ -303,12 +304,9 @@ export const BUDDY_VIDEO_MODEL_ID_SET: ReadonlySet<string> = new Set(
  * Builds one buddy catalog row.
  *
  * `endpoint` is explicit rather than left to the generic `/chat/completions`
- * default because the two families disagree about it: CodeBuddy's base URL
- * carries a version segment the default joins onto correctly, while
- * WorkBuddy's does not — the default would produce
- * `https://www.workbuddy.ai/chat/completions`, which that upstream answers
- * with a 405 HTML page. Callers pass the endpoint their base URL actually
- * serves, and `undefined` for the default.
+ * default because the family's CN base URL differs from the intl one; callers
+ * pass the endpoint their base URL actually serves, and `undefined` for the
+ * default.
  */
 export function makeBuddyModel(
   entry: BuddyRawEntry,
@@ -340,14 +338,11 @@ export function makeBuddyModel(
 }
 
 /**
- * The shared model roster for the two international buddy sites.
+ * The shared model roster for the international buddy site.
  *
- * CodeBuddy intl and WorkBuddy serve the same model set from the same console
- * directory shape, so the two catalogs were kept as separate hand-written lists
- * and had already drifted: each carried ids the other lacked. One list is the
- * single source of truth, and each provider maps it with its own endpoint
- * (`workbuddy.ts` needs the explicit `/v2/chat/completions`, `codebuddy.ts`
- * takes the family default) — the endpoint is the only thing that differs.
+ * CodeBuddy intl serves the model set from the same console directory shape, so
+ * the catalog is one hand-written list as the single source of truth, mapped
+ * with the provider's own endpoint (`codebuddy.ts` takes the family default).
  *
  * CodeBuddy CN is deliberately NOT on this list: its console publishes a
  * different roster (its own `glm-5v-turbo` / `kimi-k3-1` ids and CN-specific
@@ -393,6 +388,7 @@ export const BUDDY_SHARED_RAW: readonly BuddyRawEntry[] = [
   ["grok-4.7", "Grok 4.7", true, true, 500_000, 128_000],
   ["hy3", "Hy3", true, true, 192_000, 64_000, true],
   ["hy4", "Hy4", true, true, 1_000_000, 64_000, true],
+  ["hy4free", "Hy4 Free", true, true, 1_000_000, 64_000, true],
   ["kimi-k2.5", "Kimi K2.5", true, false, 164_000, 262_144],
   ["kimi-k2.6", "Kimi K2.6", true, false, 256_000, 262_144],
   ["kimi-k2.7", "Kimi K2.7", true, false, 256_000, 65_536],

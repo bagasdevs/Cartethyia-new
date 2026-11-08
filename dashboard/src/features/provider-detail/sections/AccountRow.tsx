@@ -14,7 +14,7 @@ import { useUpdateProviderAccount } from "../../../hooks/providers";
 import { useRecoverAccount } from "../../../hooks/providers";
 import { useRefreshAccountQuota, type QuotaWindow } from "../../../hooks/quota";
 import { useMysteriousAccounts } from "../../../lib/privacy-mode";
-import { lastModelCooldownAt } from "../../../components/AccountCooldown";
+import { activeModelCooldowns, lastModelCooldownAt } from "../../../components/AccountCooldown";
 import { Button } from "../../../components/ui/button";
 import { HealthEventsModal } from "../../../components/HealthEventsModal";
 import { ClaimGiftsButton } from "../../../components/ClaimGiftsButton";
@@ -185,7 +185,23 @@ export function AccountRow({
   const disabled = account.status === "disabled";
   const cooldownUntilMs = account.cooldownUntil ? new Date(account.cooldownUntil).getTime() : NaN;
   const hasActiveCooldown = Number.isFinite(cooldownUntilMs) && cooldownUntilMs > Date.now();
-  const isRecoverable = account.status === "cooldown" || hasActiveCooldown;
+  // An account with per-model cooldowns is recoverable too: the account is
+  // active for other models, but these entries still exclude the (account,
+  // model) pairs through routing. Recover clears every one of them, so the
+  // button must appear whenever any per-model backoff is in force — not only
+  // when the account-wide status/cooldown says so.
+  const hasActiveModelCooldowns = activeModelCooldowns(account) !== undefined;
+  // An account carrying a recorded failure category is recoverable even when
+  // it is not in an account-wide cooldown: the quota-check path can stamp
+  // `rate_limit_transient` without moving status/cooldownUntil, and a stale
+  // category would otherwise render "Rate limited" with no way to clear it.
+  // `auth_invalidated` is the one category recover cannot fix (a re-login is
+  // required), so it stays excluded.
+  const hasRecoverableError =
+    typeof account.lastErrorCategory === "string" &&
+    account.lastErrorCategory.length > 0 &&
+    account.lastErrorCategory !== "auth_invalidated";
+  const isRecoverable = account.status === "cooldown" || hasActiveCooldown || hasActiveModelCooldowns || hasRecoverableError;
   const [showHistory, setShowHistory] = useState(false);
   const [showPoolHistory, setShowPoolHistory] = useState(false);
   const [editKeyOpen, setEditKeyOpen] = useState(false);

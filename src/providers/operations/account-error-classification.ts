@@ -10,6 +10,7 @@
 import { isRecord } from "../../protocol/codecs";
 import { GatewayError } from "../../protocol/gateway-error";
 import { BUDDY_PROVIDER_IDS } from "../provider-metadata";
+import type { AccountTier } from "./account-tier";
 import { parseProviderResetDuration, parseUpstreamBackoff } from "../../protocol/upstream-parsing";
 import {
   resolveAccountAuthRejectedCooldownMs,
@@ -23,6 +24,12 @@ import {
   resolveAccountUnclassifiedCooldownMs,
 } from "../../config/cooldowns";
 const DEFAULT_RATE_LIMIT_COOLDOWN_MS = resolveAccountRateLimitCooldownMs;
+/**
+ * Perch's `turn_rate_limited` window. The upstream does not state a reset and
+ * answers the same on every ticket mint while the window is exhausted, so a
+ * day matches the practical cadence and stops the redial loop.
+ */
+const PERCH_TURN_RATE_LIMIT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 /**
  * Inception's per-minute limit window (1 minute).
  *
@@ -83,7 +90,7 @@ const QODER_QUOTA_COOLDOWN_MS = 24 * 60 * 60 * 1000;
  * to be two constants, 24h for the content block and 6h for the channel one,
  * both applied on the first observation. That was wrong in the direction that
  * costs most: `11140` is also what a wrong desktop `User-Agent` brand answers
- * (`workbuddy/shared.ts`), so after we fixed a header regression every buddy
+ * (`codebuddy/shared.ts`), so after we fixed a header regression every buddy
  * account stayed dead for up to a further day, and one prompt that failed a
  * safety review cost a whole account a day. As a base it escalates through the
  * consecutive-failure ladder, which tells the two causes apart by what they do
@@ -259,6 +266,12 @@ export interface AccountFailureEvidence {
    * limit the provider said resets in 23 days.
    */
   readonly upstreamBody?: unknown;
+  /**
+   * The account's tier, derived from its plan (`mapPlanToTier`). Read only by
+   * the writer when it resolves tier-aware cooldown rules; the classifier
+   * itself does not branch on it.
+   */
+  readonly accountTier?: AccountTier;
 }
 
 export interface AccountErrorClassification {
@@ -299,6 +312,14 @@ export interface AccountErrorClassification {
    * apart — it needs to know whether to count the hit and escalate the window.
    */
   readonly modelUnsupported?: boolean;
+  /**
+   * Where the cooldown duration came from (D18). A duration resolved from a
+   * tier/provider rule (`provider-rule`) is a policy decision and must NOT go
+   * through `escalateFallbackCooldown` — the 1h escalation cap would cut the
+   * 24h Trae rule down to an hour on the first failure. Only a pure fallback
+   * (`fallback`) escalates.
+   */
+  readonly ruleSource?: "provider-rule" | "fallback";
 }
 
 /**
@@ -342,6 +363,26 @@ export function escalateFallbackCooldown(
   if (providerStated || cooldownMs <= 0) return cooldownMs;
   const level = Math.min(Math.max(0, consecutiveFailures), COOLDOWN_ESCALATION_MAX_LEVEL);
   return Math.min(cooldownMs * 2 ** level, resolveAccountCooldownEscalationMaxMs());
+}
+
+/**
+ * Returns a cooldown duration with the D18 escalation split applied.
+ *
+ * A duration that came from a tier/provider rule (`ruleSource === "provider-rule"`)
+ * is a policy decision and must never pass through
+ * {@link escalateFallbackCooldown}: the 1h cap would truncate the 24h Trae
+ * free-tier rule to one hour on the first failure. Only a pure fallback
+ * (`ruleSource === "fallback"`, or unset for callers that predate the split)
+ * escalates.
+ */
+export function applyRuleEscalation(
+  cooldownMs: number,
+  providerStated: boolean,
+  consecutiveFailures: number,
+  ruleSource: "provider-rule" | "fallback" | undefined,
+): number {
+  if (ruleSource === "provider-rule") return cooldownMs;
+  return escalateFallbackCooldown(cooldownMs, providerStated, consecutiveFailures);
 }
 
 /**
@@ -1590,6 +1631,30 @@ const ACCOUNT_ERROR_RULES: readonly AccountErrorRule[] = [
         cooldownMs,
         new Date(Date.now() + cooldownMs),
         s.reason("Inception per-minute input-token limit"),
+        s.origin === "upstream",
+      );
+    },
+  },
+  {
+    // Perch's `turn_rate_limited` is a per-turn API window, not a per-request
+    // 429: the account keeps answering but every call mints another ticket
+    // into the same exhausted window. The stated remedy ("contact us for
+    // direct API access") implies the window is long — park the account for a
+    // day so routing picks a sibling instead of hammering the same key.
+    name: "perch-turn-rate-limit",
+    match: (s) =>
+      s.origin === "upstream" &&
+      s.providerId === "perch" &&
+      (s.providerCode === "turn_rate_limited" ||
+        (s.statusCode === 429 && s.lower.includes("turn rate"))),
+    decide: (s) => {
+      const cooldownMs = s.statedCooldownMs ?? PERCH_TURN_RATE_LIMIT_COOLDOWN_MS;
+      return s.result(
+        "rate_limit_transient",
+        "cooldown",
+        cooldownMs,
+        new Date(Date.now() + cooldownMs),
+        s.reason("Perch turn rate limit"),
         s.origin === "upstream",
       );
     },

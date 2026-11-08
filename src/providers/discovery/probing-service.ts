@@ -47,7 +47,7 @@ import {
   grok407ProbeFailure,
   hasMeaningfulOutput,
   loadProbePreferences,
-  qoderCmodelProbePrompt,
+  PROBE_FAST_SAMPLE_MAX_CHARS,
   recordProbeHealth,
   resolveProbeAdapter,
   resolveProbeTarget,
@@ -188,14 +188,16 @@ export class ProviderProbingService {
     request: ProbeModelRequest,
   ): Promise<ProbeModelResult> {
     const startedAt = Date.now();
-    // Qoder's IDE surface is the only transport that echoes provider metadata
-    // (`provider_model`, `target`, …) in its raw_usage, so probes for Qoder
-    // default to it unless the operator picked a surface explicitly. This
-    // covers every entry point (single model, all models, all accounts).
+    // Qoder's legacy COSY surface is the only live chat transport since
+    // 2026-11-07 (the gRPC host is NXDOMAIN and the IDE `/model/v1` surface
+    // answers 404 on every alive host). Probes for Qoder default to it unless
+    // the operator picked a surface explicitly. The IDE surface also echoes
+    // provider metadata, but that is worthless when the surface itself is
+    // dead — a probe must report what live traffic would do.
     const normalizedRequest: ProbeModelRequest =
       (providerId === "qoder" || providerId === "qodercn") &&
       (request.surface === undefined || request.surface === "default")
-        ? { ...request, surface: "ide" }
+        ? { ...request, surface: "cosy" }
         : request;
     const modelId = normalizedRequest.modelId;
     // One provider snapshot per probe: the contract gate, the account gate, the
@@ -241,24 +243,29 @@ export class ProviderProbingService {
       };
     }
 
-    const { probeReasoning, payloadCapture } = await loadProbePreferences({
+    const preferences = await loadProbePreferences({
       db: this.db,
       tenantId,
       wireFamily,
       request,
     });
-    // Qoder's gRPC surface refuses a probe that asks a model to identify
-    // itself (406 from the upstream proxy) for one roster row (`cmodel`,
-    // virtual id `cantus`). dmodel/qmodel/smodel accept the identity prompt
-    // fine — only cmodel refuses it — so the workaround is scoped to that
-    // row, not to every Qoder probe, and never overrides an explicit prompt.
-    const qoderCmodelPrompt = qoderCmodelProbePrompt(providerId, modelId, normalizedRequest.prompt);
-    const probeRequest = qoderCmodelPrompt === undefined ? normalizedRequest : { ...normalizedRequest, prompt: qoderCmodelPrompt };
+    const { probeReasoning, payloadCapture } = preferences;
+    // `detail` is the exact pre-existing behaviour; only `fast` changes any
+    // budget. The identity prompt itself is shared by both modes (D42).
+    const fast = preferences.mode === "fast";
+    const probeTimeoutMs = preferences.timeoutMs ?? 30_000;
+    const probeSignal = AbortSignal.timeout(probeTimeoutMs);
     const canonicalRequest = buildProbeCanonicalRequest({
       modelId,
-      request: probeRequest,
+      request: normalizedRequest,
       probeReasoning,
       sourceSurface,
+      ...(preferences.maxOutputTokens === undefined
+        ? {}
+        : { maxOutputTokens: preferences.maxOutputTokens }),
+      ...(typeof adapter?.systemPrompt === "function"
+        ? { providerSystemPrompt: adapter.systemPrompt() }
+        : {}),
     });
     let capturedRequest = canonicalRequest;
     const parsedProviderId = parseProviderId(providerId);
@@ -282,7 +289,6 @@ export class ProviderProbingService {
         : { probe_surface: normalizedRequest.surface }),
     };
 
-    const probeSignal = AbortSignal.timeout(30_000);
     const events: CanonicalEvent[] = [];
     /**
      * Populated when the probe dials. Declared here, not inside the try, so the
@@ -337,7 +343,7 @@ export class ProviderProbingService {
             candidate,
             {
               credential,
-              deadline: startedAt + 30_000,
+              deadline: startedAt + probeTimeoutMs,
               abort_signal: probeSignal,
               outbound_fetch: probeFetch,
             },
@@ -373,7 +379,7 @@ export class ProviderProbingService {
             candidate,
             {
               credential,
-              deadline: startedAt + 30_000,
+              deadline: startedAt + probeTimeoutMs,
               abort_signal: probeSignal,
               outbound_fetch: probeFetch,
             },
@@ -415,7 +421,7 @@ export class ProviderProbingService {
           capturedRequest = request;
           for await (const event of adapter.dispatch(request, candidate, {
             credential,
-            deadline: startedAt + 30_000,
+            deadline: startedAt + probeTimeoutMs,
             abort_signal: probeSignal,
             outbound_fetch: probeFetch,
             // A bidi-only provider (Cursor's Connect-RPC Run) has no `fetch`
@@ -433,7 +439,8 @@ export class ProviderProbingService {
           if (!hasMeaningfulOutput(events)) throw new Error("probe response content empty");
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
-          if (!/empty\s+(?:response\s+)?content|response\s+content\s+empty/i.test(message)) {
+          // `fast` is deliberately single-shot: no 1024-token streamed retry.
+          if (fast || !/empty\s+(?:response\s+)?content|response\s+content\s+empty/i.test(message)) {
             throw error;
           }
           // Some reasoning models spend the short probe budget before producing
@@ -526,26 +533,40 @@ export class ProviderProbingService {
       latencyMs,
     });
 
-    // Probe telemetry rides the same batch buffer as live traffic. Keep the
-    // probe bodies linked by request_id so the console can inspect the exact
-    // canonical request and provider event stream that produced the result.
-    this.telemetryBuffer?.enqueue({
-      tenantId,
-      requestId,
-      sourceSurface,
-      requestedModel: modelId,
-      endpoint: endpointPath,
-      providerId,
-      ...(accountId ? { accountId } : {}),
-      ...(networkPoolId ? { networkPoolId } : {}),
-      latencyMs,
-      ...(ttfbMs !== undefined ? { ttfbMs } : {}),
-      stream: capturedRequest.stream,
-      status: ok ? "completed" : "failed",
-      ...(ok ? {} : { errorCategory: errorMessage ?? "probe_failed" }),
-      ...(usage ? { usage } : {}),
-      ...(tokensPerSec !== undefined ? { tokensPerSec } : {}),
-    });
+    // Probe telemetry rides the same batch buffer as live traffic. `fast`
+    // keeps only the liveness row — no token-speed/usage/TTFB detail — so a
+    // "test all models" run stays cheap; `detail` is unchanged.
+    if (fast) {
+      this.telemetryBuffer?.enqueue({
+        tenantId,
+        requestId,
+        sourceSurface,
+        requestedModel: modelId,
+        endpoint: endpointPath,
+        providerId,
+        latencyMs,
+        stream: false,
+        status: ok ? "completed" : "failed",
+      });
+    } else {
+      this.telemetryBuffer?.enqueue({
+        tenantId,
+        requestId,
+        sourceSurface,
+        requestedModel: modelId,
+        endpoint: endpointPath,
+        providerId,
+        ...(accountId ? { accountId } : {}),
+        ...(networkPoolId ? { networkPoolId } : {}),
+        latencyMs,
+        ...(ttfbMs !== undefined ? { ttfbMs } : {}),
+        stream: capturedRequest.stream,
+        status: ok ? "completed" : "failed",
+        ...(ok ? {} : { errorCategory: errorMessage ?? "probe_failed" }),
+        ...(usage ? { usage } : {}),
+        ...(tokensPerSec !== undefined ? { tokensPerSec } : {}),
+      });
+    }
     if (this.telemetryBuffer && payloadCapture.enabled) {
       if (payloadCapture.mode === "metadata") {
         // Stage presence only: the provider request line (method, URL,
@@ -596,7 +617,13 @@ export class ProviderProbingService {
       }
     }
 
-    const sample = extractSample(events);
+    const rawSample = extractSample(events);
+    // `fast` answers one question — did the model talk back? — so an 80-char
+    // excerpt is enough; `detail` keeps the full sample verbatim (D40).
+    const sample =
+      rawSample === undefined || !fast
+        ? rawSample
+        : rawSample.slice(0, PROBE_FAST_SAMPLE_MAX_CHARS);
     // The HTTP-only `readReportedModel` covers response-body transports; a
     // non-HTTP transport (Qoder gRPC) reports the upstream echo as a
     // `response_start` event instead — fall back to that when the body read
@@ -611,11 +638,11 @@ export class ProviderProbingService {
       ...(accountId ? { accountId } : {}),
       ok,
       latencyMs,
-      ...(ttfbMs !== undefined ? { ttfbMs } : {}),
+      ...(fast || ttfbMs === undefined ? {} : { ttfbMs }),
       ...(upstreamStatusCode === undefined ? {} : { statusCode: upstreamStatusCode }),
       ...(sample ? { sample } : {}),
-      ...(reportedModel === undefined ? {} : { reportedModel }),
-      ...(providerMetadata === undefined || Object.keys(providerMetadata).length === 0
+      ...(fast || reportedModel === undefined ? {} : { reportedModel }),
+      ...(fast || providerMetadata === undefined || Object.keys(providerMetadata).length === 0
         ? {}
         : { providerMetadata }),
       ...(searchResults !== undefined && searchResults.length > 0 ? { searchResults } : {}),
@@ -717,38 +744,54 @@ export class ProviderProbingService {
     }
   }
 
-  async syncModels(tenantId: string, providerId: string): Promise<{ synced: number }> {
+  /**
+   * Fetches one provider's model listing through the exact same two branches
+   * `syncModels` uses — a registry resolver, or the generic OpenAI-compatible
+   * `/models` fetch for BYOK — without writing anything. `supported:false`
+   * names a provider with no listing path so the Add-Model UI can offer its
+   * manual fallback instead of reporting a transport failure.
+   *
+   * The account is the first usable one (`selectUsableAccount`), the same
+   * selection sync uses (D27); its label is returned when available so the
+   * surface can say whose roster it is showing.
+   */
+  async discoverModels(
+    tenantId: string,
+    providerId: string,
+  ): Promise<{
+    readonly supported: boolean;
+    readonly models: readonly ModelDefinition[];
+    readonly accountLabel?: string;
+    /** Wire resolution context + BYOK family constraints for a later commit. */
+    readonly wire: {
+      readonly providerRow: ProbeProviderRow | undefined;
+      readonly supportedWireFamilies: readonly WireFamily[] | undefined;
+      readonly baseUrl: string | undefined;
+    };
+  }> {
     const outbound = asOutboundBinding(await this.outboundFetchFor(tenantId, providerId));
     try {
       const discoveryFetch = asFetchLike(outbound.fetch);
       const resolver = await this.providerRegistry.resolveModelDiscovery(providerId);
+      const account = await this.usableAccount(tenantId, providerId);
+      const providerRow = await this.loadProviderWireRow(providerId);
       if (resolver) {
-        // An account is used when one is usable, and the fetch is attempted
-        // either way. Gating on a credential only made the common case
-        // unreachable: most providers list their models without auth, and the
-        // ones that do not answer 401 themselves, which names the actual
-        // problem where a local 409 named a missing account the operator may
-        // not even need.
-        const account = await this.usableAccount(tenantId, providerId);
-        const secret = account?.secret;
-        const providerRow = await this.loadProviderWireRow(providerId);
-        const effectiveBaseUrl = providerRow?.baseUrl ?? providerBaseUrl(providerId) ?? "";
+        // `providerBaseUrl` throws for a non-bundled id; a custom provider can
+        // still register a discovery resolver, and its own row's base URL is
+        // the authority. Only a bundled provider falls back to metadata.
+        const effectiveBaseUrl =
+          providerRow?.baseUrl ??
+          (isBundledProviderId(providerId) ? providerBaseUrl(providerId) : "");
         let discovered: readonly ModelDefinition[] | null;
         try {
           discovered = await resolver({
             baseUrl: effectiveBaseUrl,
-            credential: secret ?? "",
+            credential: account?.secret ?? "",
             ...(discoveryFetch ? { fetcher: discoveryFetch } : {}),
             ...(account?.authState === undefined ? {} : { authState: account.authState }),
           });
         } catch (error) {
-          throw new GatewayError(
-            "transport_unavailable",
-            502,
-            `Model discovery failed for ${providerId}: ${error instanceof Error ? error.message : "unknown error"} (request {requestId}). The connection ghosted us — come back in a moment 👻`,
-            {},
-            "upstream",
-          );
+          throw this.discoveryFailure(providerId, error);
         }
         if (!discovered) {
           throw new GatewayError(
@@ -759,101 +802,92 @@ export class ProviderProbingService {
             "upstream",
           );
         }
-        const ctx = wireContextFrom(providerRow);
-        return this.persistDiscoveredModels(
-          providerId,
-          discovered,
-          (modelId) => resolveDiscoveredWire(modelId, ctx, undefined, this.defaultEndpoints),
-          ctx.endpointPathsByWireFamily,
-          effectiveBaseUrl,
-        );
+        return {
+          supported: true,
+          models: discovered,
+          ...(account?.label === undefined ? {} : { accountLabel: account.label }),
+          wire: { providerRow, supportedWireFamilies: undefined, baseUrl: effectiveBaseUrl },
+        };
       }
-
-      const providerRow = await this.loadProviderWireRow(providerId);
       if (providerRow?.baseUrl) {
-        const secret = await this.usableAccountSecret(tenantId, providerId);
-        if (secret) {
-          // An Anthropic-compatible root reads `x-api-key`, not bearer auth,
-          // and a bare host needs its `/v1` segment before `/models` joins on.
-          // Both are derived from the same wire profile dispatch uses, so
-          // auto-fetch behaves identically for either flavor of custom provider.
-          const wireProfile = resolveByokWireProfile(
-            providerRow.wireFamilyDefault,
-            providerRow.compatibilityProfile as CompatibilityProfile | null,
-          );
-          const modelsBaseUrl = modelDiscoveryBaseUrl(providerRow.baseUrl);
-          let discovered: readonly ModelDefinition[] | null;
-          try {
-            discovered = await fetchOpenAICompatibleModels({
-              baseUrl: modelsBaseUrl,
-              providerId,
-              headers: {
-                ...authHeaders(
-                  wireProfile.authHeaderShape,
-                  new TextEncoder().encode(secret),
-                  "api_key",
-                ),
-              },
-              ...(discoveryFetch ? { fetcher: discoveryFetch as typeof fetch } : {}),
-            });
-          } catch (error) {
-            throw new GatewayError(
-              "transport_unavailable",
-              502,
-              `Model discovery failed for ${providerId}: ${error instanceof Error ? error.message : "unknown error"} (request {requestId}). The connection ghosted us — come back in a moment 👻`,
-              {},
-              "upstream",
-            );
-          }
-          if (discovered && discovered.length > 0) {
-            const ctx = wireContextFrom(providerRow);
-            return this.persistDiscoveredModels(
-              providerId,
-              discovered,
-              (modelId) => resolveDiscoveredWire(modelId, ctx, undefined, this.defaultEndpoints),
-              ctx.endpointPathsByWireFamily,
-              providerRow.baseUrl ?? undefined,
-              // The generic `/models` fetch guesses a wire from the model id;
-              // the row's own profile is what the adapter will enforce, so it
-              // decides which guess is admissible.
-              wireProfile.supportedWireFamilies,
-            );
-          }
+        const wireProfile = resolveByokWireProfile(
+          providerRow.wireFamilyDefault,
+          providerRow.compatibilityProfile as CompatibilityProfile | null,
+        );
+        const modelsBaseUrl = modelDiscoveryBaseUrl(providerRow.baseUrl);
+        let discovered: readonly ModelDefinition[] | null;
+        try {
+          discovered = await fetchOpenAICompatibleModels({
+            baseUrl: modelsBaseUrl,
+            providerId,
+            headers: {
+              ...authHeaders(
+                wireProfile.authHeaderShape,
+                new TextEncoder().encode(account?.secret ?? ""),
+                "api_key",
+              ),
+            },
+            ...(discoveryFetch ? { fetcher: discoveryFetch as typeof fetch } : {}),
+          });
+        } catch (error) {
+          throw this.discoveryFailure(providerId, error);
+        }
+        if (discovered && discovered.length > 0) {
+          return {
+            supported: true,
+            models: discovered,
+            ...(account?.label === undefined ? {} : { accountLabel: account.label }),
+            wire: {
+              providerRow,
+              supportedWireFamilies: wireProfile.supportedWireFamilies,
+              baseUrl: providerRow.baseUrl ?? undefined,
+            },
+          };
         }
       }
+      return {
+        supported: false,
+        models: [],
+        ...(account?.label === undefined ? {} : { accountLabel: account.label }),
+        wire: { providerRow, supportedWireFamilies: undefined, baseUrl: undefined },
+      };
+    } finally {
+      outbound.release?.();
+    }
+  }
 
-      // Two reasons a sync reaches here with nothing dialed, and the operator
-      // needs to be told which one. Returning `{synced: 0}` for both made an
-      // unsupported provider indistinguishable from a successful fetch that
-      // found nothing — the console showed a green "0 synced" for a provider
-      // it can never sync.
-      const bundled = isBundledProviderId(providerId);
-      if (!bundled) {
-        // A custom provider has a row and a base URL but no usable credential.
-        // The fix is an account, and saying "no listing endpoint" would send the
-        // operator looking for a capability the provider may well have.
-        throw new GatewayError(
-          "invalid_request",
-          400,
-          `Add an account for ${providerId} first — model listing needs a credential (request {requestId}). Wrong key, right door — check the credential 🔑`,
-          {},
-          "cartethyia",
-        );
+  /** One upstream-shaped error for both discovery branches. */
+  private discoveryFailure(providerId: string, error: unknown): GatewayError {
+    return new GatewayError(
+      "transport_unavailable",
+      502,
+      `Model discovery failed for ${providerId}: ${error instanceof Error ? error.message : "unknown error"} (request {requestId}). The connection ghosted us — come back in a moment 👻`,
+      {},
+      "upstream",
+    );
+  }
+
+  /**
+   * The single write path for every discovery result: one fresh fetch, one
+   * subset, one source. Sync passes the whole roster as `discovered`; the
+   * Add-Model commit passes the operator's selected definitions as `manual`.
+   * `definitionsFrom` is applied to the fresh fetch so a stale client-side
+   * `ModelDefinition` can never decide what gets stored.
+   */
+  private async persistRoster(
+    tenantId: string,
+    providerId: string,
+    definitionsFrom: (
+      fresh: readonly ModelDefinition[],
+    ) => readonly ModelDefinition[],
+    source?: "manual",
+    unsupportedError?: (accountExists: boolean) => GatewayError,
+  ): Promise<{ synced: number }> {
+    const fresh = await this.discoverModels(tenantId, providerId);
+    if (!fresh.supported) {
+      if (unsupportedError) {
+        throw unsupportedError((await this.usableAccount(tenantId, providerId)) !== undefined);
       }
-      if (!(await this.usableAccountSecret(tenantId, providerId))) {
-        // A bundled provider with an account would have gone through the
-        // resolver branch above, so reaching here means none is registered.
-        // Add one first, then fetch.
-        throw new GatewayError(
-          "invalid_request",
-          400,
-          `Add an account for ${providerId} before fetching its models (request {requestId}). Wrong key, right door — check the credential 🔑`,
-          {},
-          "cartethyia",
-        );
-      }
-      // A credential exists and the provider still has no listing path: the
-      // catalog is the compiled one, and new models arrive with an update.
       throw new GatewayError(
         "capability_unsupported",
         400,
@@ -861,9 +895,75 @@ export class ProviderProbingService {
         {},
         "cartethyia",
       );
-    } finally {
-      outbound.release?.();
     }
+    const ctx = wireContextFrom(fresh.wire.providerRow);
+    return this.persistDiscoveredModels(
+      providerId,
+      definitionsFrom(fresh.models),
+      (modelId) => resolveDiscoveredWire(modelId, ctx, undefined, this.defaultEndpoints),
+      ctx.endpointPathsByWireFamily,
+      fresh.wire.baseUrl,
+      fresh.wire.supportedWireFamilies,
+      source,
+    );
+  }
+
+  /**
+   * Full sync: one fetch, upsert every id as `discovered` (or `auto_free`).
+   * Its original prerequisite diagnostics are preserved: a custom provider
+   * with no account is told to add one, a bundled provider with no listing
+   * endpoint is told its catalog ships with the release.
+   */
+  async syncModels(tenantId: string, providerId: string): Promise<{ synced: number }> {
+    return this.persistRoster(
+      tenantId,
+      providerId,
+      (fresh) => fresh,
+      undefined,
+      (accountExists) => {
+        if (!isBundledProviderId(providerId) || !accountExists) {
+          const prefix = isBundledProviderId(providerId)
+            ? `Add an account for ${providerId} before fetching its models`
+            : `Add an account for ${providerId} first — model listing needs a credential`;
+          return new GatewayError(
+            "invalid_request",
+            400,
+            `${prefix} (request {requestId}). Wrong key, right door — check the credential 🔑`,
+            {},
+            "cartethyia",
+          );
+        }
+        return new GatewayError(
+          "capability_unsupported",
+          400,
+          `${providerId} publishes no model-listing endpoint (request {requestId}). Its catalog ships with Cartethyia; new models appear with an update. Know your tools — this one just isn't in the box 🧰`,
+          {},
+          "cartethyia",
+        );
+      },
+    );
+  }
+
+  /**
+   * Persists an operator-selected subset of a freshly fetched roster as
+   * `source="manual"` (D28). The store has already intersected the requested
+   * ids against its own fetch; this second fetch is the anti-forgery boundary
+   * and the source of every stored `ModelDefinition`.
+   */
+  async commitDiscoveredModels(
+    tenantId: string,
+    providerId: string,
+    selectedIds: readonly string[],
+  ): Promise<{ synced: number }> {
+    return this.persistRoster(
+      tenantId,
+      providerId,
+      (fresh) => {
+        const wanted = new Set(selectedIds);
+        return fresh.filter((definition) => wanted.has(definition.modelId));
+      },
+      "manual",
+    );
   }
 
   private async persistDiscoveredModels(
@@ -873,6 +973,7 @@ export class ProviderProbingService {
     endpointOverrides?: Partial<Record<WireFamily, string>>,
     baseUrl?: string,
     supportedWireFamilies?: readonly WireFamily[],
+    source?: "manual",
   ): Promise<{ synced: number }> {
     // Static definitions are the injected bundled catalog; the probing service
     // and the console store are both handed the same startup-built map.
@@ -892,6 +993,10 @@ export class ProviderProbingService {
     // rows for the same ids afterwards.
     const resolvedPairs: Array<{ modelId: string; endpointPath: string }> = [];
     const rows: Array<typeof models.$inferInsert> = [];
+    // A `manual` commit is an operator's subset, not a full roster. The
+    // builtin-id skip that protects sync from creating shadow rows would hide
+    // a legitimately selected operator row, so only sync applies it.
+    const skipBuiltinIds = source === undefined;
     // `(modelId, endpointPath)` is the row identity and the upsert's conflict
     // target, so a listing that repeats a pair (the bespoke discoveries return
     // raw upstream ids) would make a multi-row `ON CONFLICT DO UPDATE` fail with
@@ -900,7 +1005,7 @@ export class ProviderProbingService {
     const seenPairs = new Set<string>();
     for (const item of discoveredModels) {
       const modelId = typeof item === "string" ? item : item.modelId;
-      if (builtinIds.has(modelId)) continue;
+      if (skipBuiltinIds && builtinIds.has(modelId)) continue;
       const resolved = resolve(modelId);
       const discDef = typeof item === "string" ? undefined : item;
       const { wireFamily, endpointPath } = applyDiscoveredWire({
@@ -927,6 +1032,10 @@ export class ProviderProbingService {
         reasoning: knownDefinition?.reasoning ?? discDef?.reasoning ?? false,
         toolCall: knownDefinition?.toolCall ?? discDef?.toolCall ?? false,
         cost: modelsDevCatalog.costFor(providerId, modelId),
+        // R-E: fetched warnings win, a matching static definition is the
+        // fallback, and an unknown id stores `NULL` (operator-editable).
+        warningMetadata:
+          discDef?.warnings ?? knownDefinition?.warnings ?? null,
         // Discovery builds its rows from the same static catalog, so a fetched
         // row carries the same answer a seeded one does. Null when neither
         // source marked it, which reads as "unknown" rather than "free".
@@ -948,7 +1057,8 @@ export class ProviderProbingService {
         // source, because the model list groups on it: a free-tier row is not
         // an ordinary fetched one, and collapsing both into `discovered` lost
         // that distinction at the only point where it is still known.
-        source: discDef?.freeTier === true ? "auto_free" : "discovered",
+        source:
+          source ?? (discDef?.freeTier === true ? "auto_free" : "discovered"),
         sourceUpdatedAt,
         enabled: true,
         ...(discDef?.dialect === undefined && knownDefinition?.dialect === undefined
@@ -975,6 +1085,7 @@ export class ProviderProbingService {
             cost: sql`excluded.cost`,
             proOnly: sql`excluded.pro_only`,
             freeTier: sql`excluded.free_tier`,
+            warningMetadata: sql`excluded.warning_metadata`,
             dialect: sql`excluded.dialect`,
             // The proposed row's own source, not a constant: a free-tier
             // discovery and an ordinary one write the same upsert, and pinning
@@ -986,6 +1097,9 @@ export class ProviderProbingService {
         });
     }
     const synced = rows.length;
+    // A manual commit is an operator's selection, not a roster replacement:
+    // pruning would delete unrelated discovered rows with the same ids.
+    if (source === "manual") return { synced };
     // Drop this provider's discovered rows for the synced ids that are no
     // longer part of the resolved set — the stale `(model, endpoint)` pair left
     // behind when a corrected wire family moved a model to a new path. Rows the
@@ -1015,13 +1129,6 @@ export class ProviderProbingService {
     return { synced };
   }
 
-  private async usableAccountSecret(
-    tenantId: string,
-    providerId: string,
-  ): Promise<string | undefined> {
-    return (await this.usableAccount(tenantId, providerId))?.secret;
-  }
-
   /**
    * The account a credential-scoped discovery will use, with its non-secret
    * auth configuration. Selection is unchanged — first usable row, preferring a
@@ -1030,7 +1137,11 @@ export class ProviderProbingService {
   private async usableAccount(
     tenantId: string,
     providerId: string,
-  ): Promise<{ readonly secret: string; readonly authState?: Readonly<Record<string, unknown>> } | undefined> {
+  ): Promise<{
+    readonly secret: string;
+    readonly label?: string;
+    readonly authState?: Readonly<Record<string, unknown>>;
+  } | undefined> {
     const rows = await this.db
       .select()
       .from(providerAccounts)
@@ -1045,6 +1156,7 @@ export class ProviderProbingService {
     const authState = isRecord(usable.authState) ? usable.authState as Readonly<Record<string, unknown>> : undefined;
     return {
       secret: decryptCredentialToString(usable.credentialCiphertext),
+      ...(typeof usable.label === "string" ? { label: usable.label } : {}),
       ...(authState === undefined ? {} : { authState }),
     };
   }
@@ -1055,6 +1167,9 @@ export class ProviderProbingService {
    * through a sliding worker pool bounded to `PROBE_CONCURRENCY`. Each request
    * carries its model route and service kind so native services never fall
    * through to an LLM probe.
+   *
+   * `mode` flows through every request, so "Test all models" (D43) can use
+   * the cheap `fast` path end to end.
    *
    * Sliding window beats barrel-batching here: the historical pattern waited
    * for the slowest probe in each group of `N` before starting the next group,

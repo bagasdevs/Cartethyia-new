@@ -1,6 +1,7 @@
 import {
   Boxes,
   Cable,
+  FlaskConical,
   Globe,
   Download,
   ExternalLink,
@@ -28,6 +29,7 @@ import { EmptyState, ErrorState, LoadingState } from "../../components/ui/state"
 import { Inline, CardActions } from "../../components/ui/inline";
 import { Stack } from "../../components/ui/stack";
 import {
+  useProbeAllModels,
   useProbeAllProviderAccounts,
   useProbeModel,
   useProviderAccounts,
@@ -55,8 +57,15 @@ import {
   initialFieldValues,
   missingRequiredFields,
 } from "./sections/ImportCredentialDialog";
-import { AddModelModal, ModelGrid, ShowSelect, ThinkingSelect, type ModelShowFilter } from "./sections/Models";
-import { PROBE_REASONING_EFFORTS, type ProbeReasoningEffort } from "../../data/contracts";
+import {
+  AddModelModal,
+  ModelGrid,
+  ShowSelect,
+  ThinkingSelect,
+  type ModelShowFilter,
+} from "./sections/Models";
+import { PROBE_REASONING_EFFORTS, type ModelProbeMode, type ProbeReasoningEffort } from "../../data/contracts";
+import { useRuntimeSettings } from "../../hooks/settings";
 
 type DashboardServiceKind = "llm" | "websearch" | "imageGeneration" | "videoGeneration";
 
@@ -140,6 +149,15 @@ export default function ProviderDetail(): ReactNode {
     const raw = window.localStorage.getItem(CARTETHYIA_PROVIDER_SHOW_KEY(pid));
     return raw === "free" ? "free" : "all";
   };
+  // Probe mode is a tenant-wide setting (Settings → Model testing); every
+  // provider follows the same mode. There is no per-provider override.
+  const runtimeSettings = useRuntimeSettings();
+  const globalProbeMode: ModelProbeMode = runtimeSettings.data?.modelProbeMode ?? "detail";
+  const probeAllModels = useProbeAllModels();
+  // The Models grid exposes its aggregate "test every card" runner here so the
+  // header button calls each card's own Test (verdicts paint in place) — the
+  // batch API stays as a fallback only when no grid is mounted.
+  const runAllCardProbesRef = useRef<(() => void) | undefined>(undefined);
   const [showFilter, setShowFilter] = useState<ModelShowFilter>(() => readShowFilter(id));
   useEffect(() => {
     if (!id) return;
@@ -228,6 +246,10 @@ export default function ProviderDetail(): ReactNode {
   const deduped = (() => {
     const seen = new Map<string, (typeof models)[number]>();
     for (const model of models) {
+      // A row without a model id cannot be rendered or routed; dropping it
+      // here (instead of crashing the sort below on null.localeCompare) is the
+      // safe surface for a stale/legacy row.
+      if (!model.modelId) continue;
       const serviceKind = model.serviceKind ?? "llm";
       const key = `${serviceKind}:${model.modelId}`;
       const existing = seen.get(key);
@@ -634,6 +656,36 @@ export default function ProviderDetail(): ReactNode {
                 onChange={setThinkingEffort}
                 size="sm"
               />
+              {/* One click fires every card's own Test — the cards own their
+                  probe state, so each verdict paints on its card live. The
+                  batch path (mutate) is only a fallback when no grid is
+                  mounted (websearch section). */}
+              <Button
+                variant="secondary"
+                size="sm"
+                icon={<FlaskConical size={13} className={probeAllModels.isPending ? "animate-spin" : ""} />}
+                disabled={probeAllModels.isPending || llmModels.length === 0}
+                onClick={() => {
+                  const runAll = runAllCardProbesRef.current;
+                  if (runAll !== undefined) {
+                    runAll();
+                  } else {
+                    probeAllModels.mutate(
+                      { providerId: id, mode: globalProbeMode },
+                      {
+                        onError: (error) =>
+                          toast.error(
+                            "Test all models failed",
+                            (error as { message?: string }).message ?? "Probe failed",
+                          ),
+                      },
+                    );
+                  }
+                }}
+                title={`Test every registered model in ${globalProbeMode} mode`}
+              >
+                {probeAllModels.isPending ? "Testing…" : "Test all models"}
+              </Button>
               {/* Every provider gets the button, including one that publishes
                   no model-listing endpoint. Hiding it left the operator with no
                   way to find out why their provider has no models; the route
@@ -729,8 +781,17 @@ export default function ProviderDetail(): ReactNode {
               models={llmModels}
               serviceKind="llm"
               thinkingEffort={thinkingEffort}
+              probeMode={globalProbeMode}
               showFilter={showFilter}
               searchCapable={provider?.supportsWebSearch === true}
+              testAll={{
+                pending: probeAllModels.isPending,
+                onRun: () => probeAllModels.mutate({ providerId: id, mode: globalProbeMode }),
+                results: probeAllModels.data?.results ?? null,
+              }}
+              onReady={(runAll) => {
+                runAllCardProbesRef.current = runAll;
+              }}
             />
           )}
         </CardBody>

@@ -8,9 +8,9 @@
 //     X-Device-Type, X-Os-Version  (all encodeURIComponent'd)
 //   - User-Agent: TraeClient/TTNet
 //
-// The donor's data-plane implementation and the native Agent transport both
-// send x-ide-token alongside Authorization. Version headers remain separate:
-// they are not universally required by Agent and commercial requests.
+// The native Agent transport also sends x-ide-token alongside Authorization.
+// Version headers remain separate: they are not universally required by Agent
+// and commercial requests.
 
 import { createHash } from "node:crypto";
 import {
@@ -32,9 +32,9 @@ export interface TraeDeviceIdentity {
  * Derives the device pair the upstream client sends.
  *
  * Both are pure one-way derivations from the account id, so one account always
- * presents one device and two accounts never share one — the donor notes this
- * is the risk-control correlation surface, so a per-process random id would
- * look like many devices behind one account and a shared id would link them.
+ * presents one device and two accounts never share one — this is the
+ * risk-control correlation surface, so a per-process random id would look like
+ * many devices behind one account and a shared id would link them.
  */
 export function traeDeviceIdentity(uid: string): TraeDeviceIdentity {
   const seed = String(uid ?? "").trim() || "anonymous";
@@ -52,9 +52,9 @@ export function traeDeviceIdentity(uid: string): TraeDeviceIdentity {
 /**
  * OS string reported as `X-Os-Version`.
  *
- * The donor reads this from the host registry, which leaks the operator's real
- * Windows build to upstream. This gateway is not the operator's desktop, so a
- * fixed value of the same shape is both more private and more stable.
+ * Upstream reads this from the host registry, which would leak the operator's
+ * real Windows build. This gateway is not the operator's desktop, so a fixed
+ * value of the same shape is both more private and more stable.
  */
 export const TRAE_OS_VERSION = "Windows 11 Pro";
 
@@ -70,6 +70,13 @@ export interface TraeHeaderInput {
   readonly uid: string;
   /** Version code sent as `x-ide-version-code`. */
   readonly versionCode?: string;
+  /** Client semver (e.g. `3.6.13`), sent as `X-App-Version`/`x-ide-version`. */
+  readonly appVersion?: string;
+  /**
+   * Traffic class, sent as `request-traffic-type`. Defaults to `chat`;
+   * the agent surface overrides to `agent`.
+   */
+  readonly trafficType?: string;
   /** True for the streaming chat call, which overrides `Accept`. */
   readonly stream?: boolean;
   /** Extra/replacement headers, applied case-insensitively. */
@@ -79,7 +86,15 @@ export interface TraeHeaderInput {
 /**
  * Builds the header set for one Trae request.
  *
- * `null` in `extra` deletes the header, matching the donor's override rule.
+ * `null` in `extra` deletes the header.
+ *
+ * Deliberately does NOT send:
+ * - `x-ide-token` — the canonical client (Trae 1.107.1 bundle, commit
+ *   `b6786417`) does not send it on the chat/agent data plane; it is an
+ *   OAuth/business-host header only. Sending it changed nothing for auth but
+ *   diverges from the reference wire.
+ * - `store-country-code` — not sent on the data plane either. The pay/quota
+ *   collector adds it explicitly where the commercial surface requires it.
  */
 export function buildTraeHeaders(input: TraeHeaderInput): Record<string, string> {
   const config = TRAE_REALMS[input.realm];
@@ -88,7 +103,6 @@ export function buildTraeHeaders(input: TraeHeaderInput): Record<string, string>
     "X-App-Id": TRAE_APP_ID,
     "x-plugin-channel": TRAE_PLUGIN_CHANNEL,
     "x-ide-version-code": input.versionCode ?? config.versionCode,
-    "x-ide-token": input.token,
     Authorization: `Cloud-IDE-JWT ${input.token}`,
     "Content-Type": "application/json",
     Accept: "application/json",
@@ -99,6 +113,17 @@ export function buildTraeHeaders(input: TraeHeaderInput): Record<string, string>
     "X-Device-Brand": encodeURIComponent(TRAE_DEVICE_BRAND),
     "X-Device-Type": encodeURIComponent("windows"),
     "X-Os-Version": encodeURIComponent(TRAE_OS_VERSION),
+    // Semver + traffic-class headers the 3.6.13 harness sends; verified live
+    // (2026-11-06) that they are accepted and change nothing (A/B sweep
+    // identical). Only sent when the caller supplies a version.
+    ...(input.appVersion === undefined
+      ? {}
+      : {
+          "X-App-Version": input.appVersion,
+          "X-App-Version-Code": input.appVersion,
+          "x-ide-version": input.appVersion,
+        }),
+    "request-traffic-type": input.trafficType ?? "chat",
   };
 
   if (input.stream === true) {

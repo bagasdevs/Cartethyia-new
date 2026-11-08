@@ -32,6 +32,14 @@ export interface CompatibilityProfile {
    * bundled specs declare it on `ApiKeyProviderSpec.gatewayUserAgent`.
    */
   readonly gateway_user_agent?: boolean;
+  /**
+   * Which service surfaces this custom provider may serve. Absent means every
+   * kind is enabled (the historical default). The operator narrows this by
+   * checking only the capabilities their upstream actually answers — agentic
+   * (LLM) is always on when the list is present, and a kind the upstream
+   * cannot serve stays out of the provider's tab set.
+   */
+  readonly service_kinds?: readonly ServiceKind[];
 }
 
 /** Identity and routing defaults for every builtin provider. */
@@ -143,6 +151,20 @@ const RAW_BUNDLED_PROVIDER_METADATA = [
     defaultSkipProxy: true,
     credentialUrl: "https://cursor.com",
     credentialHint: "Sign in with Cursor or import a Cursor API key.",
+  },
+  {
+    id: "devin",
+    displayName: "Devin",
+    baseUrl: "https://server.codeium.com",
+    wireFamilyDefault: "chat",
+    requiresAccount: true,
+    bespokeWire: true,
+    hasAdapterUserAgent: true,
+    // Devin's upstream is a Connect-RPC protobuf service with its own framing;
+    // an egress proxy in front of it breaks the stream shape. Direct only.
+    defaultSkipProxy: true,
+    credentialUrl: "https://devin.ai",
+    credentialHint: "Sign in with Devin, Windsurf Enterprise, or import a Devin session token / Windsurf seat key.",
   },
   { id: "kimi", displayName: "Kimi Code", baseUrl: "https://api.kimi.com/coding", credentialUrl: "https://platform.moonshot.ai/console/api-keys" },
   { id: "opencode", displayName: "OpenCode Free", baseUrl: "https://opencode.ai", requiresAccount: false, ipScopedRateLimit: true, hasAdapterUserAgent: true },
@@ -344,6 +366,7 @@ const RAW_BUNDLED_PROVIDER_METADATA = [
     // User-Agent. Letting the operator overwrite it would let them break the
     // provider, so the console locks the control.
     hasAdapterUserAgent: true,
+    credentialHint: "Paste a Nous Portal API key (portal.nousresearch.com → API keys), or sign in with the Nous Portal device code (OAuth) for the subscription route.",
   },
   { id: "bai", displayName: "B.AI", baseUrl: "https://api.b.ai/v1", credentialUrl: "https://b.ai" },
   {
@@ -367,8 +390,6 @@ const RAW_BUNDLED_PROVIDER_METADATA = [
   { id: "cline", displayName: "Cline", baseUrl: "https://api.cline.bot/api/v1", hasAdapterUserAgent: true, defaultSkipProxy: true, credentialUrl: "https://app.cline.bot" },
   { id: "cb", displayName: "CodeBuddy", baseUrl: "https://www.codebuddy.ai/v2", hasAdapterUserAgent: true, serviceKinds: ["llm", "imageGeneration", "videoGeneration"], credentialUrl: "https://www.codebuddy.ai", credentialHint: "Sign in with the same CodeBuddy account you use in the desktop app." },
   { id: "cbcn", displayName: "CodeBuddy CN", baseUrl: "https://copilot.tencent.com/v2", hasAdapterUserAgent: true, credentialUrl: "https://copilot.tencent.com", credentialHint: "Sign in with the same CodeBuddy China account you use in the desktop app." },
-  { id: "workbuddy", displayName: "WorkBuddy", baseUrl: "https://www.workbuddy.ai", hasAdapterUserAgent: true, serviceKinds: ["llm", "imageGeneration", "videoGeneration"], credentialUrl: "https://www.workbuddy.ai", credentialHint: "Sign in with the same WorkBuddy account you use in the desktop app." },
-  { id: "workbuddycn", displayName: "WorkBuddy CN", baseUrl: "https://www.workbuddy.cn", hasAdapterUserAgent: true, serviceKinds: ["llm", "imageGeneration", "videoGeneration"], credentialUrl: "https://www.workbuddy.cn", credentialHint: "Sign in with the same WorkBuddy China account you use in the desktop app." },
   {
     // Kilo Code resells the OpenRouter catalog. The base URL carries the API's
     // path prefix (`/api/openrouter`) and every model row carries only the wire
@@ -432,6 +453,22 @@ const RAW_BUNDLED_PROVIDER_METADATA = [
     credentialUrl: "https://www.trae.com.cn/",
     credentialHint: "Paste a Trae CN account export (accessToken + refreshToken) or the raw access token from a Trae China account.",
   },
+  {
+    id: "freepi",
+    displayName: "Free-pi",
+    baseUrl: "https://api.freepi.ai/v1/chat/completions",
+    defaultSkipProxy: true,
+    credentialUrl: "https://freepi.ai",
+    credentialHint: "Sign in with a GitHub device code (free-pi login), or paste a free-pi JWT issued by the backend.",
+  },
+  {
+    id: "perch",
+    displayName: "Perch",
+    baseUrl: "https://app.perchai.app",
+    defaultSkipProxy: true,
+    credentialUrl: "https://chat.perchai.app",
+    credentialHint: "Sign in with Google or GitHub (Perch account). Starter includes Roost Standard and Standard 1M.",
+  },
   { id: "ollamacloud", displayName: "Ollama Cloud", baseUrl: "https://ollama.com/v1", credentialUrl: "https://ollama.com/settings/keys" },
   { id: "gemini", displayName: "Google Gemini", baseUrl: "https://generativelanguage.googleapis.com/v1beta", serviceKinds: ["llm", "websearch", "imageGeneration"], credentialUrl: "https://aistudio.google.com/app/apikey" },
   { id: "xiaomipg", displayName: "Xiaomi MiMo (PAYG)", baseUrl: "https://api.xiaomimimo.com/v1", credentialUrl: "https://platform.xiaomimimo.com" },
@@ -472,7 +509,7 @@ const RAW_BUNDLED_PROVIDER_METADATA = [
 export type BundledProviderId = (typeof RAW_BUNDLED_PROVIDER_METADATA)[number]["id"];
 
 /**
- * The Buddy family: CodeBuddy, its China tenant, and WorkBuddy.
+ * The Buddy family: CodeBuddy and its China tenant.
  *
  * They share one billing and credit system, so several layers need to ask "is
  * this a Buddy provider" — the health recorder, the request preparer, and the
@@ -480,7 +517,7 @@ export type BundledProviderId = (typeof RAW_BUNDLED_PROVIDER_METADATA)[number]["
  * get added in one place and silently missed in the others. Declared here
  * beside the identities it names; the layers keep their own *policies*.
  */
-export const BUDDY_PROVIDER_IDS: ReadonlySet<string> = new Set(["cb", "cbcn", "workbuddy", "workbuddycn"]);
+export const BUDDY_PROVIDER_IDS: ReadonlySet<string> = new Set(["cb", "cbcn"]);
 
 /**
  * Per-provider JWT verification defaults for issued OAuth access tokens. An
@@ -648,6 +685,24 @@ export function providerServiceKinds(providerId: string): readonly ServiceKind[]
   // bundled provider without the declaration serves LLM only.
   if (declared !== undefined) return declared;
   return SERVICE_KINDS;
+}
+
+/**
+ * Resolves the service kinds for a custom (BYOK) provider row.
+ *
+ * The operator may narrow the surface set via `compatibilityProfile.service_kinds`
+ * (the Advanced Capabilities checkboxes in the Add Custom Provider modal). Absent,
+ * every kind is allowed — the historical default. A present list never drops
+ * `llm` (agentic is the floor of a custom provider).
+ */
+export function customProviderServiceKinds(
+  compatibilityProfile: CompatibilityProfile | null | undefined,
+): readonly ServiceKind[] {
+  const kinds = compatibilityProfile?.service_kinds;
+  if (kinds === undefined || kinds.length === 0) return SERVICE_KINDS;
+  const set = new Set<ServiceKind>(SERVICE_KINDS.filter((kind) => kinds.includes(kind)));
+  set.add("llm");
+  return SERVICE_KINDS.filter((kind) => set.has(kind));
 }
 
 

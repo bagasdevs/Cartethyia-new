@@ -84,12 +84,15 @@ function traeDiscovery(
     if (rows.length === 0) return realm === "cn" ? TRAE_CN_MODELS : TRAE_INTL_MODELS;
     const fallback = realm === "cn" ? TRAE_CN_MODELS : TRAE_INTL_MODELS;
     const byId = new Map(fallback.map((model) => [model.modelId, model]));
+    // Return everything the upstream picker reports — the live listing is the
+    // truth for the account, including configs absent from the static roster.
+    // The static roster is only the fallback when discovery fails. A config
+    // discovered upstream gets the realm's first row as a template so it is
+    // routable with the shape this provider serves, carrying the window
+    // upstream reported.
     return rows.map((row) => {
       const existing = byId.get(row.id);
       if (existing === undefined) {
-        // Discovered upstream but absent from the static roster: clone the
-        // realm's first row so a new model is routable with the shape this
-        // provider serves, carrying the window upstream reported.
         const template = fallback[0];
         if (template === undefined) return undefined;
         return { ...template, modelId: row.id, contextLimit: row.ctx ?? null };
@@ -315,6 +318,20 @@ export const PROVIDER_CAPABILITIES = {
         ...(fetcher === undefined ? {} : { fetcher }),
       }),
   },
+  devin: {
+    // Devin's chat wire is a Connect-RPC protobuf stream; the path is pinned
+    // here so a probe verifies dispatch actually calls it.
+    endpointPathsByWireFamily: { chat: "/exa.api_server_pb.ApiServerService/GetChatMessage" },
+    loadAdapter: async () => (await import("./integrations/devin/devin")).devinAdapter,
+    loadModels: async () => (await import("./integrations/devin/devin-catalog")).DEVIN_MODELS,
+    loadAuthentication: oauthCapability(() => import("./integrations/devin/devin-auth"), "devinOAuthClient"),
+    loadQuotaCollector: quotaCapability(() => import("./integrations/devin/devin-quota"), "fetchDevinQuota"),
+    loadModelDiscovery: async () => async ({ credential, fetcher }) =>
+      (await import("./integrations/devin/devin-catalog")).discoverDevinModels({
+        credential,
+        ...(fetcher === undefined ? {} : { fetcher }),
+      }),
+  },
   cerebras: {
     endpointPathsByWireFamily: { chat: "/chat/completions" },
     loadAdapter: async () => createApiKeyAdapter((await import("./integrations/cerebras")).CEREBRAS_SPEC),
@@ -514,6 +531,51 @@ export const PROVIDER_CAPABILITIES = {
     loadQuotaCollector: quotaCapability(() => import("./integrations/trae/trae-quota"), "fetchTraeCnQuota"),
     loadModelDiscovery: traeDiscovery("cn", "traecn"),
   },
+  freepi: {
+    loadAdapter: async () => (await import("./integrations/freepi/freepi")).createFreepiAdapter(),
+    loadModels: async () => (await import("./integrations/freepi/freepi-catalog")).FREEPI_MODELS,
+    // Free-pi login is a GitHub device flow; the issued JWT is the credential.
+    loadAuthentication: oauthCapability(() => import("./integrations/freepi/freepi-oauth"), "freepiOAuthClient"),
+    loadQuotaCollector: quotaCapability(() => import("./integrations/freepi/freepi-quota"), "fetchFreepiQuota"),
+    // Live `/client-version` (Bearer) is the catalog source; the static roster
+    // is the offline fallback.
+    loadModelDiscovery: async () => async (request: Parameters<ProviderModelDiscovery>[0]) => {
+      const { discoverFreepiModels } = await import("./integrations/freepi/freepi-discovery");
+      const { FREEPI_MODELS } = await import("./integrations/freepi/freepi-catalog");
+      const secret = request.credential.trim();
+      const fetcher = request.fetcher as unknown as typeof fetch | undefined;
+      if (secret.length === 0 || fetcher === undefined) return FREEPI_MODELS;
+      let token = secret;
+      if (secret.startsWith("{")) {
+        try {
+          const parsed = JSON.parse(secret) as Record<string, unknown>;
+          const found = ["accessToken", "access_token", "token"].find(
+            (key) => typeof parsed[key] === "string" && (parsed[key] as string).length > 0,
+          );
+          if (found !== undefined) token = parsed[found] as string;
+        } catch {
+          // Use the raw secret as the token.
+        }
+      }
+      const rows = await discoverFreepiModels({ token, fetcher });
+      if (rows.length === 0) return FREEPI_MODELS;
+      return rows;
+    },
+  },
+  perch: {
+    loadAdapter: async () => (await import("./integrations/perch/perch")).createPerchAdapter(),
+    loadModels: async () => (await import("./integrations/perch/perch-catalog")).PERCH_MODELS,
+    // Perch login is Supabase PKCE (Google/GitHub); the session blob
+    // (access/refresh token) is the credential, and the CLI refreshes it.
+    loadAuthentication: oauthCapability(() => import("./integrations/perch/perch-oauth"), "perchOAuthClient", { withRefresher: true }),
+    loadQuotaCollector: quotaCapability(() => import("./integrations/perch/perch-quota"), "fetchPerchQuota"),
+    // The hosted API exposes no public model list — Roost tiers are the only
+    // surface the CLI accepts, so discovery returns the static roster.
+    loadModelDiscovery: async () => async () => {
+      const { PERCH_MODELS } = await import("./integrations/perch/perch-catalog");
+      return PERCH_MODELS;
+    },
+  },
   inferhub: {
     loadAdapter: async () => (await import("./integrations/inferhub")).createInferhubAdapter(),
     // Live `/v1/models` is the primary source: the marketplace republishes its
@@ -527,6 +589,9 @@ export const PROVIDER_CAPABILITIES = {
   hermes: {
     loadAdapter: async () => createApiKeyAdapter((await import("./integrations/hermes")).HERMES_SPEC),
     loadModels: async () => (await import("./integrations/hermes")).HERMES_MODELS,
+    // Hermes accepts both API keys and the Nous Portal device-code OAuth flow
+    // (subscription route). The OAuth client is refreshable.
+    loadAuthentication: oauthCapability(() => import("./integrations/hermes/hermes-oauth"), "hermesOAuthClient", { withRefresher: true }),
     // `/v1/models` is open and states each row's real limits, so the free
     // allowance tracks upstream instead of a hand-kept list. The static list
     // above stays as the offline fallback for a fetch that fails.

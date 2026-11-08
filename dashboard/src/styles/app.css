@@ -743,7 +743,7 @@ html[data-app="share"] .share-backdrop {
       color-mix(in srgb, var(--page-bg) calc(var(--share-backdrop-veil) * 100%), transparent),
       color-mix(in srgb, var(--page-bg) calc(var(--share-backdrop-veil) * 100%), transparent)
     ),
-    url("/assets/brand/bansos_page.png");
+    url("/assets/brand/bansos_page.webp");
   background-position: center, center 28%;
   background-repeat: no-repeat, no-repeat;
   background-size: cover, cover;
@@ -1907,4 +1907,14 @@ label.settings-row-label {
   grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr));
   gap: 12px;
   min-width: 0;
+}
+
+/* Flash highlight when a Test-all result row jumps to a model card. */
+.model-flash {
+  animation: model-flash-pulse 1.6s ease-out;
+}
+@keyframes model-flash-pulse {
+  0% { box-shadow: 0 0 0 2px var(--accent); }
+  60% { box-shadow: 0 0 0 4px var(--accent); }
+  100% { box-shadow: 0 0 0 0 transparent; }
 }

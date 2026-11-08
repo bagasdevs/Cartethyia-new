@@ -8,7 +8,248 @@ current baseline; an existing one applies the numbered files that followed it.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [2.7.9] - 2026-11-08
+
+### Added
+
+- **Perch provider (Free Limited), pure HTTP.** Supabase GoTrue PKCE OAuth
+  implemented directly in Cartethyia (no captured external tokens), Starter
+  plan selection, turn-ticket mint, `/api/perch-terminal/model-call` SSE stream,
+  account quota, and model discovery. `pro` tiers were never hit and are
+  absent from the roster. No CLI process, desktop app, MCP, or ACP is
+  installed, spawned, or bundled as a transport. Evidence:
+  `documentation/research/perch/README.md`.
+- **Perch Starter-pool model pins.** Beyond the Roost tiers, the Starter plan
+  pins a small model pool; the catalog now ships `glm-5.3-flash-starter`,
+  `deepseek-flash-starter`, `crouton-alpha`, and `beam-1.0-starter`
+  (all 1M context per the client's published cards). Verified live
+  2026-11-08: GLM 5.3 Flash, DeepSeek V4.1 Flash, and Crouton Alpha answer
+  200 and the server reports the pinned backing model; Beam was not verified
+  (turn rate limit). A pin is sent as `manualModelOptionId` +
+  `preferredModelId` with `strictManual: true` — `preferredModelId` alone is
+  ignored by the upstream (it falls back to the Roost default). The 1M tier
+  now also sends the canonical `standard_max` tier id instead of the label.
+- **Unified provider system-prompt hook.** `ProviderAdapter.systemPrompt?()`
+  lets an adapter declare the system prompt its upstream fingerprints; the
+  probe path injects it as `request.system` instead of hardcoding anything in a
+  provider-detail test. Perch declares the 432-char Saffron prefix, which the
+  model-call body keeps as the opener even when the caller supplies its own
+  system turn. Other providers are unchanged.
+- **Routing: a qualified `provider/model` not in the catalog now routes via
+  the provider's sibling candidate.** Previously any model missing from the
+  catalog was refused with `model_not_found` (404), even when the provider was
+  explicitly qualified and could serve arbitrary model ids (BYOK, custom
+  gateways, unfetched models). The engine now clones the provider's first live
+  candidate (inheriting endpoint, wire family, dialect, capabilities, tenant
+  scope) and retargets it at the requested model. Bare-model misses and
+  providers with no candidates still 404.
+- **Inject System Prompt: preset preview + mode select, per-model removed.**
+  Every preset card (built-in and custom) now has a Preview button showing the
+  full prompt text in a dialog. Append/Override mode is selectable directly on
+  preset cards and on the global custom prompt (previously display-only). The
+  per-model scope section is removed from the dialog; global, provider, combo,
+  and alias scopes remain.
+- **Combos page: system-prompt active pill on combo/alias rows.** A combo or
+  alias with an active injection (preset or custom) shows a green `Active`
+  pill next to its name with the preset name or Append/Override label.
+- **Cursor model sweep live (2026-11-06): 1/47 PASS, 46/47 refused.**
+  Probe (`scripts/provider-probing/cursor/probe-cursor.ts`) now parses the
+  typed error detail (`Model unavailable on Free: …`) and resolves on
+  `turn_ended` instead of waiting for END_STREAM. Full 47-model sweep: only
+  `default` (Auto) serves; every named model answers `resource_exhausted`
+  (entitlement, not request shape).
+- **Cursor native tool execution (no MCP fallback).** The adapter now executes
+  Cursor's host tools locally — `read`, `write`, `grep`, `shell`, `ls`,
+  `edit`, `find`, `delete` — instead of relaying them to the client or
+  refusing them. One canonical name per tool across both wire generations
+  (modern exec arms are namespaced `ct_*` internally). Every path resolves
+  inside the workspace root (escape → typed `rejected`/`permission_denied`);
+  shell runs via parsed argv with `shell: false` and pinned cwd. MCP is kept
+  for client-declared tools; `subagent`, `web_search`, `fetch` stay refused.
+  Harness (19 checks incl. parallel):
+  `scripts/provider-probing/cursor/harness/native-tool-harness.ts`; unit tests:
+  `test/providers/cursor-exec.test.ts`.
+- **Cursor adapter aligns with the agent CLI wire (2026.11.05-86047df).**
+  Unpacked the `cursor-agent` npm runtime and audited hosts, endpoint
+  inventory, headers, and payloads against the adapter. Applied: `x-cursor-timezone`
+  (IANA zone) now sent on the Run stream and unary catalog calls, matching the
+  CLI's request middleware; `FALLBACK_CLIENT_VERSION` and `VERSION_SOURCES.cursor.fallback`
+  equalized on `cli-2026.11.05-86047df` (the CLI's build id). `x-cursor-checksum`
+  is a bridge-worker-only header in this build (not sent by the CLI's Run/API
+  path); it is kept for the IDE profile and documented. `x-cursor-team-id` and
+  bridge-worker/env headers (`x-cursor-client-os/arch`, `host-app-*`, `canary`)
+  are not adopted. Full evidence + decision log:
+  `documentation/research/cursor/2026-11-06-cursor-agent-cli-wire-audit.md`.
+- **Test: HTTP/2 bidi streaming suite skips when the fixture CA is not
+  trusted.** `test/network/outbound-http2.test.ts` now requires the fixture CA
+  to be present in `NODE_EXTRA_CA_CERTS` (as the runner bundles it); running
+  `bun test` directly with a different extra CA skips the suite instead of
+  failing on the self-signed cert.
+
+- **CodeBuddy/WorkBuddy rosters: `hy4free` added alongside `hy4`.** The
+  free variant mirrors `hy4`'s metadata on every buddy roster: intl
+  (cb/workbuddy) at 1M context / 64k output with tool calling and vision, CN
+  (cbcn/workbuddycn) at 960k / 64k, and the `high` reasoning effort ladder on
+  both realms.
+- **OAuth browser dialog: drag-and-drop redirect URL files + field reset on
+  invalid paste.** The manual "Step 2" field now accepts a dropped file (a
+  saved redirect URL or raw code) straight into the same paste path, with a
+  highlighted drop zone. An invalid paste (a URL with no `code`, or a
+  provider error) resets the field instead of closing the modal, so the
+  operator can correct the paste without reopening the dialog.
+- **Trae probing scripts: `scripts/provider-probing/trae/`.** `probe-trae-chat`
+  (chat/agent wire + SSE decode), `probe-trae-quota` (session/entitlement/pay
+  surfaces), plus `--models`/`--picker`/`--userinfo`/`--sweep`
+  (chat/agent sweep) roster and identity probes. All share the adapter's own
+  header builder and never print tokens.
+- **Trae intl roster: search-agent configs and paygo rows added.** `search_agent`,
+  `search_agent_gpt-5.4`, `search_agent_gpt-5.3-codex`,
+  `search_agent_gemini_3_pro_with_g3f`, and `gemini-3.1-pro-paygo` join the
+  agent catalog (skipped rows that already existed: `gpt-5.4`, all `gpt-5*paygo`).
+  All verified live (2026-11-06) to stream on the agent surface with full
+  tool-calling support; specs mirror the upstream model each config resolves to.
+- **Trae intl roster: models refused on the Free plan removed.** Live sweep
+  (2026-11-06) showed `gpt-5.2`, `deepseek-v4.1-flash`, `deepseek-v4-flash-0731`,
+  `deepseek-v4-pro-0813`, `kimi-k3`, `kimi-k2.7-code`, `kimi-k2.5`,
+  `gemini-3.1-pro`, `gemini-3-flash-solo`, `minimax-m3`, `minimax-m2.7` all
+  answer `1005 {"plan":5}` on Free accounts; `search_agent`, `gpt-5-paygo`,
+  and `gpt-5.1-paygo` were dropped after review. The intl agent roster is now
+  the 7 verified-usable rows, and discovery no longer re-adds removed rows: the
+  intl discovery source is the agent picker (`batch_get_detail_param`,
+  `usage=chat_completion`) and only rows already in the static roster are kept —
+  a discovered id outside the roster is dropped instead of cloned from a
+  template, so a sync/update cannot republish models the account cannot serve.
+- **Provider detail: one "Test all models" button drives per-card tests.** The
+  button directly triggers each model card's own test runner (cards register
+  their probe via the card→grid registry), so every card reports its own live
+  status inline. There is no dedicated batch API or SSE probe path — the
+  earlier experimental SSE batch route was fully reverted from the probing
+  service, store, and contracts.
+- **Custom providers: advanced capability checklist saved into
+  `service_kinds`.** The dashboard's advanced capabilities (vision, tool
+  calling, reasoning, …) are stored on `CompatibilityProfile.service_kinds`
+  and enforced by backend validation. An absent `service_kinds` means "all
+  kinds" for backward compatibility; `llm` is always included, so an older
+  custom provider without capabilities still routes as a chat model.
+- **Free-pi provider (bundled): adapter + OAuth + quota + live discovery.**
+  The free-pi backend (`api.freepi.ai`) is now a bundled provider serving the
+  OpenAI-completions wire with a JWT bearer. Login is GitHub device-code
+  (`freepi-oauth-capture.ts`); the quota collector reads `GET /me` (USD daily
+  budget, daily/bonus/premium credits); discovery reads `GET /client-version`
+  and keeps the whole live catalog, with the bare `deepseek-v4-flash` id
+  remapped onto the CLI default `deepseek/deepseek-v4-flash`. The adapter
+  registers an ad session (`/ads/next` + `/ads/impression`) before chat —
+  upstream answers `ads_required` unless a session has shown ads — and maps
+  `guest_unavailable`/`model_requires_credits` → quota, `model_at_capacity` →
+  capacity, `upstream_error` → platform unavailable. The static roster is the
+  offline fallback and carries only the four Free Unlimited rows
+  (`deepseek-v4.1-flash`, `glm-5.3-flash`, `particle`,
+  `deepseek/deepseek-v4-flash`); the v4 row was dropped per operator request.
+  Live-verified: guest sweep (4 free rows pass, 26 refused with
+  `guest_unavailable`), GitHub sweep (23/30 pass, 4 model_at_capacity, 2
+  credit-required, 1 upstream 404), and direct chat through the gateway.
+- **Free-pi probing scripts.** `scripts/provider-probing/freepi/`:
+  `probe-freepi.ts` (guest/device identity, `/me`, `/client-version`, chat,
+  sweep), `freepi-oauth-capture.ts` (device-code login → JWT capture), and
+  `freepi-shared.ts` (upstream wire helpers). Tokens are never printed.
+- **Probe scripts restructured: `scripts/scratch/` removed.** All scratch
+  files moved into `scripts/provider-probing/` by domain (qoder → grpc/direct/
+  tools/dev/inspect, trae stays in trae/), relative imports fixed, and
+  references updated everywhere. Duplicates merged: `export-provider-accounts.ts`
+  + `qoder-export-accounts.ts` → `lib/export-accounts.ts` (generic helper) with
+  the qoder wrapper; `qoder-raw-wire-probe.ts` + `qoder-toolcall-audit-probe.ts`
+  → `qoder/inspect/qoder-wire-audit.ts`. The `README.md` layout now documents
+  the full tree.
+
+### Changed
+
+- **Probe mode is global (Settings), not per-provider.** The fast/minimal vs
+  detail probe toggle now lives in the runtime settings
+  (`useRuntimeSettings().modelProbeMode`); per-provider headers and
+  localStorage flags were removed.
+- **Qoder native device identity hardened: generated headers no longer sent,
+  disk cache + majority vote.** Adopted from the donor reference
+  implementation: a generated (software) identity is no longer sent as the
+  full `cosy-machine*` machine-header set — the upstream filters the daily
+  CREDITS campaign when a full set of derived headers appears (donor issue
+  #10), so generated identities now send only `cosy-machineid` + os +
+  hostname, while native UMID identities keep the full six-header set. A
+  per-realm disk cache (`machine_identity.json`) keeps the device identity
+  stable across container rebuilds, and fresh mints use a majority vote
+  (2–3 samples) to stabilize the bridge's VM-classification jitter. When the
+  bridge fails entirely, the cached identity (even expired) is preferred over
+  a generated one. The allocation path now skips a cached token that is
+  already bound to another account (unique-index invariant).
+- **Free-pi upstream error codes align with gateway conventions.** `guest_unavailable`
+  and `model_requires_credits` now map to `policy_rejected` (403), and
+  `model_at_capacity`/`model_unavailable` to `platform_unavailable` (503),
+  so each `GatewayErrorCode` carries one consistent status.
+- **Qoder machine identity now OS-derived; vendor bridge removed.** The
+  `vendor/qoder-umid/` tree (runtime-info ELF/PE/Mach-O binaries, mini-ELF
+  bundle) and `scripts/tools/extract-qoder-umid.ts` are deleted. Identity is
+  now derived deterministically from the host OS fingerprint + account uid
+  (donor-style `derive_id` pattern): UUIDv4-shaped machine id, base64url
+  machine token, 18-hex type/code. Same host + same account → same identity;
+  accounts are isolated by the uid salt. The Dockerfile's umid `chmod` step,
+  `CARTETHYIA_QODER_UMID_MINI`, and related docs/config are removed.
+
+### Fixed
+- **Recover is now offered for any account with a recorded failure category,
+  not only those parked in an account-wide cooldown.** The quota-check path
+  can stamp `rate_limit_transient` without moving status/`cooldownUntil`, so
+  a rate-limited account previously rendered "Rate limited" with no way to
+  clear it. `AccountRow` and the health dialog now show Recover whenever
+  `lastErrorCategory` is set (except `auth_invalidated`, which needs a
+  re-login).
+- **Console probes now carry Perch's required system prompt in the compiled
+  binary.** `PERCH_SAFFRON_SYSTEM_PROMPT` used to be read from
+  `saffron-system-prompt.txt` via `readFileSync(import.meta.dir)`; the
+  standalone binary has no `.txt` asset, so it silently shipped a two-line
+  fallback and every provider-detail probe answered `403
+  perch_surface_required` while source-level probes succeeded. The prompt is
+  now a bundled TS literal (test asserts it matches the research copy), and
+  `PerchAdapter` uses `context.outbound_fetch` for ticket, account, and
+  model-call instead of `globalThis.fetch`. Verified live 2026-11-08 on the
+  exact console probe path with the DB credential: `standard 1m` → 200.
+- **Fast probe uses `"ping"` with 64 max output tokens.** The fast probe
+  prompt is now `"ping"` (was `"How are you?"`) and
+  `PROBE_FAST_MAX_OUTPUT_TOKENS` is 64 (was 32), so quick checks stay cheaper
+  while remaining above entropy thresholds. The detail probe keeps the
+  identity prompt at 256 tokens.
+- **Perch rate limits now cool the account so routing fails over.** Perch's
+  `turn_rate_limited` answers on every ticket mint while the window is
+  exhausted. The adapter now stamps every upstream verdict (`rate_limited`,
+  `policy_rejected`, `platform_unavailable`) with `origin: "upstream"` plus
+  `providerCode`/`providerId`, so the account health machine sees it; the
+  classifier maps `turn_rate_limited` to `rate_limit_transient` with a 24-hour
+  cooldown and routing picks a sibling account instead of hammering the same
+  key all day.
+- **Free-pi device login keeps one account per GitHub user.** The device flow
+  used to label every login `freepi-device`; the OAuth identity fingerprint
+  collided on that static label, so a second login silently replaced the first
+  account. The JWT now resolves the GitHub identity (`sub` / `email`) into the
+  account label and `auth_state`, so different GitHub users land on different
+  rows — the same re-login identity fix as the Cursor fallback.
+- **Perch browser login resolves the GoTrue user email as the account label.**
+  Without it the exchange fell back to the provider-id label and every Perch
+  login collided on one identity fingerprint, so a second login replaced the
+  first account.
+- **Qoder probes default to the COSY surface.** The adapter and probe default
+  `surface` changed from `grpc`/`ide` to `cosy`; the `cmodel` identity-prompt
+  probe workaround is removed. `deepseek-v4.1-flash` and
+  `qwen3.8-flash` verified live (2026-11-07) at 200 via COSY.
+- **Client-version fallbacks refreshed for every provider except Devin.** The
+  shared cursor client-version fallback and opencode fingerprint now match the
+  pinned versions; Devin stays static (its version is not fetched). The
+  version monitor tests were updated accordingly.
+- **Recover surfaces for active accounts with per-model cooldowns.**
+  `isRecoverable` now includes cooldown state (`cooldownUntil` and a present
+  `activeModelCooldowns`), so Recover appears exactly where a refresh would
+  otherwise hit a per-model cooldown.
+- **Refresh-token button removed from the dashboard.** The separate "Refresh
+  token" button and its hook/type are gone from the account row; the backend
+  `/console/api` refresh route is retained so API consumers and older
+  dashboards keep working.
 
 ### Added
 
@@ -40,6 +281,65 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **WorkBuddy removed; data migrates to CodeBuddy automatically.** The buddy
+  family is now `cb`/`cbcn` only — `workbuddy` and `workbuddycn` providers and
+  the TuringShield SDK (`vendor/turing-sdk/`, `turing-device-token.ts`) are
+  deleted. Migration `0045` repoints every dependent row (accounts, models,
+  routing settings, telemetry) from `workbuddy` → `cb` and `workbuddycn` →
+  `cbcn`, mirroring the opencode rename pattern. Device-token headers now fall
+  back to the captured token (auth_state / `CARTETHYIA_DEVICE_TOKEN_FILE`);
+  the qimei36 device binding is not carried over and is re-derived per account.
+  Cross-channel credential warning removed from the dashboard.
+- **Assets: all raster images converted to WebP and resized to display
+  needs.** The bundle drops from ~30 MB to ~3.4 MB (-89%). Console background
+  3840×2160 JPEG (12.9 MB) → 1920×1080 WebP (179 KB); share backdrop
+  2560×1440 PNG (7.5 MB) → 1920×1080 WebP (145 KB); story art and
+  documentation screenshots recompressed (WebP q75-80, screenshots capped at
+  1600px). Callers updated to the `.webp` paths; social-card dimensions in
+  `dashboard-assets.ts` and README updated to the new 1200×393 output.
+
+### Fixed
+
+- **Trae: entitlement model refusals (`1005`/`4015`) surface as
+  `quota_exceeded`, not platform faults or auth failures.** Verified live
+  (2026-11-06): identical wire streams fine on a paid-capable account while a
+  Free account is refused with these codes, and the refused account's token
+  still answers `GetUserInfo` 200. They previously fell through to
+  `platform_unavailable` (502), which misattributed a quota/plan wall to a
+  transient fault.
+- **Trae: the pay/quota collector now reaches the right host and parses the
+  real entitlement shape.** The intl pay default was the US host, which
+  refuses region `sg` (or region-unrecorded intl) accounts with `401 code
+  1001`; it now defaults to the SG host like the core does, and a recorded
+  `region` picks its own pay host via `TRAE_REGION_PAY_HOSTS`. The entitlement
+  parser read a shape that does not exist (`data.entitlement_list` /
+  `ent_title` / `total` / `remain`); it now reads the live
+  `user_entitlement_pack_list` (`display_desc`, `entitlement_base_info.quota`
+  caps, v2 `usage_summary` on CN), so Free/paid plans report their real caps.
+- **Trae: the data-plane header builder no longer sends `x-ide-token` or
+  `store-country-code`.** The canonical client (Trae 1.107.1 bundle) does not
+  send them on chat/agent; they are OAuth/business-host headers that the quota
+  collector adds explicitly. The probe scripts match the adapter's reference
+  wire exactly.
+- **Trae: harness-aligned semver + traffic headers.** The adapter now sends
+  `X-App-Version`, `X-App-Version-Code`, and `x-ide-version` (from
+  `getTraeVersion()`) plus `request-traffic-type` (`agent`/`chat` per surface),
+  matching the 3.6.13 harness inventory. Verified live via A/B sweep: outcome
+  identical with and without them (audit + evidence:
+  `documentation/research/trae/2026-11-06-trae-header-payload-builder-audit.md`).
+- **Antigravity: replayed thinking without a signature is dropped on Claude
+  routes.** The upstream requires every replayed `thinking` block to carry a
+  `signature`; a Chat-surface client replays reasoning as a bare
+  `reasoning_content` string, so the replayed `thought` part was unsigned and
+  the upstream rejected the second turn of a session with `400
+  messages.N.content.0.thinking.signature: Field required`. Claude routes now
+  drop unsigned reasoning blocks (the donor's `drop-unsigned-thinking`
+  behavior); signed reasoning still replays. Gemini routes are untouched.
+- **Antigravity/Gemini/Factory: reasoning signatures are preserved from
+  upstream responses.** `responseParts` now extracts `thoughtSignature` from
+  Gemini-family response parts and the adapters forward it on the canonical
+  reasoning event, so a signature received upstream survives the round trip
+  and replays correctly on the next turn.
 - **Qoder: provider request/response capture now shows the gRPC chat call,
   not the PAT exchange.** The payload-capture wrapper only saw HTTP `fetch`
   calls, and Qoder's production chat transport is gRPC — so Request Detail's
@@ -69,6 +369,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
   this restores usage telemetry and powers the estimate. Chat/Responses/
   Messages surfaces all read `cached_input_tokens`, so the estimate shows up
   everywhere usage does.
+- **Qoder: model-server host `api2-v2.qoder.sh` is dead and routing now
+  falls back to the alive gateway set.** Live DNS verification (2026-11-07):
+  `api2-v2.qoder.sh` is NXDOMAIN on every resolver (Google/Cloudflare DoH,
+  local, CN), so the gRPC model-server and IDE `/model/v1` surfaces are
+  unreachable. The region endpoint sync
+  (`/algo/api/v3/service/region/endpoints`) decrypted to `inferNodes = [api1]`
+  etc. The adapter default surface is now legacy COSY (`cosy`), hosts are
+  tried in order (`api1` → `api2` → `api3`), and the intl gRPC/IDE host
+  constants point at `api1` instead of the dead `api2-v2`. Legacy COSY on
+  `api1`/`api2` verified live: 200 + full stream with model `auto`. Evidence:
+  `documentation/research/qoder/live/2026-11-07-qoder-host-inference-fallback.md`.
+
+### Removed
+
+- **WorkBuddy providers and the TuringShield SDK.** `workbuddy` /
+  `workbuddycn` integration folders, `turing-device-token.ts`, and
+  `vendor/turing-sdk/` are deleted. The device-token header path now uses the
+  captured token only; migration `0045` moves any stored WorkBuddy data onto
+  CodeBuddy (`cb`/`cbcn`).
+- **Per-model system-prompt scope from the dashboard dialog.** The per-model
+  section is gone; custom prompts for models are no longer editable in the UI
+  (stored rows are untouched).
+- **Dashboard cross-channel credential warning.** The interchangeable-token
+  warning (CodeBuddy/WorkBuddy) is removed along with the provider pair that
+  motivated it.
 
 ## [2.7.8] - 2026-11-05
 

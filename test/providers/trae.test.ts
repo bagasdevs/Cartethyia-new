@@ -168,13 +168,12 @@ describe("trae rosters", () => {
   test("context windows are per model, not uniform", () => {
     // Reading a single maximum across the roster would report 1M for the GPT
     // rows, which — except `gpt-5.4` — cap at 272k, and would overstate
-    // Kimi-K2.5 / MiniMax-M2.7, which offer no selectable upgrade above 200k.
+    // the search-agent rows that resolve to 272k models.
     const find = (id: string): number | undefined =>
       TRAE_INTL_MODELS.find((m) => m.modelId === id)?.contextLimit ?? undefined;
     expect(find("gpt-5.4")).toBe(1_000_000);
-    expect(find("gpt-5.2")).toBe(272_000);
-    expect(find("deepseek-v4.1-flash")).toBe(1_000_000);
-    expect(find("kimi-k2.5")).toBe(200_000);
+    expect(find("gpt-5.2-codex-paygo")).toBe(272_000);
+    expect(find("search_agent_gpt-5.4")).toBe(1_000_000);
   });
 });
 
@@ -221,10 +220,14 @@ describe("trae device identity", () => {
 });
 
 describe("buildTraeHeaders", () => {
-  test("CN authenticates with Cloud-IDE-JWT", () => {
+  test("CN authenticates with Cloud-IDE-JWT and omits data-plane extra headers", () => {
     const headers = buildTraeHeaders({ realm: "cn", token: "t", uid: "1" });
     expect(headers["Authorization"]).toBe("Cloud-IDE-JWT t");
-    expect(headers["x-ide-token"]).toBe("t");
+    // The canonical client does not send `x-ide-token` on the chat/agent data
+    // plane (Trae 1.107.1 bundle, commit b6786417); it is an OAuth/business
+    // header only. A probe with it diverged from the reference wire.
+    expect(headers["x-ide-token"]).toBeUndefined();
+    expect(headers["store-country-code"]).toBeUndefined();
   });
 
   test("intl uses the same Cloud-IDE-JWT scheme as CN", () => {
@@ -234,6 +237,31 @@ describe("buildTraeHeaders", () => {
     expect(headers["x-ide-version"]).toBeUndefined();
     expect(headers["x-app-version"]).toBeUndefined();
     expect(headers["User-Agent"]).toBe("TraeClient/TTNet");
+    // Semver/traffic headers only appear when a caller supplies the version.
+    expect(headers["request-traffic-type"]).toBe("chat");
+  });
+
+  test("appVersion adds the harness semver headers", () => {
+    const headers = buildTraeHeaders({
+      realm: "intl",
+      token: "t",
+      uid: "1",
+      appVersion: "3.6.13",
+    });
+    expect(headers["X-App-Version"]).toBe("3.6.13");
+    expect(headers["X-App-Version-Code"]).toBe("3.6.13");
+    expect(headers["x-ide-version"]).toBe("3.6.13");
+    expect(headers["request-traffic-type"]).toBe("chat");
+  });
+
+  test("trafficType overrides the request-traffic-type header", () => {
+    const headers = buildTraeHeaders({
+      realm: "intl",
+      token: "t",
+      uid: "1",
+      trafficType: "agent",
+    });
+    expect(headers["request-traffic-type"]).toBe("agent");
   });
 
   test("a stream request takes the SSE Accept", () => {
@@ -382,7 +410,7 @@ describe("buildTraeChatBody", () => {
 
   test("a huge max_tokens is clamped to the roster output limit", () => {
     const body = buildTraeChatBody(
-      "gpt-5.2",
+      "gpt-5.2-codex-paygo",
       request({ generation_controls: { max_tokens: 1_000_000_000 } }),
       "intl",
       undefined,
@@ -393,7 +421,7 @@ describe("buildTraeChatBody", () => {
 
   test("a caller max_tokens within the roster limit is forwarded unchanged", () => {
     const body = buildTraeChatBody(
-      "gpt-5.2",
+      "gpt-5.2-codex-paygo",
       request({ generation_controls: { max_tokens: 32_000 } }),
       "intl",
       undefined,
@@ -413,8 +441,8 @@ describe("toTraeAgentBody", () => {
     // The agent surface ignores `model_name` entirely, and without
     // `config_source` it resolves the right upstream model and then streams
     // nothing — which looks like a dead model rather than a missing field.
-    const body = toTraeAgentBody(buildTraeChatBody("deepseek-v4.1-flash", request(), "intl"));
-    expect(body.config_name).toBe("deepseek-v4.1-flash");
+    const body = toTraeAgentBody(buildTraeChatBody("search_agent_gpt-5.4", request(), "intl"));
+    expect(body.config_name).toBe("search_agent_gpt-5.4");
     expect(body.config_source).toBe(1);
     expect("model_name" in body).toBe(false);
   });
@@ -422,13 +450,13 @@ describe("toTraeAgentBody", () => {
   test("function names the roster", () => {
     // Absent, the call fails before model resolution with
     // `[LLMUtilsChat.resolveByUsage] function is empty`.
-    const body = toTraeAgentBody(buildTraeChatBody("gpt-5.2", request(), "intl"));
+    const body = toTraeAgentBody(buildTraeChatBody("gpt-5.2-codex-paygo", request(), "intl"));
     expect(body.function).toBe(TRAE_AGENT_FUNCTION);
   });
 
   test("messages and generation controls survive the rewrite", () => {
     const source = buildTraeChatBody(
-      "kimi-k3",
+      "gemini-3.1-pro-paygo",
       request({ generation_controls: { temperature: 0.3, max_tokens: 32 } }),
       "intl",
     );
@@ -548,9 +576,35 @@ describe("trae stream framing", () => {
 });
 
 describe("trae Agent tool streams", () => {
-  test("an SSE error without a message preserves the upstream code", async () => {
-    await expect(agentEvents([{ event: "error", data: { code: 4015, message: "" } }]))
-      .rejects.toThrow("Trae stream error (upstream code 4015)");
+  test("an SSE 4015 is an entitlement verdict, not auth or platform", async () => {
+    // Verified live (2026-11-06): identical wire, a paid-capable account
+    // streams the same model fine while a Free account is refused with 4015
+    // (and 1005 {"plan":N}); the refused token still answers GetUserInfo 200.
+    // It must surface as `quota_exceeded` (429), never authentication_failed
+    // and never platform_unavailable.
+    let thrown: unknown;
+    try {
+      await agentEvents([{ event: "error", data: { code: 4015, message: "" } }]);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(GatewayError);
+    const g = thrown as GatewayError;
+    expect(g.code).toBe("quota_exceeded");
+    expect(g.status).toBe(429);
+  });
+
+  test("an SSE 1005 is an entitlement verdict with a plan requirement", async () => {
+    let thrown: unknown;
+    try {
+      await agentEvents([{ event: "error", data: { code: 1005, message: "", extra: '{"plan":5}' } }]);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(GatewayError);
+    const g = thrown as GatewayError;
+    expect(g.code).toBe("quota_exceeded");
+    expect(g.status).toBe(429);
   });
 
   test("an upstream 1001 is classified as auth failure, not platform_unavailable", async () => {

@@ -10,6 +10,34 @@
 // is deliberately static — Qoder publishes no endpoint that resolves a name to
 // a slot the way Copilot's `/auto` does, so there is nothing to ask at runtime.
 
+import type { ModelWarning } from "../../provider-model-definition";
+
+/**
+ * Three provider-level caveats (D37), attached to every `qoder`/`qodercn` row —
+ * static, virtual, and discovered alike. These are deliberately statements of
+ * possibility, not per-model claims: the provider may route a slot to a
+ * different model, its cache may be unreliable, and a plan/transport decision
+ * may refuse a request. No roster row is asserted to have any of these
+ * behaviours individually.
+ */
+export const QODER_PROVIDER_WARNINGS: readonly ModelWarning[] = [
+  {
+    kind: "fallback_model",
+    message: "Provider may fall back to another model for this slot.",
+    severity: "warn",
+  },
+  {
+    kind: "cache_reliability",
+    message: "Cache reliability may be degraded for this provider.",
+    severity: "warn",
+  },
+  {
+    kind: "model_refusal",
+    message: "This provider may refuse certain model requests (plan/transport).",
+    severity: "warn",
+  },
+];
+
 /** A virtual id and the roster key it stands for. */
 export interface QoderVirtualModel {
   /** The id a caller sends and the catalog publishes. */
@@ -43,7 +71,11 @@ export const QODER_VIRTUAL_MODELS: readonly QoderVirtualModel[] = [
   { id: "cantus", target: "cmodel", displayName: "Cantus" },
   { id: "sonus", target: "smodel", displayName: "Sonus" },
   { id: "qwen3.8-max", target: "qmodel_38max", displayName: "Qwen3.8-Max" },
-  { id: "qwen3.8-flash", target: "qfmodel", displayName: "Qwen3.8-Flash" },
+  // `qwen3.8-flash` is the free-tier entry point over the `qfmodel` slot.
+  // Upstream's live `is_free` on this slot is a plan-tier flag rather than a
+  // zero-cost tier, so the static roster deliberately does not state it; the
+  // free badge is applied here, the same way `lite` overrides `qmodel`.
+  { id: "qwen3.8-flash", target: "qfmodel", displayName: "Qwen3.8-Flash", free: true },
   { id: "qwen3.7-max", target: "qmodel_latest", displayName: "Qwen3.7-Max" },
   { id: "qwen3.7-plus", target: "qmodel", displayName: "Qwen3.7-Plus" },
   { id: "kimi-k3", target: "kmodel_latest", displayName: "Kimi-K3.1-Pro" },

@@ -61,7 +61,8 @@ import { fetchCursorRunOrigin } from "./cursor-catalog";
 import { defaultParameterValues, fetchCursorModels } from "./cursor-catalog";
 import type { CursorModelInfo } from "./cursor-catalog";
 import { decodeValueToJson, decodeStructEntriesToJson } from "./protocol/struct";
-import { cursorVariantForExecArgs } from "./protocol/tool-canonical";
+import { encodeMessage } from "./protocol/messages";
+import { executeNativeTool, resolveExecFrame } from "./cursor-exec";
 import { fnv1a32 } from "../shared/hash";
 
 /**
@@ -929,6 +930,8 @@ class CursorAdapter implements ProviderAdapter {
         if (execServer !== undefined) {
           const handled = await this.#handleExecServerMessage(execServer, session, handle);
           if (handled.kind !== "tool_call") continue;
+          // Only MCP arms are relayed to the client for execution (client-
+          // declared tools). Native tools are answered in-band by the executor.
           const callId = `call_cursor_${runId}_${handled.execId}`;
           const scope = context.continuation_scope;
           if (scope === undefined) {
@@ -1107,9 +1110,9 @@ class CursorAdapter implements ProviderAdapter {
       return { kind: "handled" };
     }
     // Allowlist prechecks precede the real call. They are approval probes, not
-    // invocations — this gateway advertises every executable surface through
-    // the MCP channel, so its own host surface is never allowlisted and the
-    // typed result frame (not an mcp_result) is what the server waits on.
+    // invocations. Shell is allowlisted because the native executor runs it
+    // locally; MCP is allowlisted only when the tool is client-declared
+    // (relayed to the client); web fetch is never executed and stays denied.
     const precheckKind = recordOf(execServer["shell_allowlist_precheck_args"]) !== undefined
       ? "shell"
       : recordOf(execServer["mcp_allowlist_precheck_args"]) !== undefined
@@ -1118,35 +1121,37 @@ class CursorAdapter implements ProviderAdapter {
           ? "web_fetch"
           : undefined;
     if (precheckKind !== undefined) {
-      await handle.write(buildAllowlistPrecheckResult(execId, precheckKind, execIdString));
+      const allowlisted =
+        precheckKind === "shell" ? true
+        : precheckKind === "web_fetch" ? false
+        : this.mcpArgsAreDeclared(execServer, session.descriptors);
+      await handle.write(buildAllowlistPrecheckResult(execId, precheckKind, execIdString, allowlisted));
       return { kind: "handled" };
     }
-    // Native first. A Cursor host-exec frame (`read_args`, `shell_args`,
-    // `pi_read_args`, …) is relayed to the client as an ordinary tool call
-    // instead of being refused. This is the half the earlier direct-forward
-    // attempt got wrong: it built typed result frames by hand per variant and
-    // they were not matched by the server. The canonical layer owns that
-    // mapping now, keyed by the originating variant, so a result can only ever
-    // come back in the arm it arrived on.
-    const nativeCall = cursorVariantForExecArgs(execServer);
-    // Only a tool the request actually declared may be relayed. A host frame
-    // for something the client never advertised is an undeclared tool like any
-    // other and keeps the refusal — forwarding it would hand the client a call
-    // it has no handler for and nowhere to send the result.
-    const declaredNative = nativeCall !== undefined &&
-      session.descriptors.some((d) => d.toolName === nativeCall.variant.name);
-    if (nativeCall !== undefined && declaredNative) {
-      return {
-        kind: "tool_call",
-        execId,
-        execIdString,
-        toolName: nativeCall.variant.name,
-        arguments: JSON.stringify(nativeCall.args),
-      };
+    // Native exec frames (`read_args`, `shell_args`, `ct_read_args`, …) are
+    // executed locally by this gateway — not relayed to the client and not
+    // refused. The executor returns the wire result message for the frame's
+    // result oneof, so a reply can only come back in the arm it arrived on.
+    // Frames the executor does not implement fall through to the refusal.
+    const execFrame = resolveExecFrame(execServer);
+    if (execFrame !== undefined) {
+      const executed = await executeNativeTool(execFrame.frameKey, execFrame.args, process.cwd());
+      if (executed !== undefined) {
+        await handle.write(
+          encodeMessage("AgentClientMessage", {
+            exec_client_message: {
+              id: execId,
+              exec_id: execIdString ?? "",
+              [executed.field]: executed.message,
+            },
+          }),
+        );
+        return { kind: "handled" };
+      }
     }
-    // MCP is the fallback, not the first stop: client-declared tools have no
-    // native slot in `agent.proto`, so they are the ones that must travel this
-    // channel. An arm neither path claims falls through to the refusal below.
+    // MCP remains for client-declared tools: they have no native slot, so a
+    // declared `mcp_args` arm is relayed to the client as an ordinary tool
+    // call. Undeclared MCP is refused.
     const mcpArgs = recordOf(execServer["mcp_args"]);
     if (mcpArgs !== undefined) {
       const call = readExecutableMcpCall(mcpArgs, session.descriptors);
@@ -1168,6 +1173,21 @@ class CursorAdapter implements ProviderAdapter {
     await handle.write(buildExecThrow(execId, refusal, execIdString));
     await handle.write(buildExecStreamClose(execId, execIdString));
     return { kind: "handled" };
+  }
+
+  /**
+   * True when an MCP allowlist precheck targets a tool the request actually
+   * declared (so it can be relayed to the client). Undeclared MCP is denied.
+   */
+  mcpArgsAreDeclared(
+    execServer: Record<string, unknown>,
+    descriptors: readonly CursorToolDescriptor[],
+  ): boolean {
+    const precheck = recordOf(execServer["mcp_allowlist_precheck_args"]);
+    if (precheck === undefined) return false;
+    const toolName = nonEmptyStringOf(precheck["tool_name"]);
+    if (toolName === undefined) return false;
+    return descriptors.some((d) => d.toolName === toolName);
   }
 
   /**
