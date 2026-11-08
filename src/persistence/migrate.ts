@@ -196,4 +196,5 @@ export async function readMigrationLedgerStatus(
     }
     return true;
   });
+  return { expected, pending, applied: pending.length === 0 };
 }
