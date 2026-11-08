@@ -92,7 +92,6 @@ RUN test -f /app/migrations/full-postgres/0000_baseline.sql \
     && test -f /app/migrations/lite-sqlite3/0001_allow_multiple_shared_keys_per_ip.sql
 COPY --from=builder --chown=cartethyia:cartethyia /build/dist/dashboard ./dist/dashboard
 COPY --chmod=755 docker-entrypoint.sh ./entrypoint.sh
-COPY --from=builder --chown=cartethyia:cartethyia /build/vendor ./vendor
 COPY --from=builder --chown=cartethyia:cartethyia /build/dist/cartethyia ./cartethyia
 
 # AOT prewarm keeps first boot fast; the binary reads this instead of
