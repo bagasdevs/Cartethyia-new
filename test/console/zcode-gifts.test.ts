@@ -16,7 +16,7 @@ afterEach(() => { globalThis.fetch = originalFetch; });
 const runId = createRunId("zcode-gifts");
 
 dbDescribe("ZCode gift console boundary", () => {
-  for (const scenario of ["broken", "business", "malformed", "nothing", "claimed", "already_claimed", "captcha", "unknown", "partial", "credential-error"] as const) {
+  for (const scenario of ["broken", "business", "malformed", "nothing", "claimed", "already_claimed", "captcha", "unknown", "credential-error"] as const) {
     test(`manual claim reports ${scenario} honestly`, async () => {
       await withRollback(async (client) => {
         const tenant = await createTenant(client, runId);
@@ -26,14 +26,14 @@ dbDescribe("ZCode gift console boundary", () => {
         let posts = 0;
         globalThis.fetch = Object.assign(async (_input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
           if (init?.method === "POST") {
-            const code = scenario === "captcha" ? 3007 : scenario === "already_claimed" ? 1003 : scenario === "unknown" ? 9999 : scenario === "partial" && posts > 0 ? 3007 : 0;
+            const code = scenario === "captcha" ? 3007 : scenario === "already_claimed" ? 1003 : scenario === "unknown" ? 9999 : 0;
             posts += 1;
             return Response.json({ code });
           }
           if (scenario === "broken") return new Response("not-json");
           if (scenario === "business") return Response.json({ code: 0, success: false });
           if (scenario === "malformed") return Response.json({ code: 0, data: { plans: {}, deliveries: {} } });
-          return Response.json({ code: 0, data: { deliveries: [], plans: scenario === "nothing" ? [] : Array.from({ length: scenario === "partial" ? 2 : 1 }, (_, i) => ({ plan_id: `gift-${i}`, name: `Gift ${i}` })) } });
+          return Response.json({ code: 0, data: { deliveries: [], plans: scenario === "nothing" ? [] : [{ plan_id: "gift-0", name: "Gift 0" }] } });
         }, { preconnect: originalFetch.preconnect });
         const quota = { source: "zcode-start", plan: null, windows: [], error: null };
         await setCachedQuota(tenant.tenantId, id, quota, undefined);
@@ -58,7 +58,7 @@ dbDescribe("ZCode gift console boundary", () => {
         expect(body.ok).toBe(!failure);
         expect(body.data.state).toBe(failure ? "error" : scenario);
         expect(JSON.stringify(body)).not.toContain("dummy-secret");
-        if (scenario === "claimed" || scenario === "partial") {
+        if (scenario === "claimed") {
           expect(body.data.claimed).toEqual(["Gift 0"]);
           expect(await getCachedQuotaEntry(tenant.tenantId, id, undefined)).toBeNull();
           expect(await getCachedQuotaEntry(GLOBAL_QUOTA_LENS, id, undefined)).toBeNull();
@@ -71,7 +71,7 @@ dbDescribe("ZCode gift console boundary", () => {
           expect(invalidations).toBe(0);
         }
         await invalidateQuotaCacheForAccount(id, undefined);
-        if (scenario === "partial" || scenario === "captcha") expect(body.data.detail).toContain("ZCode app");
+        if (scenario === "captcha") expect(body.data.detail).toContain("ZCode app");
       });
     });
   }

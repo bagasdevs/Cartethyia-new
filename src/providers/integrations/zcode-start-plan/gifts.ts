@@ -65,9 +65,10 @@ function headers(credential: string, accountId: string): Record<string, string> 
 }
 
 /** The claim actions a marketing delivery offers, and the plan's own name. */
-function bannerClaims(delivery: unknown): { plans: Array<{ planId: string; name: string | null }>; malformed: boolean } {
+function bannerClaims(delivery: unknown): { plans: Array<{ planId: string; name: string | null; priority: number }>; malformed: boolean } {
   const ids: string[] = [];
   const names: string[] = [];
+  let priority = 0;
   let malformed = false;
   const walk = (node: unknown, depth: number): void => {
     if (depth > 12) return;
@@ -85,11 +86,13 @@ function bannerClaims(delivery: unknown): { plans: Array<{ planId: string; name:
     const plan = asRecord(record["zcode_plan"]);
     const name = asTrimmedString(plan?.["name"]);
     if (name !== undefined) names.push(name);
+    const p = asCoercedNumber(plan?.["priority"]);
+    if (p !== undefined) priority = p;
     for (const value of Object.values(record)) walk(value, depth + 1);
   };
   walk(delivery, 0);
   const name = names[0] ?? null;
-  return { plans: ids.map((planId) => ({ planId, name })), malformed };
+  return { plans: ids.map((planId) => ({ planId, name, priority })), malformed };
 }
 
 /** Only a successful, readable envelope can represent an empty list. */
@@ -126,6 +129,8 @@ async function read(
 export interface ZcodeGiftPlan {
   readonly planId: string;
   readonly name: string | null;
+  /** Upstream `priority`; claim always takes highest-priority claimable plan first. */
+  readonly priority: number;
   /** Where the plan was discovered: a marketing banner, billing preview, or a referral reward. */
   readonly source: "marketing" | "preview" | "incentive";
   /** Referral task progress; present only for incentive rewards. */
@@ -164,7 +169,7 @@ async function toClaim(
       for (const delivery of Array.isArray(deliveries) ? deliveries : []) {
         const banner = bannerClaims(delivery);
         if (banner.malformed) unread.push("marketing feed has an invalid claim action");
-        for (const claim of banner.plans) add({ planId: claim.planId, name: claim.name ?? claim.planId, source: "marketing" });
+        for (const claim of banner.plans) add({ planId: claim.planId, name: claim.name ?? claim.planId, priority: claim.priority, source: "marketing" });
       }
     }
   } catch {
@@ -193,6 +198,7 @@ async function toClaim(
         add({
           planId,
           name: asTrimmedString(plan?.["name"]) ?? planId,
+          priority: asCoercedNumber(plan?.["priority"]) ?? 0,
           source: "preview",
           ...(entitlements.length > 0 ? { entitlements: entitlements.map((raw) => {
             const entitlement = asRecord(raw);
@@ -239,6 +245,7 @@ async function toClaim(
         add({
           planId,
           name: asTrimmedString(reward?.["title"]) ?? asTrimmedString(plan?.["name"]) ?? planId,
+          priority: 0,
           source: "incentive",
           ...(hasProgress ? { progress: { current, target, state } } : {}),
           ...(inviteCode !== undefined ? { inviteCode } : {}),
@@ -333,7 +340,7 @@ async function claimOne(
   return "failed";
 }
 
-/** Claims every gift plan ZCode offers the account. */
+/** Claims the highest-priority claimable gift plan (upstream `ClaimBest`). */
 export async function claimZcodeGifts(args: {
   readonly accountId: string;
   readonly credential: string;
@@ -345,13 +352,15 @@ export async function claimZcodeGifts(args: {
     const { plans: discovered, unread } = await toClaim(fetcher, credential, accountId);
     // An incentive reward whose target is unmet would only draw a rejection
     // from the claim POST; it is "not yet", not a failure. Preview lists it;
-    // the claim skips it.
-    const plans = discovered.filter((plan) =>
+    // the claim skips it. Only the highest-priority claimable plan is claimed
+    // per run (upstream `ClaimBest`); the rest wait for the next run.
+    const claimable = discovered.filter((plan) =>
       plan.source !== "incentive" || plan.progress === undefined ||
       (plan.progress.state === "completed" || plan.progress.state === "achieved") ||
       (plan.progress.target > 0 && plan.progress.current >= plan.progress.target)
     );
-    const skipped = discovered.length - plans.length;
+    const skipped = discovered.length - claimable.length;
+    const plans = claimable.length ? [claimable.reduce((a, b) => (b.priority > a.priority ? b : a))] : [];
     if (plans.length === 0) {
       return unread.length > 0
         ? { state: "error", claimed: [], detail: unread.join("; ") }

@@ -249,8 +249,9 @@ action; quota cards do not expose gift claims. It opens a preview dialog that
 reads marketing banners, billing preview, and the
 incentive referral summary — every discovered plan shows its source,
 entitlements, and (for referral tasks) progress and invite code — without
-claiming anything. **Claim all** then
-posts each claimable `plan_id` to `/api/v1/zcode-plan/billing/claim`; a
+claiming anything. **Claim highest priority** then posts the highest-priority
+claimable `plan_id` (upstream `priority`; marketing/banner and billing preview
+sources carry it, incentive rewards are 0) to `/api/v1/zcode-plan/billing/claim`;
 referral reward whose target is unmet is listed as **In progress** and skipped
 by the claim instead of drawing a rejection. A `zcode-v*-start-plan-*` id is never POSTed:
 activating the Start Plan free tier replays the client handshake

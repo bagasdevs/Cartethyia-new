@@ -84,12 +84,16 @@ describe("ZCode gift outcomes", () => {
     expect((await claim(fetcher)).state).toBe("error");
   });
 
-  test("mixed claims retain grants without hiding CAPTCHA or failure", async () => {
-    const result = await claim(fixture(emptyFeed, preview(4), [0, 1003, 3007, 7777]).fetcher);
-    expect(result.state).toBe("partial");
-    expect(result.claimed).toEqual(["Gift 0"]);
-    expect(result.detail).toContain("CAPTCHA");
-    expect(result.detail).toContain("failed");
+  test("claims only the highest-priority plan", async () => {
+    const prioPreview = { code: 0, data: { plans: [
+      { plan_id: "p-low", name: "Low", priority: 1 },
+      { plan_id: "p-high", name: "High", priority: 9 },
+    ] } };
+    const upstream = fixture(emptyFeed, prioPreview, [0]);
+    const result = await claim(upstream.fetcher);
+    expect(result.state).toBe("claimed");
+    expect(result.claimed).toEqual(["High"]);
+    expect(upstream.posts()).toBe(1);
   });
 
   test("an unread list is partial even when every discovered gift was already claimed", async () => {

@@ -189,7 +189,7 @@ function GiftPreviewDialog({ accountId, accountName, open, onClose, onClaim, cla
         )}
         <div className="flex items-center justify-between gap-3">
           <p className="min-w-0 truncate text-micro text-text-tertiary">
-            Claiming takes every claimable plan once; unknown replies surface as failures.
+            Claims the highest-priority plan; unknown replies surface as failures.
           </p>
           <div className="flex shrink-0 items-center gap-2">
             <Button size="sm" variant="secondary" onClick={onClose}>Close</Button>
@@ -200,7 +200,7 @@ function GiftPreviewDialog({ accountId, accountName, open, onClose, onClaim, cla
               icon={claiming ? <Loader2 size={12} className="animate-spin" /> : <Gift size={12} />}
               onClick={onClaim}
             >
-              {claiming ? "Claiming…" : "Claim all"}
+              {claiming ? "Claiming…" : "Claim highest priority"}
             </Button>
           </div>
         </div>
