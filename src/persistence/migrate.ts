@@ -98,6 +98,15 @@ function hashStatements(source: string): string {
 }
 
 /**
+ * Migrations that were renamed during a fork merge. The SQL is byte-for-byte
+ * identical; only the filename changed (conflicting `0044` numbering). Treat
+ * the old id as supported so existing databases boot instead of crashing.
+ */
+const KNOWN_RENAMED_MIGRATIONS: Record<string, string> = {
+  "0044_add_telemetry_cache_write_tokens.sql": "0046_add_telemetry_cache_write_tokens.sql",
+};
+
+/**
  * Rejects databases whose schema was created by retired migration files or
  * which have tables but no record of the current baseline.
  */
@@ -108,7 +117,10 @@ export function assertMigrationHistorySupported(
   currentBaselineMarker?: string,
 ): void {
   const supported = new Set(expected);
-  const retired = [...applied].filter((migrationId) => !supported.has(migrationId));
+  const retired = [...applied].filter(
+    (migrationId) =>
+      !supported.has(migrationId) && KNOWN_RENAMED_MIGRATIONS[migrationId] === undefined,
+  );
   if (retired.length > 0) {
     throw new Error(
       `Database contains retired migration history (${retired.join(", ")}). ` +
