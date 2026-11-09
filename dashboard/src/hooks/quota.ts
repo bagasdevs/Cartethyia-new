@@ -185,14 +185,44 @@ export function useAccountGiftPreview(accountId: string, enabled: boolean) {
   });
 }
 
+/** DeepSeek-V4.1-Flash captcha configuration for claim verification. */
+export interface CaptchaConfig {
+  readonly enabled: boolean;
+  readonly region?: string;
+  readonly prefix?: string;
+  readonly sceneId?: string;
+}
+
+/** Fetches the DeepSeek-V4.1-Flash captcha config for an account. */
+export function useCaptchaConfig(accountId: string, enabled: boolean) {
+  return useQuery<CaptchaConfig>({
+    queryKey: ["captcha-config", accountId],
+    queryFn: async ({ signal }) => {
+      const result = await consoleRequest<{ ok: boolean; data: CaptchaConfig }>(
+        `/accounts/${encodeURIComponent(accountId)}/captcha-config`,
+        signal ? { signal } : undefined,
+      );
+      return result.data;
+    },
+    enabled,
+    staleTime: 60_000,
+  });
+}
+
 /** Explicit operator action; new entitlements invalidate the cached quota views. */
 export function useClaimAccountGifts(accountId: string) {
   const queryClient = useQueryClient();
-  return useMutation<GiftClaimResult, ApiErrorShape, void>({
-    mutationFn: async () => {
+  return useMutation<GiftClaimResult, ApiErrorShape, { captchaVerifyParam?: string; captchaVerifyRegion?: string } | void>({
+    mutationFn: async (captcha) => {
       const result = await consoleRequest<{ readonly data: GiftClaimResult }>(
         `/accounts/${encodeURIComponent(accountId)}/claim-gifts`,
-        { method: "POST" },
+        { 
+          method: "POST",
+          body: captcha ? JSON.stringify({
+            captchaVerifyParam: captcha.captchaVerifyParam,
+            captchaVerifyRegion: captcha.captchaVerifyRegion,
+          }) : undefined,
+        },
       );
       return result.data;
     },
