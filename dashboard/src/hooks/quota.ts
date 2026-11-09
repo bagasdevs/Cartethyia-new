@@ -172,11 +172,14 @@ export interface GiftPreview {
 export function useAccountGiftPreview(accountId: string, enabled: boolean) {
   return useQuery<GiftPreview>({
     queryKey: queryKeys.quota.giftPreview(accountId),
-    queryFn: ({ signal }) =>
-      consoleRequest<GiftPreview & { readonly id: string }>(
+    queryFn: async ({ signal }) => {
+      const result = await consoleRequest<GiftPreview & { readonly data: GiftPreview; readonly id: string }>(
         `/accounts/${encodeURIComponent(accountId)}/claim-gifts`,
         signal ? { signal } : undefined,
-      ),
+      );
+      // Backend returns an envelope {ok, status, data, message}; unwrap the data field.
+      return result.data ?? result;
+    },
     enabled,
     staleTime: 30_000,
   });
