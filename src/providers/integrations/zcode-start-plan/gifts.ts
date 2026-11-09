@@ -293,7 +293,8 @@ async function startPlanHandshake(
     return plans.some((entry) => {
       const plan = asRecord(entry);
       return asTrimmedString(plan?.["status"])?.toLowerCase() === "active" &&
-        /^zcode-v\d+-start-plan-/.test(asTrimmedString(plan?.["plan_id"]) ?? "");
+        // Only exact start-plan IDs (without numeric suffixes like -1109)
+        /^zcode-v\d+-start-plan$/.test(asTrimmedString(plan?.["plan_id"]) ?? "");
     });
   } catch {
     return false;
@@ -311,7 +312,9 @@ async function claimOne(
   // handshake (marketing touch → incentive summary → billing preview →
   // billing balance), not by POSTing to the claim endpoint; that POST answers
   // a rejection for this plan id.
-  if (/^zcode-v\d+-start-plan-/.test(planId)) {
+  // Only exact "zcode-v{N}-start-plan" IDs (without additional suffixes like
+  // "-1109" which are marketing/promotional plans) trigger the handshake.
+  if (/^zcode-v\d+-start-plan$/.test(planId)) {
     const activated = await startPlanHandshake(fetcher, credential, accountId);
     return activated ? "claimed" : "failed";
   }

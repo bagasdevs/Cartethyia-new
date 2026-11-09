@@ -131,8 +131,9 @@ describe("ZCode gift outcomes", () => {
   });
 
   test("a start-plan id activates through the handshake instead of the claim POST", async () => {
-    const feed = { code: 0, data: { deliveries: [{ banner: { buttons: [{ action: { type: "claim_zcode_plan", args: { plan_id: "zcode-v3-start-plan-0817" } } }] } }] } };
-    const balance = { code: 0, data: { plans: [{ plan_id: "zcode-v3-start-plan-0817", status: "active" }] } };
+    // Exact start-plan ID (no numeric suffix) triggers handshake
+    const feed = { code: 0, data: { deliveries: [{ banner: { buttons: [{ action: { type: "claim_zcode_plan", args: { plan_id: "zcode-v3-start-plan" } } }] } }] } };
+    const balance = { code: 0, data: { plans: [{ plan_id: "zcode-v3-start-plan", status: "active" }] } };
     const fetcher: ValidatedFetch = async (url, init) => {
       const target = String(url);
       if (init?.method === "POST") throw new Error("claim POST must not run for the start plan");
@@ -141,14 +142,35 @@ describe("ZCode gift outcomes", () => {
       return Response.json({ code: 0, data: {} });
     };
     expect(await claimZcodeGifts({ accountId: "fixture", credential: "dummy-secret", fetcher }))
-      .toEqual({ state: "claimed", claimed: ["zcode-v3-start-plan-0817"], detail: null });
+      .toEqual({ state: "claimed", claimed: ["zcode-v3-start-plan"], detail: null });
   });
 
   test("a start-plan handshake without an active plan is a failure, not a success", async () => {
-    const feed = { code: 0, data: { deliveries: [{ banner: { buttons: [{ action: { type: "claim_zcode_plan", args: { plan_id: "zcode-v3-start-plan-0817" } } }] } }] } };
+    // Exact start-plan ID (no numeric suffix) triggers handshake
+    const feed = { code: 0, data: { deliveries: [{ banner: { buttons: [{ action: { type: "claim_zcode_plan", args: { plan_id: "zcode-v3-start-plan" } } }] } }] } };
     const upstream = fixture(feed, emptyPreview);
     expect((await claim(upstream.fetcher)).state).toBe("error");
     expect(upstream.posts()).toBe(0);
+  });
+
+  test("a marketing plan with start-plan-like ID claims via POST, not handshake", async () => {
+    // Marketing plans with numeric suffix (e.g. -0817) go through POST claim
+    const feed = { code: 0, data: { deliveries: [{ banner: { buttons: [{ action: { type: "claim_zcode_plan", args: { plan_id: "zcode-v3-start-plan-0817" } } }] } }] } };
+    const claimResponse = { code: 0, data: { plan: { plan_id: "zcode-v3-start-plan-0817" } } };
+    let postCalled = false;
+    const fetcher: ValidatedFetch = async (url, init) => {
+      const target = String(url);
+      if (init?.method === "POST" && target.includes("billing/claim")) {
+        postCalled = true;
+        return Response.json(claimResponse);
+      }
+      if (target.includes("marketing/touch")) return Response.json(feed);
+      return Response.json({ code: 0, data: {} });
+    };
+    const result = await claimZcodeGifts({ accountId: "fixture", credential: "dummy-secret", fetcher });
+    expect(postCalled).toBe(true);
+    expect(result.state).toBe("claimed");
+    expect(result.claimed).toEqual(["zcode-v3-start-plan-0817"]);
   });
 });
 
