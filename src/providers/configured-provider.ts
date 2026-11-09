@@ -3,6 +3,7 @@ import type { CanonicalRequest, WireFamily } from "../protocol/canonical-model";
 import { GatewayError } from "../protocol/gateway-error";
 import { OpenAICompatibleAdapter, withBearerAuthentication } from "./adapters/compatible-adapter";
 import { providerBaseUrl } from "./provider-metadata";
+import type { ProviderModule } from "./provider-registry";
 
 export function ensurePayloadModel(
   payload: Record<string, unknown>,
@@ -15,6 +16,7 @@ export function ensurePayloadModel(
   payload["model"] = model;
   return model;
 }
+
 /**
  * Declarative description of one bearer-authenticated OpenAI-compatible provider.
  *
@@ -98,3 +100,149 @@ export function createApiKeyAdapter(
     }),
   );
 }
+
+function apiKeySpec(
+  providerId: ProviderId,
+  paths: Readonly<Partial<Record<"chat" | "responses", string>>>,
+): ApiKeyProviderSpec {
+  return {
+    provider_id: providerId,
+    endpoint_paths_by_wire_family: paths,
+  };
+}
+
+const BEARER_PATHS = { chat: "/chat/completions", responses: "/responses" } as const;
+
+/**
+ * Builtin providers whose entire adapter contract is "bearer auth against the
+ * provider's `BUNDLED_PROVIDER_METADATA` base URL, OpenAI-compatible chat +
+ * responses, with endpoint paths declared below the base's version root".
+ */
+export const GENERIC_API_KEY_SPECS = {
+  larprouter: apiKeySpec("larprouter", BEARER_PATHS),
+  mistral: apiKeySpec("mistral", BEARER_PATHS),
+  fireworks: apiKeySpec("fireworks", BEARER_PATHS),
+  nvidia: apiKeySpec("nvidia", BEARER_PATHS),
+  gmi: apiKeySpec("gmi", BEARER_PATHS),
+  ollamacloud: apiKeySpec("ollamacloud", BEARER_PATHS),
+  together: apiKeySpec("together", BEARER_PATHS),
+  siliconflow: apiKeySpec("siliconflow", BEARER_PATHS),
+  siliconflowcn: apiKeySpec("siliconflowcn", BEARER_PATHS),
+  nanogpt: apiKeySpec("nanogpt", BEARER_PATHS),
+  baseten: apiKeySpec("baseten", BEARER_PATHS),
+  synthetic: apiKeySpec("synthetic", BEARER_PATHS),
+  stepfun: apiKeySpec("stepfun", BEARER_PATHS),
+  sakana: apiKeySpec("sakana", BEARER_PATHS),
+  helmcode: apiKeySpec("helmcode", BEARER_PATHS),
+  coralbricks: apiKeySpec("coralbricks", BEARER_PATHS),
+  aiand: apiKeySpec("aiand", BEARER_PATHS),
+  wafer: apiKeySpec("wafer", BEARER_PATHS),
+  coreweave: apiKeySpec("coreweave", BEARER_PATHS),
+  dashscope: apiKeySpec("dashscope", BEARER_PATHS),
+  "qwen-portal": apiKeySpec("qwen-portal", BEARER_PATHS),
+} satisfies Readonly<Record<string, ApiKeyProviderSpec>>;
+
+export type GenericApiKeyProviderId = keyof typeof GENERIC_API_KEY_SPECS;
+
+export const GENERIC_API_KEY_PROVIDER_IDS = Object.keys(
+  GENERIC_API_KEY_SPECS,
+) as readonly GenericApiKeyProviderId[];
+
+/**
+ * Ids whose base URL already ends at a version segment.
+ */
+export const VERSIONED_ROOT_API_KEY_SPECS = {
+  groq: apiKeySpec("groq", BEARER_PATHS),
+  deepinfra: apiKeySpec("deepinfra", BEARER_PATHS),
+  novita: apiKeySpec("novita", BEARER_PATHS),
+  venice: apiKeySpec("venice", BEARER_PATHS),
+  qianfan: apiKeySpec("qianfan", BEARER_PATHS),
+  zhipucoding: apiKeySpec("zhipucoding", BEARER_PATHS),
+  firepass: apiKeySpec("firepass", BEARER_PATHS),
+} satisfies Readonly<Record<string, ApiKeyProviderSpec>>;
+
+export type VersionedRootApiKeyProviderId =
+  keyof typeof VERSIONED_ROOT_API_KEY_SPECS;
+
+export const VERSIONED_ROOT_API_KEY_PROVIDER_IDS = Object.keys(
+  VERSIONED_ROOT_API_KEY_SPECS,
+) as readonly VersionedRootApiKeyProviderId[];
+
+type DiscoveryBackedCapabilities = Pick<
+  ProviderModule,
+  "endpointPathsByWireFamily" | "loadAdapter" | "loadModelDiscovery"
+>;
+
+type ModelDiscoveryFactory = NonNullable<ProviderModule["loadModelDiscovery"]>;
+export type OpenAIModelDiscoveryFactory = (
+  providerId: string,
+  options?: {
+    readonly headers?: (credential: string) => Readonly<Record<string, string>>;
+  },
+) => ModelDiscoveryFactory;
+
+const DISCOVERY_BACKED_PROVIDER_SPECS = {
+  groq: VERSIONED_ROOT_API_KEY_SPECS.groq,
+  larprouter: GENERIC_API_KEY_SPECS.larprouter,
+  together: GENERIC_API_KEY_SPECS.together,
+  deepinfra: VERSIONED_ROOT_API_KEY_SPECS.deepinfra,
+  siliconflow: GENERIC_API_KEY_SPECS.siliconflow,
+  siliconflowcn: GENERIC_API_KEY_SPECS.siliconflowcn,
+  novita: VERSIONED_ROOT_API_KEY_SPECS.novita,
+  venice: VERSIONED_ROOT_API_KEY_SPECS.venice,
+  nanogpt: GENERIC_API_KEY_SPECS.nanogpt,
+  baseten: GENERIC_API_KEY_SPECS.baseten,
+  synthetic: GENERIC_API_KEY_SPECS.synthetic,
+  stepfun: GENERIC_API_KEY_SPECS.stepfun,
+  sakana: GENERIC_API_KEY_SPECS.sakana,
+  helmcode: GENERIC_API_KEY_SPECS.helmcode,
+  coralbricks: GENERIC_API_KEY_SPECS.coralbricks,
+  aiand: GENERIC_API_KEY_SPECS.aiand,
+  wafer: GENERIC_API_KEY_SPECS.wafer,
+  firepass: VERSIONED_ROOT_API_KEY_SPECS.firepass,
+  zhipucoding: VERSIONED_ROOT_API_KEY_SPECS.zhipucoding,
+  dashscope: GENERIC_API_KEY_SPECS.dashscope,
+  qianfan: VERSIONED_ROOT_API_KEY_SPECS.qianfan,
+} satisfies Readonly<Record<string, ApiKeyProviderSpec>>;
+
+type DiscoveryBackedProviderId = keyof typeof DISCOVERY_BACKED_PROVIDER_SPECS;
+
+/** Canonical discovery-backed provider ids, in declaration order. */
+export const DISCOVERY_BACKED_PROVIDER_IDS = Object.keys(
+  DISCOVERY_BACKED_PROVIDER_SPECS,
+) as readonly DiscoveryBackedProviderId[];
+
+export function discoveryBackedCapabilities(
+  providerId: string,
+  spec: ApiKeyProviderSpec,
+  openAIModelDiscovery: OpenAIModelDiscoveryFactory,
+): DiscoveryBackedCapabilities {
+  return {
+    ...(spec.endpoint_paths_by_wire_family === undefined
+      ? {}
+      : { endpointPathsByWireFamily: spec.endpoint_paths_by_wire_family }),
+    loadAdapter: async () => createApiKeyAdapter(spec),
+    loadModelDiscovery: openAIModelDiscovery(providerId, {
+      headers: (credential) => ({ authorization: `Bearer ${credential}` }),
+    }),
+  };
+}
+
+/**
+ * Creates the standard provider capability table using the registry's shared
+ * discovery loader, keeping its lazy import and authentication behavior intact.
+ */
+export function createDiscoveryBackedProviderCapabilities(
+  openAIModelDiscovery: OpenAIModelDiscoveryFactory,
+): Readonly<Record<DiscoveryBackedProviderId, DiscoveryBackedCapabilities>> {
+  const capabilities = {} as Record<DiscoveryBackedProviderId, DiscoveryBackedCapabilities>;
+  for (const providerId of DISCOVERY_BACKED_PROVIDER_IDS) {
+    capabilities[providerId] = discoveryBackedCapabilities(
+      providerId,
+      DISCOVERY_BACKED_PROVIDER_SPECS[providerId],
+      openAIModelDiscovery,
+    );
+  }
+  return capabilities;
+}
+

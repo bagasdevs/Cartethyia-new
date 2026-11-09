@@ -472,8 +472,9 @@ export async function selectProbeAccount(args: {
  * back to the generic OpenAI-compatible adapter so probe/dispatch still works.
  * The low-level compatible adapter is used directly to avoid importing concrete
  * integrations from discovery (which would violate the provider-architecture
- * layering test). `loadOne` returning `undefined` means "no bundled adapter";
- * a throw is a registry failure and propagates rather than being reported as
+ * layering test). `resolve(..., { force: true })` rebuilds the bundled adapter
+ * against the current registration; `undefined` means "no bundled adapter"; a
+ * throw is a registry failure and propagates rather than being reported as
  * "no adapter registered".
  */
 export async function resolveProbeAdapter(args: {
@@ -482,7 +483,7 @@ export async function resolveProbeAdapter(args: {
   readonly providerWireRow: ProbeProviderRow | undefined;
 }): Promise<ProviderAdapter | undefined> {
   const { providerRegistry, providerId, providerWireRow } = args;
-  let adapter = await providerRegistry.loadOne(providerId);
+  let adapter = await providerRegistry.resolve(providerId, { force: true });
   if (!adapter) {
     try {
       if (providerWireRow?.baseUrl) {
@@ -665,8 +666,16 @@ export function buildProbeCanonicalRequest(args: {
    * probe.
    */
   readonly providerSystemPrompt?: string | undefined;
+  /**
+   * A provider-specific default probe prompt, used when the operator sent no
+   * prompt. Lets a provider whose policy gate flags repeated identical probes
+   * (Freebuff: `prompt_policy_refused` / "same message sent over and over")
+   * receive a minimal, per-model-varying probe instead of the shared identity
+   * question every provider otherwise sends.
+   */
+  readonly defaultPromptOverride?: string | undefined;
 }): CanonicalRequest {
-  const { modelId, request, probeReasoning, sourceSurface, maxOutputTokens, providerSystemPrompt } = args;
+  const { modelId, request, probeReasoning, sourceSurface, maxOutputTokens, providerSystemPrompt, defaultPromptOverride } = args;
   const fast = maxOutputTokens === PROBE_FAST_MAX_OUTPUT_TOKENS;
   return {
     model: modelId,
@@ -681,6 +690,7 @@ export function buildProbeCanonicalRequest(args: {
             kind: "text",
             text:
               request.prompt ??
+              defaultPromptOverride ??
               (fast ? PROBE_FAST_DEFAULT_PROMPT : "What model are you, and what is your knowledge cutoff date? Answer in one sentence."),
           },
         ],

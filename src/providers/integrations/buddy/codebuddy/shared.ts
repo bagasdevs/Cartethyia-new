@@ -87,7 +87,7 @@ export async function codebuddyHeaders(
     };
   }
   const purpose = buddyAgentPurpose(context, request);
-  return {
+  const headers: Record<string, string> = {
     accept: "text/event-stream",
     "User-Agent": ua,
     "X-Product": "SaaS",
@@ -100,28 +100,29 @@ export async function codebuddyHeaders(
     "X-Domain": codebuddyDomain(variant),
     "x-requested-with": "XMLHttpRequest",
     "x-codebuddy-request": "1",
-    // The effective agent purpose, matching the reference's dynamic value.
-    // The reference does not invent `conversation`; it sends the purpose only
-    // when one exists.
-    ...(purpose === undefined ? {} : { "X-Agent-Purpose": purpose }),
-    // The upstream's channel check reads the turn-level aggregation key, and a
-    // chat request without it is refused for a missing conversation id.
-    ...conversation,
-    // Per-account device binding (qimei36) — distinct device per account.
-    ...(() => {
-      const binding = resolveBuddyDeviceBinding(context);
-      return binding === undefined ? {} : { "X-Device-Id-List": JSON.stringify({ qimei36: binding }) };
-    })(),
-    // The desktop client sends the device-token pair on both realms. Captured
-    // token (auth_state / device-token file) when present, otherwise the
-    // official failure placeholder. (CLI branch above already returned without
-    // device headers.)
-    ...(await buddyDeviceTokenHeaders({
-      realm: identity === "IDE" ? "intl" : "cn",
-      context,
-      cliIdentity,
-    })),
   };
+  // The effective agent purpose, matching the reference's dynamic value.
+  // The reference does not invent `conversation`; it sends the purpose only
+  // when one exists.
+  if (purpose !== undefined) headers["X-Agent-Purpose"] = purpose;
+  // The upstream's channel check reads the turn-level aggregation key, and a
+  // chat request without it is refused for a missing conversation id.
+  Object.assign(headers, conversation);
+  // Per-account device binding (qimei36) — distinct device per account.
+  const binding = resolveBuddyDeviceBinding(context);
+  if (binding !== undefined) {
+    headers["X-Device-Id-List"] = JSON.stringify({ qimei36: binding });
+  }
+  // The desktop client sends the device-token pair on both realms. Captured
+  // token (auth_state / device-token file) when present, otherwise the
+  // official failure placeholder. (CLI branch above already returned without
+  // device headers.)
+  Object.assign(headers, await buddyDeviceTokenHeaders({
+    realm: identity === "IDE" ? "intl" : "cn",
+    context,
+    cliIdentity,
+  }));
+  return headers;
 }
 
 /**
@@ -140,6 +141,14 @@ export function codebuddyAdapterConfig(args: {
   ) => void;
   fetchImpl?: typeof fetch;
   cliIdentity?: boolean;
+  /**
+   * Body compression for chat dispatches. The CodeBuddy CLI contract (donor
+   * `codebuddy2api`) gzips the JSON body for the CLI profiles and sends
+   * `Accept-Encoding: identity`. `"json"` (default) keeps plain JSON.
+   */
+  requestCompression?: "json" | "gzip";
+  /** When set, retry a channel-check 400 against this path (console fallback). */
+  channelFallbackPath?: string;
 }): OpenAICompatibleAdapterConfig {
   return withBearerAuthentication({
     provider_id: args.providerId,
@@ -147,6 +156,12 @@ export function codebuddyAdapterConfig(args: {
     buildExtraHeaders: (context, request) =>
       codebuddyHeaders(args.variant, context, request, args.cliIdentity),
     prePayload: args.prePayload,
+    ...(args.requestCompression === undefined
+      ? {}
+      : { request_compression: args.requestCompression }),
+    ...(args.channelFallbackPath === undefined
+      ? {}
+      : { channel_fallback_path: args.channelFallbackPath }),
     ...(args.fetchImpl ? { fetchImpl: args.fetchImpl } : {}),
   });
 }

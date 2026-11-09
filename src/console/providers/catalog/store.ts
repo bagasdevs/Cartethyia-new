@@ -1,6 +1,6 @@
 // Drizzle-backed provider, account, model, routing, and API-key repositories.
-import { and, asc, eq, gte, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
-import { isSqliteDatabase } from "../../../persistence/dialect";
+import { and, asc, eq, gte, inArray, isNull, ne, or, sql, type SQL } from "drizzle-orm";
+import { liveModelCooldownExistsSql } from "../../../persistence/dialect";
 import { ConsoleDomainError } from "../../shared/errors";
 import { parseCustomProviderId, isBundledProviderId } from "../../../providers/provider-contracts";
 import { providerRateLimitIsIpScoped } from "../../../providers/provider-metadata";
@@ -1697,7 +1697,9 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
    * is evaluated in SQL, so the whole provider is handled in one statement
    * without reading rows into the process. `cooldown_until` and
    * `model_cooldowns` are left untouched: they are the evidence the operator
-   * sees on a disabled row until an explicit Recover clears them.
+   * sees on a disabled row until an explicit Recover clears them. A row that
+   * is already `disabled` is not a target — those columns surviving the
+   * status change would otherwise keep matching the predicate forever.
    *
    * Pool-as-account rows live in `provider_pool_accounts`, not this table, so
    * they are excluded by construction. Shared (`tenant_id IS NULL`) rows are
@@ -1790,21 +1792,24 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
   }
 
   /**
-   * `status='cooldown' OR cooldown_until > now OR model_cooldowns` carries a
-   * live entry. The JSON check is dialect-specific: PostgreSQL uses
-   * `jsonb_each_text` (with a shape guard), SQLite `json_each` on its `text`
-   * column. Only entries whose ISO deadline is still in the future count, mirroring
-   * `liveModelCooldowns`. Timestamps are stored as ISO strings on both backends,
-   * so the lexical comparison against `nowIso` is stable.
+   * Not already disabled, and either `status='cooldown'`, `cooldown_until` is
+   * still in the future, or `model_cooldowns` carries a live entry. Scoped to
+   * the caller's own rows (the tenant path never touches `tenant_id IS NULL`
+   * rows). The shared JSON subquery lives in the dialect module; only the
+   * surrounding scoping is the store's.
+   *
+   * The disabled exclusion is load-bearing. Disable preserves the deadline
+   * columns as evidence, so without it a row this action just wrote matches
+   * the predicate again and the operator's count never drops to zero.
    */
   private liveCooldownPredicate(nowIso: string): SQL {
-    const liveModelCooldown = isSqliteDatabase(this.db)
-      ? sql`EXISTS (SELECT 1 FROM json_each(${providerAccounts.modelCooldowns}) AS entry WHERE json_valid(${providerAccounts.modelCooldowns}) AND json_type(${providerAccounts.modelCooldowns}) = 'object' AND entry.value > ${nowIso})`
-      : sql`EXISTS (SELECT 1 FROM jsonb_each_text(${providerAccounts.modelCooldowns}) AS entry WHERE jsonb_typeof(${providerAccounts.modelCooldowns}) = 'object' AND entry.value > ${nowIso})`;
-    return or(
-      eq(providerAccounts.status, "cooldown"),
-      sql`${providerAccounts.cooldownUntil} > ${nowIso}`,
-      liveModelCooldown,
+    return and(
+      ne(providerAccounts.status, "disabled"),
+      or(
+        eq(providerAccounts.status, "cooldown"),
+        sql`${providerAccounts.cooldownUntil} > ${nowIso}`,
+        liveModelCooldownExistsSql(this.db, nowIso),
+      ),
     ) as SQL;
   }
 

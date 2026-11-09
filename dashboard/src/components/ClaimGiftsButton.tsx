@@ -199,6 +199,7 @@ function GiftPreviewDialog({ accountId, accountName, open, onClose, onClaim, cla
               disabled={claiming || (preview.data?.claimableCount ?? 0) === 0}
               icon={claiming ? <Loader2 size={12} className="animate-spin" /> : <Gift size={12} />}
               onClick={onClaim}
+              aria-label="Claim highest priority gift"
             >
               {claiming ? "Claiming…" : "Claim highest priority"}
             </Button>

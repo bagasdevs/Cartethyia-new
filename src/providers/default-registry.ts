@@ -4,13 +4,20 @@
 // drag every integration into memory at process start.
 import {
   GENERIC_API_KEY_SPECS,
-} from "./configured-openai-providers";
-import { createDiscoveryBackedProviderCapabilities, discoveryBackedCapabilities } from "./bundled-discovery-providers";
-import { createApiKeyAdapter } from "./configured-provider";
-import type { ApiKeyProviderSpec } from "./configured-provider";
-import { oauthCapability, quotaCapability, type ProviderModuleCapabilities } from "./provider-capabilities";
+  createDiscoveryBackedProviderCapabilities,
+  discoveryBackedCapabilities,
+  createApiKeyAdapter,
+  type ApiKeyProviderSpec,
+} from "./configured-provider";
 import { BUDDY_PROVIDER_CAPABILITIES } from "./integrations/buddy/capabilities";
-import { ProviderRegistry, toRegistration, type ProviderModule } from "./provider-registry";
+import {
+  ProviderRegistry,
+  toRegistration,
+  oauthCapability,
+  quotaCapability,
+  type ProviderModule,
+  type ProviderModuleCapabilities,
+} from "./provider-registry";
 import { BUNDLED_PROVIDER_METADATA, PROVIDER_COMPATIBILITY_PROFILES, providerBaseUrl, providerRequiresAccount, providerUpstreamHost, providerDefaultWireFamily, type BundledProviderId } from "./provider-metadata";
 import { createAnthropicCompatibleAdapter } from "./integrations/anthropic";
 import { defineModel } from "./provider-model-definition";
@@ -29,6 +36,29 @@ function configuredProvider(
     loadAdapter: async () => createApiKeyAdapter(GENERIC_API_KEY_SPECS[providerId]),
     ...(loadModels === undefined ? {} : { loadModels }),
   };
+}
+
+/**
+ * Extracts a bearer token from a JSON credential object when the stored secret
+ * is a JSON account export, falling back to the raw secret otherwise. Several
+ * discovery paths accept both a bare token and a JSON export, and each used to
+ * re-implement this same parse + key-pick; this keeps the reading in one place.
+ *
+ * Preserves the exact fallback semantics: an unparseable secret, or a JSON
+ * object with none of the recognized token keys, yields the raw secret.
+ */
+function extractJsonCredentialToken(secret: string): string {
+  if (!secret.startsWith("{")) return secret;
+  try {
+    const parsed = JSON.parse(secret) as Record<string, unknown>;
+    const found = ["accessToken", "access_token", "token"].find(
+      (key) => typeof parsed[key] === "string" && (parsed[key] as string).length > 0,
+    );
+    if (found !== undefined) return parsed[found] as string;
+  } catch {
+    // Use the raw secret as the token.
+  }
+  return secret;
 }
 
 /**
@@ -60,18 +90,7 @@ function traeDiscovery(
     if (secret.length === 0 || fetcher === undefined) {
       return realm === "cn" ? TRAE_CN_MODELS : TRAE_INTL_MODELS;
     }
-    let token = secret;
-    if (secret.startsWith("{")) {
-      try {
-        const parsed = JSON.parse(secret) as Record<string, unknown>;
-        const found = ["accessToken", "access_token", "token"].find(
-          (key) => typeof parsed[key] === "string" && (parsed[key] as string).length > 0,
-        );
-        if (found !== undefined) token = parsed[found] as string;
-      } catch {
-        // Use the raw secret as the token.
-      }
-    }
+    const token = extractJsonCredentialToken(secret);
     const region = request.authState?.["region"];
     const rows = await discoverTraeModels({
       realm,
@@ -545,18 +564,7 @@ export const PROVIDER_CAPABILITIES = {
       const secret = request.credential.trim();
       const fetcher = request.fetcher as unknown as typeof fetch | undefined;
       if (secret.length === 0 || fetcher === undefined) return FREEPI_MODELS;
-      let token = secret;
-      if (secret.startsWith("{")) {
-        try {
-          const parsed = JSON.parse(secret) as Record<string, unknown>;
-          const found = ["accessToken", "access_token", "token"].find(
-            (key) => typeof parsed[key] === "string" && (parsed[key] as string).length > 0,
-          );
-          if (found !== undefined) token = parsed[found] as string;
-        } catch {
-          // Use the raw secret as the token.
-        }
-      }
+      const token = extractJsonCredentialToken(secret);
       const rows = await discoverFreepiModels({ token, fetcher });
       if (rows.length === 0) return FREEPI_MODELS;
       return rows;
@@ -670,9 +678,7 @@ export const PROVIDER_CAPABILITIES = {
     // dressed ZCode client request (see the integration). The credential is a
     // ZCode login JWT — pasted, or minted by the sign-in flow below.
     loadAdapter: async () =>
-      createApiKeyAdapter(
-        (await import("./integrations/zcode-start-plan/provider")).ZCODE_START_PLAN_SPEC,
-      ),
+      (await import("./integrations/zcode-start-plan/provider")).createZcodeStartPlanAdapter(),
     loadModels: async () =>
       (await import("./integrations/zcode-start-plan/provider")).ZCODE_START_PLAN_MODELS,
     // The device flow stores the issued ZCode login JWT, not a Coding Plan key.
@@ -783,9 +789,28 @@ export const PROVIDER_CAPABILITIES = {
       responses: "/responses",
     },
     loadAdapter: async () => createApiKeyAdapter(GENERIC_API_KEY_SPECS.ollamacloud),
-    loadModels: async () => (await import("./integrations/ollamacloud-models")).OLLAMACLOUD_MODELS,
-    loadQuotaCollector: quotaCapability(() => import("./integrations/ollamacloud-quota"), "fetchOllamaQuota"),
+    loadModels: async () => (await import("./integrations/ollamacloud")).OLLAMACLOUD_MODELS,
+    loadQuotaCollector: quotaCapability(() => import("./integrations/ollamacloud"), "fetchOllamaQuota"),
     loadModelDiscovery: openAIModelDiscovery("ollamacloud", { headers: (credential) => ({ authorization: `Bearer ${credential}` }) }),
+  },
+  freebuff: {
+    // Freebuff chat is OpenAI-compatible on `/api/v1/chat/completions`, but the
+    // adapter runs a stateful preflight (session admission + agent-runs START)
+    // and a device-signature header set — see the integration.
+    endpointPathsByWireFamily: { chat: "/api/v1/chat/completions" },
+    loadAdapter: async () => (await import("./integrations/freebuff/freebuff")).createFreebuffAdapter(),
+    loadModels: async () => (await import("./integrations/freebuff/freebuff-catalog")).FREEBUFF_MODELS,
+    loadAuthentication: oauthCapability(() => import("./integrations/freebuff/freebuff-oauth"), "freebuffOAuthClient"),
+    loadQuotaCollector: quotaCapability(() => import("./integrations/freebuff/freebuff-quota"), "fetchFreebuffQuota"),
+    loadModelDiscovery: async () =>
+      (await import("./integrations/freebuff/freebuff-discovery")).freebuffModelDiscovery(),
+  },
+  zro: {
+    endpointPathsByWireFamily: { messages: "/v1/messages" },
+    loadAdapter: async () => (await import("./integrations/zro/zro")).createZroAdapter(),
+    loadModels: async () => (await import("./integrations/zro/zro")).ZRO_MODELS,
+    loadQuotaCollector: quotaCapability(() => import("./integrations/zro/zro"), "fetchZroQuota"),
+    loadModelDiscovery: async () => (await import("./integrations/zro/zro")).zroModelDiscovery()(),
   },
 
   ...createDiscoveryBackedProviderCapabilities(openAIModelDiscovery),
@@ -835,7 +860,7 @@ export const PROVIDER_CAPABILITIES = {
   // the provider usable before anyone syncs.
   dashscope: {
     ...discoveryBackedCapabilities("dashscope", GENERIC_API_KEY_SPECS.dashscope, openAIModelDiscovery),
-    loadModels: async () => (await import("./integrations/dashscope-models")).DASHSCOPE_MODELS,
+    loadModels: async () => (await import("./integrations/alibabacp/dashscope-models")).DASHSCOPE_MODELS,
   },
 
 // Anthropic-Messages providers reached with a plain key. The wire path is

@@ -67,14 +67,14 @@ test("provider account rows show future model grants beside, not inside, usable 
   expect(html).toContain("1 of 1 models available");
   expect(html).not.toContain("100% left");
   expect(html).not.toContain("90% left");
-  expect(html).toContain("Expired referral");
-  expect(html).toContain("Expired");
+  expect(html).not.toContain("Expired referral");
+  expect(html).not.toContain("Expired");
   expect(html).not.toContain('data-tone="warn"');
   expect(html).toContain("Next grant");
   expect(html).toContain("glm-5.3-flash");
   expect(html).toContain("Not started yet");
   expect(html).toContain(new Date(startsAt).toLocaleString());
-  expect(html).toContain('aria-label="Claim gifts for Start account"');
+  expect(html).toContain('aria-label="Preview gifts for Start account"');
 });
 
 test("uncapped purchased/free balance remains readable without a fabricated percentage", () => {
@@ -99,7 +99,7 @@ test("uncapped purchased/free balance remains readable without a fabricated perc
   expect(html).not.toContain('aria-valuenow="0"');
 });
 
-test("expired scoped grants are history and never enable an account, including at the expiry boundary", async () => {
+test("expired scoped grants are hidden and never enable an account, including at the expiry boundary", async () => {
   const now = Date.parse("2026-11-02T12:00:00Z");
   Date.now = () => now;
   const data: QuotaOverview = {
@@ -122,8 +122,7 @@ test("expired scoped grants are history and never enable an account, including a
   }, { preconnect: originalFetch.preconnect });
   const view = await mount(createElement(QuotaPage), { seed: [{ key: queryKeys.quota.all, data }] });
   try {
-    expect(view.text()).toContain("Expired");
-    expect(view.text()).toContain("Old referral");
+    expect(view.text()).not.toContain("Old referral");
     expect(view.find('[role="progressbar"]')).toBeNull();
     const available = [...view.container.querySelectorAll("button")].find((button) => button.textContent?.includes("Turn on Available"));
     await view.act(() => available!.click());

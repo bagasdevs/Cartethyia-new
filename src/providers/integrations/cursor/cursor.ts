@@ -64,6 +64,7 @@ import { decodeValueToJson, decodeStructEntriesToJson } from "./protocol/struct"
 import { encodeMessage } from "./protocol/messages";
 import { executeNativeTool, resolveExecFrame } from "./cursor-exec";
 import { fnv1a32 } from "../shared/hash";
+import { TtlCache } from "../../../persistence/ttl-cache";
 
 /**
  * Client-heartbeat cadence for every Cursor Run.
@@ -84,25 +85,25 @@ const CURSOR_HEARTBEAT_INTERVAL_MS = 5_000;
  */
 const CURSOR_ROSTER_TTL_MS = 300_000;
 /**
- * credential → { roster, fetchedAt } for the parameter lookup.
+ * credential → roster for the parameter lookup.
  *
  * Keyed by an FNV-1a digest of the credential rather than the raw token so a
  * long-lived map does not hold live credentials as keys. Bounded by
- * `ROSTER_CACHE_MAX` with oldest-first eviction: the TTL is only checked on
- * read, so without a cap rotated tokens would grow the map without bound.
+ * `ROSTER_CACHE_MAX` with LRU eviction: the TTL is only checked on read, so
+ * without a cap rotated tokens would grow the map without bound. Implemented
+ * by the canonical `TtlCache` in LRU mode — re-setting moves the entry to the
+ * newest position, and the cap evicts the least-recently-used entry.
  */
 const ROSTER_CACHE_MAX = 1024;
-const rosterCache = new Map<string, { roster: readonly CursorModelInfo[]; fetchedAt: number }>();
+const rosterCache = new TtlCache<{ roster: readonly CursorModelInfo[] }>({
+  ttlMs: CURSOR_ROSTER_TTL_MS,
+  maxEntries: ROSTER_CACHE_MAX,
+  lru: true,
+});
 
 function rosterCacheSet(credential: string, roster: readonly CursorModelInfo[]): void {
   const key = String(fnv1a32(credential));
-  rosterCache.delete(key); // re-set moves the entry to newest position
-  rosterCache.set(key, { roster, fetchedAt: Date.now() });
-  while (rosterCache.size > ROSTER_CACHE_MAX) {
-    const oldest = rosterCache.keys().next().value;
-    if (oldest === undefined) break;
-    rosterCache.delete(oldest);
-  }
+  rosterCache.set(key, { roster });
 }
 
 /**
@@ -112,7 +113,7 @@ function rosterCacheSet(credential: string, roster: readonly CursorModelInfo[]):
 export const rosterCacheForTests = {
   size: (): number => rosterCache.size,
   set: rosterCacheSet,
-  get: (credential: string): { roster: readonly CursorModelInfo[]; fetchedAt: number } | undefined =>
+  get: (credential: string): { roster: readonly CursorModelInfo[] } | undefined =>
     rosterCache.get(String(fnv1a32(credential))),
 };
 /** Client-heartbeat cadence the Cursor edge expects (donor `heartbeatMs`). */
@@ -539,26 +540,56 @@ class CursorAdapter implements ProviderAdapter {
       );
     }
     const resolvedAll = pending.map((item) => cursorRunSessions.resolveCall(item.callId, scope));
-    // Results previous legs already answered resolve nothing: the replayed
-    // conversation carries them as history, not as an unanswered call. When
-    // *no* call resolves AND the call id live nowhere in this process — a
-    // gateway restart between legs, an evicted idle Run, then — the request is
-    // by definition a complete replay (every answered call is present in the
-    // conversation), and the fresh-turn path rebases it into a new Run.
-    // A call id that is live under another scope keeps the strict refusal:
-    // adopting that conversation would surface another tenant's Run under
-    // this caller.
-    if (
-      resolvedAll.every((entry) => entry === undefined) &&
-      isCompleteToolHistoryReplay(request, pending) &&
-      pending.every((item) => !cursorRunSessions.hasAnyCall(item.callId))
-    ) {
+    const resolved = resolvedAll.filter((entry) => entry !== undefined);
+    const allSameRun =
+      resolved.length === pending.length && new Set(resolved.map((entry) => entry.session.runId)).size === 1;
+    // A call id that is live in this process but resolves to nothing under this
+    // caller's scope belongs to another tenant's Run. Rebasing over it would
+    // surface that conversation under this caller — always a hard refusal.
+    const foreignLive = pending.some(
+      (item) =>
+        cursorRunSessions.resolveCall(item.callId, scope) === undefined &&
+        cursorRunSessions.hasAnyCall(item.callId),
+    );
+    // Complete-replay rebase (donor / oh-my-pi behavior): when the request is
+    // the full transcript — every `call_cursor_*` result it carries is paired
+    // with a `toolCall` in the same conversation — and no foreign-live call is
+    // involved, cancel whatever live Runs its ids still touch and rebuild a
+    // fresh Run from history. This covers the cases the old code refused with
+    // a hard 400: a replay mixing results of an already-answered leg with a
+    // live one ("mixes live Cursor tool results"), and results spanning
+    // multiple live Runs. A hard refusal there is what stalled the client loop
+    // every time Cursor replays a superseded transcript; the donor instead
+    // closes the parked runs and answers with a fresh turn.
+    if (!allSameRun && !foreignLive && isCompleteToolHistoryReplay(request, pending)) {
+      for (const entry of resolved) {
+        cursorRunSessions.terminate(entry.session.runId, "Cursor Run superseded by a rebase");
+        this.#handles.delete(entry.session.runId);
+        this.cleanupReader(entry.session.runId);
+      }
       yield* this.#startRun(request, candidate, context);
       return;
     }
-    const resolved = resolvedAll.filter((entry) => entry !== undefined);
     const runId = resolved[0]?.session.runId;
-    if (runId === undefined) {
+    if (!allSameRun) {
+      // Not a safe rebase. Two distinct cases:
+      // 1. A partial tail — a result whose `toolCall` is absent from the sent
+      //    conversation. That is not a complete replay, so there is nothing
+      //    safe to rebase; name the missing ids so the client can resend the
+      //    whole transcript.
+      // 2. A complete replay that still resolves to mixed runs — either a call
+      //    id live under another scope (foreignLive, hard refusal) or results
+      //    spanning more than one live Run with a transcript that is not a
+      //    complete replay. Both stay refused rather than partially applied.
+      const missing = missingToolCallIds(request, pending);
+      if (missing.length > 0) {
+        throw new GatewayError(
+          "invalid_request",
+          400,
+          "This tool result has no matching tool call in the sent conversation (request {requestId}); resend the complete conversation. The session went cold — reconnect or resend 🔌",
+          { callIds: missing },
+        );
+      }
       throw new GatewayError(
         "invalid_request",
         400,
@@ -566,12 +597,10 @@ class CursorAdapter implements ProviderAdapter {
         { callIds: pending.map((item) => item.callId) },
       );
     }
-    if (resolved.some((entry) => entry?.session.runId !== runId)) {
-      throw new GatewayError(
-        "invalid_request",
-        400,
-        "These tool results belong to different Cursor Runs (request {requestId}); resend them one Run at a time. The session went cold — reconnect or resend 🔌",
-      );
+    if (runId === undefined) {
+      // Unreachable: every path that leaves `allSameRun` false throws above or
+      // rebases. This keeps the non-null narrowing legible for the rest.
+      throw new GatewayError("invalid_request", 400, "Cursor Run is no longer live (request {requestId}). The session went cold — reconnect or resend 🔌");
     }
     const session = cursorRunSessions.get(runId);
     if (session === undefined) {
@@ -704,7 +733,6 @@ class CursorAdapter implements ProviderAdapter {
           text: liveUserText(request),
           modelId,
           conversationId,
-          runId,
           ...(images.length > 0 ? { images } : {}),
           ...(descriptors.length > 0 ? { descriptors } : {}),
           ...(systemPrompt === undefined ? {} : { systemPrompt }),
@@ -879,10 +907,11 @@ class CursorAdapter implements ProviderAdapter {
     context: ProviderDispatchContext,
   ): Promise<readonly CursorModelInfo[]> {
     const key = String(fnv1a32(credential));
+    // Peek first: `get` deletes expired entries, but the stale roster must
+    // survive as the fallback when the refetch fails (see the catch below).
+    const stale = rosterCache.peek(key);
     const cached = rosterCache.get(key);
-    if (cached !== undefined && Date.now() - cached.fetchedAt < CURSOR_ROSTER_TTL_MS) {
-      return cached.roster;
-    }
+    if (cached !== undefined) return cached.roster;
     try {
       const roster = await fetchCursorModels({
         credential,
@@ -894,7 +923,7 @@ class CursorAdapter implements ProviderAdapter {
       rosterCacheSet(credential, roster);
       return roster;
     } catch {
-      return cached?.roster ?? [];
+      return stale?.roster ?? [];
     }
   }
 
@@ -1363,6 +1392,13 @@ function readPendingToolResult(
  * when it resends its recorded transcript — a gateway restart between legs or
  * an evicted Run — and the only shape safe to rebase into a fresh Run, where
  * the recorded exchange travels as history.
+ *
+ * The matching `toolCall` may live anywhere in the conversation, not only in
+ * the trailing assistant turn: Claude Code resends the full transcript, which
+ * contains several earlier `call_cursor_*` rounds. A scan that accepted only
+ * one trailing assistant/tool pair refused those complete replays with
+ * "no longer pending" even though every result was paired and none was live
+ * (mirrors `isCompleteContinuationReplay` in the preparer).
  */
 function isCompleteToolHistoryReplay(
   request: CanonicalRequest,
@@ -1375,6 +1411,20 @@ function isCompleteToolHistoryReplay(
     }
   }
   return pending.every((item) => calledIds.has(item.callId));
+}
+
+/** The `call_cursor_*` result ids with no matching `toolCall` in the conversation. */
+function missingToolCallIds(
+  request: CanonicalRequest,
+  pending: readonly PendingToolResult[],
+): string[] {
+  const calledIds = new Set<string>();
+  for (const message of request.messages) {
+    for (const part of message.content) {
+      if (part.kind === "toolCall") calledIds.add(part.call_id);
+    }
+  }
+  return pending.filter((item) => !calledIds.has(item.callId)).map((item) => item.callId);
 }
 
 /** Reconstructs one tool result's text and images for the adapter's tests. */
@@ -1394,4 +1444,3 @@ function resolveCursorWireModelId(rawModelId: string): string {
   if (id === "auto") return "default";
   return rawModelId;
 }
-

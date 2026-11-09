@@ -23,7 +23,11 @@ import { Dialog } from "../../../components/ui/dialog";
 import { Input } from "../../../components/ui/input";
 import { Inline } from "../../../components/ui/inline";
 import { Stack } from "../../../components/ui/stack";
-import { formatResetDistance, quotaPillSummary, quotaWindowState } from "../../../lib/format/quota";
+import {
+  formatResetDistance,
+  quotaPillSummary,
+  quotaWindowState,
+} from "../../../lib/format/quota";
 import { toast } from "../../../lib/toast";
 import { usePoolHealthEvents, usePoolProviderProbe } from "../../../hooks/network";
 import { EmptyState, LoadingState, ErrorState } from "../../../components/ui/state";
@@ -45,8 +49,8 @@ function QuotaPill({
 }: {
   readonly windows: readonly QuotaWindow[] | undefined;
 }): ReactNode {
+  const inactive = windows?.filter((window) => quotaWindowState(window) === "future") ?? [];
   const summary = quotaPillSummary(windows ?? []);
-  const inactive = windows?.filter((window) => quotaWindowState(window) !== "current") ?? [];
   return (
     <>
       {summary.text !== null && (
@@ -57,7 +61,7 @@ function QuotaPill({
       )}
       {inactive.map((window, index) => (
         <span key={`${window.kind ?? window.label}:${window.startsAt}:${index}`} className="text-badge text-text-tertiary">
-          {window.label}{window.modelIds?.length ? ` · ${window.modelIds.join(", ")}` : ""} · {quotaWindowState(window) === "expired" ? "Expired" : `Not started yet · Starts ${new Date(window.startsAt!).toLocaleString()}`}
+          {window.label}{window.modelIds?.length ? ` · ${window.modelIds.join(", ")}` : ""} · {`Not started yet · Starts ${new Date(window.startsAt!).toLocaleString()}`}
         </span>
       ))}
     </>

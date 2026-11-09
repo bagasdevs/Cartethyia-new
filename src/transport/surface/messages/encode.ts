@@ -207,11 +207,14 @@ export function groupedBlocks(events: readonly CanonicalEvent[]): {
           previousReasoningText,
           nextText,
         );
-        if (reasoningSummaryHasBoundary(previousReasoningIdentity, identity)) {
+        // A thinking block splits only on a strong boundary (a real paragraph
+        // break). Copilot streams one thought as many items; treating every
+        // identity change as a new block painted dozens of tiny thinking blocks.
+        if (reasoningSummaryHasBoundary(previousReasoningIdentity, identity) && separator === "\n\n") {
           next.thinking = `${separator}${nextText}`;
           blocks.push(next);
         } else {
-          previous.thinking = `${String(previous.thinking ?? "")}${nextText}`;
+          previous.thinking = `${String(previous.thinking ?? "")}${separator}${nextText}`;
         }
         previousReasoningIdentity = identity;
         previousReasoningText = nextText;
@@ -264,7 +267,12 @@ export function stopData(events: readonly CanonicalEvent[]): {
   const usageEvent = [...events]
     .reverse()
     .find((event): event is Extract<CanonicalEvent, { type: "usage" }> => event.type === "usage");
-  const failed = terminal?.state === "failed";
+  // A failed terminal — `failed`, or `aborted` (upstream stream error) —
+  // marks the response as failed. An explicit canonical `error` event before
+  // the terminal also fails it: the upstream declared a failure even when the
+  // terminal state alone does not.
+  const hasErrorEvent = events.some((event) => event.type === "error");
+  const failed = terminal?.state === "failed" || (terminal?.state === "aborted" && hasErrorEvent);
   let reason: string | null;
   if (terminal?.stop_reason !== undefined) reason = mapStopReason(terminal.stop_reason);
   else reason = terminal?.state === "complete" ? "end_turn" : null;

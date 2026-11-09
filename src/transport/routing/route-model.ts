@@ -108,6 +108,8 @@ export interface RouteCandidate {
   readonly quota_windows?: readonly ProviderQuotaWindow[];
   /** A successful Start Plan balance authoritatively lists its model grants. */
   readonly quota_entitlements_known?: boolean;
+  /** Normalized quota/plan fact stamped at plan time (unified engine). */
+  readonly quota_fact?: NormalizedQuotaFact;
 }
 
 /**
@@ -141,6 +143,27 @@ export type RoutedCandidate = RouteCandidate & {
    * activity is read live via `sharedClaudeSlowLanes.isActive`).
    */
   lane?: "slow";
+  /**
+   * Normalized quota/plan fact stamped at plan time by the routing decision
+   * engine. The decision engine reads this instead of re-deriving window state.
+   */
+  quota_fact?: NormalizedQuotaFact;
+  /**
+   * Operator-configured account priority (0 when unset). Higher ranks ahead
+   * within the same rank group, before usage measurement.
+   */
+  account_priority?: number;
+  /**
+   * True when the account's remaining quota fraction is at or below the
+   * configured reserve percent. A reserved account stays eligible but orders
+   * behind non-reserve siblings.
+   */
+  in_reserve?: boolean;
+  /**
+   * Drain urgency score: headroom fraction / remaining hours until reset.
+   * Higher = quota about to expire unused, ranked first within a rank group.
+   */
+  drain_score?: number;
 };
 
 /**
@@ -256,10 +279,13 @@ export interface RoutePlan {
 
 /** How eligible a candidate is and why — written once, read by every layer. */
 export const ROUTING_RANK = {
-  FRESH: 0,
-  SLOW: 1,
-  COOLING: 2,
-  SATURATED: 3,
+  /** Fresh candidate with a positive known quota / above its usage floor. */
+  FRESH_KNOWN: 0,
+  /** Fresh candidate whose quota state is unknown (no read, unsupported, stale). */
+  FRESH_UNKNOWN: 1,
+  SLOW: 2,
+  COOLING: 3,
+  SATURATED: 4,
 } as const;
 export type RoutingRank = (typeof ROUTING_RANK)[keyof typeof ROUTING_RANK];
 
@@ -273,6 +299,22 @@ export interface RoutingDecision {
   readonly plan_gate_blocked?: boolean;
   readonly capability_blocked?: boolean;
   readonly saturated?: boolean;
+}
+
+/**
+ * The normalized quota/plan fact the unified routing engine evaluates per
+ * candidate. Produced once per candidate before `evaluateCandidate`, so the
+ * decision engine never re-reads quota sources or re-derives window state.
+ */
+export interface NormalizedQuotaFact {
+  /** `available` = positive known balance; `exhausted` = known spent/below floor. */
+  readonly quotaState: "available" | "exhausted" | "unknown";
+  readonly quotaSource: "live_cache" | "snapshot" | "unsupported" | "none";
+  /** Epoch ms of the observation, when one exists (used for freshness). */
+  readonly quotaObservedAt: number | null;
+  /** True when the observed quota is older than the freshness horizon. */
+  readonly isStale: boolean;
+  readonly usageFloorState: "above" | "below" | "unknown";
 }
 
 import type { ComboStrategy, PoolRoutingStrategy, ProviderRoutingStrategy } from "../../persistence/schema";
@@ -299,8 +341,6 @@ export interface RouteSnapshot {
   readonly created_at: number;
   /** Optional per-provider routing preferences keyed by tenant. */
   readonly providerRouting?: ProviderRoutingMap;
-  /** Optional per-tenant pool selection strategy (absent = `least_loaded`). */
-  readonly poolRouting?: Readonly<Record<string, PoolRoutingSetting>>;
   /**
    * Tenants whose invoke switch is off, so `/v1/*` must be refused outright.
    *
@@ -319,6 +359,9 @@ export type EligibilityReason =
   | "cooldown_hard"
   | "model_cooldown"
   | "quota_exhausted"
+  | "quota_unknown"
+  | "plan_gate"
+  | "capability_unsupported"
   | "disabled"
 
 export interface EligibilityDecision {
@@ -392,6 +435,8 @@ const ELIGIBILITY_REASON_LABELS: Readonly<Record<string, string>> = {
   disabled: "all accounts are disabled",
   credit_floor_reached: "credit or quota is exhausted",
   quota_exhausted: "every account has an exhausted quota window or is below its configured usage floor",
+  quota_unknown: "accounts have no known quota state (unknown, unsupported, or stale)",
+  plan_gate: "the plan explicitly proves these accounts cannot serve this model",
   capability_unsupported: "the accounts serving this model do not support the request's capabilities (e.g. images, tools, or reasoning)",
 };
 
@@ -703,9 +748,6 @@ export class InMemoryRouteSnapshotService implements RouteSnapshotService {
       ...(built.cli_aliases ? { cli_aliases: Object.freeze({ ...built.cli_aliases }) } : {}),
       combos: Object.freeze({ ...built.combos }),
       ...(providerRouting ? { providerRouting } : {}),
-      // Unfrozen copy: deepFreeze must reach the inner per-tenant settings —
-      // a pre-frozen record trips its is-frozen guard and skips recursion.
-      ...(built.poolRouting ? { poolRouting: { ...built.poolRouting } } : {}),
       created_at: built.created_at ?? Date.now(),
     });
     // A mutation during the build means this snapshot describes a catalog that

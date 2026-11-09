@@ -27,7 +27,7 @@ import type { ValidatedFetch } from "../../../network/outbound-fetch";
 const ZCODE = "https://zcode.z.ai";
 const BILLING = `${ZCODE}/api/v1/zcode-plan/billing`;
 const TOUCH = `${ZCODE}/api/v1/marketing/touch`;
-const APP_VERSION = "3.17.1";
+const APP_VERSION = "3.17.2";
 const PLATFORM = "linux-x64";
 const TIMEOUT_MS = 15_000;
 const CLAIMED_ALREADY = 1003;

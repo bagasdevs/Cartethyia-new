@@ -11,6 +11,12 @@ interface TtlCacheOptions {
   readonly ttlMs?: number;
   readonly maxEntries?: number;
   readonly now?: () => number;
+  /**
+   * LRU eviction order. When set, re-setting an existing key moves it to the
+   * newest position (delete-then-set), so oldest-first eviction becomes
+   * least-recently-used-first. Off by default: plain FIFO insertion order.
+   */
+  readonly lru?: boolean;
 }
 
 interface TtlCacheEntry<T> {
@@ -27,11 +33,13 @@ export class TtlCache<T> {
   private readonly ttlMs: number;
   private readonly maxEntries: number;
   private readonly now: () => number;
+  private readonly lru: boolean;
 
   constructor(opts: TtlCacheOptions = {}) {
     this.ttlMs = opts.ttlMs ?? 5_000;
     this.maxEntries = opts.maxEntries ?? 128;
     this.now = opts.now ?? Date.now;
+    this.lru = opts.lru ?? false;
   }
 
   /**
@@ -54,8 +62,19 @@ export class TtlCache<T> {
    */
   set(key: string, value: T): void {
     const now = this.now();
+    if (this.lru) this.cache.delete(key); // move to newest position
     this.cache.set(key, { value, at: now });
     this.evictIfNeeded(now);
+  }
+
+  /**
+   * Peek at a stored value without checking the TTL or deleting on expiry.
+   * Returns only undefined when the key is absent. Callers that need the
+   * possibly-expired value (e.g. a stale fallback after a failed refetch)
+   * must read it before `get`, which removes expired entries.
+   */
+  peek(key: string): T | undefined {
+    return this.cache.get(key)?.value;
   }
 
   /**
@@ -144,8 +163,7 @@ interface TtlCacheFamilyOptions {
 /**
  * A set of {@link TtlCache} instances keyed by TTL, created on first use.
  *
- * Two provider-side caches (`operations/provider-version-cache.ts` and
- * `operations/model-discovery-cache.ts`) had each hand-rolled the same
+ * Two provider-side caches in `operations/provider-caches.ts` had each hand-rolled the same
  * `Map<number, TtlCache<T>>` + `cacheFor(ttlMs)` memo plus the same
  * `for (const cache of caches.values()) cache.clear()` reset. Tests pass
  * `ttlMs: 0` to force a reload, which is why the per-TTL split exists at all —

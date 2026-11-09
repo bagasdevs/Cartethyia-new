@@ -490,6 +490,31 @@ const RAW_BUNDLED_PROVIDER_METADATA = [
   // rows are served by `/v1/search`, never by the canonical chat pipeline.
   { id: "exa", displayName: "Exa", baseUrl: "https://mcp.exa.ai", serviceKinds: ["websearch"], requiresAccount: false, credentialHint: "No API key. Search goes through the public MCP." },
   { id: "parallel", displayName: "Parallel", baseUrl: "https://search.parallel.ai", serviceKinds: ["websearch"], requiresAccount: false, credentialUrl: "https://platform.parallel.ai/settings?tab=api-keys", credentialHint: "Optional. Leave empty for the public MCP, or paste an API key for the higher-limit search API." },
+  {
+    // Freebuff (Codebuff Desktop). OAuth code flow → bearer token; every
+    // dispatch carries the desktop identity group + Ed25519 device signature
+    // (see documentation/research/freebuff/). The chat surface is
+    // OpenAI-compatible on `/api/v1/chat/completions` but requires a stateful
+    // session admission + agent-runs preflight — handled by the custom adapter.
+    id: "freebuff",
+    displayName: "Freebuff",
+    baseUrl: "https://www.codebuff.com",
+    hasAdapterUserAgent: true,
+    credentialUrl: "https://www.codebuff.com/login",
+    credentialHint: "Sign in with your Freebuff account (Desktop/CLI code flow).",
+  },
+  {
+    // Zro (moonmath). Fast, private, multi-region inference for open models.
+    // Claude Code connects via the Messages wire with a plain bearer key; the
+    // provider's own Claude Code docs configure `ANTHROPIC_BASE_URL` +
+    // `ANTHROPIC_AUTH_TOKEN`. No quota endpoint exists — entitlement is the
+    // `/v1/models` list itself (a key only sees the models it may call).
+    id: "zro",
+    displayName: "Zro",
+    baseUrl: "https://zro.moonmath.ai",
+    credentialUrl: "https://zro.moonmath.ai/docs/key-controls",
+    credentialHint: "Create or copy an API key (sk-...) from the Zro key controls page (docs/key-controls).",
+  },
 ] as const;
 
 /**
@@ -617,6 +642,11 @@ const ADAPTER_USER_AGENT_PROVIDER_IDS: ReadonlySet<string> = new Set(
   BUNDLED_PROVIDER_METADATA.filter((provider) => provider.hasAdapterUserAgent).map((provider) => provider.id),
 );
 
+/** Bundled metadata keyed by provider id for O(1) lookups. */
+const BUNDLED_PROVIDER_BY_ID: ReadonlyMap<BundledProviderId, BundledProviderMetadata> = new Map(
+  BUNDLED_PROVIDER_METADATA.map((definition) => [definition.id, definition]),
+);
+
 /** Whether the bundled adapter provides its own upstream User-Agent. */
 export function providerHasAdapterUserAgent(providerId: string): boolean {
   return ADAPTER_USER_AGENT_PROVIDER_IDS.has(providerId);
@@ -628,7 +658,7 @@ export function providerHasAdapterUserAgent(providerId: string): boolean {
  * minted inside a device/browser flow with no dedicated key page).
  */
 export function providerCredentialUrl(providerId: string): string | undefined {
-  return BUNDLED_PROVIDER_METADATA.find((candidate) => candidate.id === providerId)?.credentialUrl;
+  return BUNDLED_PROVIDER_BY_ID.get(providerId as BundledProviderId)?.credentialUrl;
 }
 
 /**
@@ -636,18 +666,18 @@ export function providerCredentialUrl(providerId: string): string | undefined {
  * `undefined` where the link alone is self-explanatory.
  */
 export function providerCredentialHint(providerId: string): string | undefined {
-  return BUNDLED_PROVIDER_METADATA.find((candidate) => candidate.id === providerId)?.credentialHint;
+  return BUNDLED_PROVIDER_BY_ID.get(providerId as BundledProviderId)?.credentialHint;
 }
 
 /** Presentation-only limitation for the provider detail page. */
 export function providerOperatorNotice(providerId: string): string | undefined {
-  return BUNDLED_PROVIDER_METADATA.find((candidate) => candidate.id === providerId)?.operatorNotice;
+  return BUNDLED_PROVIDER_BY_ID.get(providerId as BundledProviderId)?.operatorNotice;
 }
 
 /** Canonical builtin display name; falls back to the provider id for unknowns. */
 export function providerDisplayName(providerId: string): string {
   return (
-    BUNDLED_PROVIDER_METADATA.find((candidate) => candidate.id === providerId)?.displayName ??
+    BUNDLED_PROVIDER_BY_ID.get(providerId as BundledProviderId)?.displayName ??
     providerId
   );
 }
@@ -679,7 +709,7 @@ export function providerDisplayName(providerId: string): string {
  * gateway guessing it will not.
  */
 export function providerServiceKinds(providerId: string): readonly ServiceKind[] {
-  const declared = BUNDLED_PROVIDER_METADATA.find((candidate) => candidate.id === providerId)
+  const declared = BUNDLED_PROVIDER_BY_ID.get(providerId as BundledProviderId)
     ?.serviceKinds;
   // Bundled providers are explicit: they say which surfaces they serve, and a
   // bundled provider without the declaration serves LLM only.
@@ -708,7 +738,7 @@ export function customProviderServiceKinds(
 
 /** Canonical builtin base URL used by adapters, discovery, and quota clients. */
 export function providerBaseUrl(providerId: string): string {
-  const entry = BUNDLED_PROVIDER_METADATA.find((candidate) => candidate.id === providerId);
+  const entry = BUNDLED_PROVIDER_BY_ID.get(providerId as BundledProviderId);
   if (!entry) throw new Error(`Unknown builtin provider "${providerId}"`);
   return entry.baseUrl.replace(/\/+$/, "");
 }
@@ -744,7 +774,7 @@ export const PROVIDER_COMPATIBILITY_PROFILES: Record<string, CompatibilityProfil
 
 /** Default wire family for a builtin provider. */
 export function providerDefaultWireFamily(providerId: string): WireFamily {
-  return BUNDLED_PROVIDER_METADATA.find((candidate) => candidate.id === providerId)?.wireFamilyDefault ?? "chat";
+  return BUNDLED_PROVIDER_BY_ID.get(providerId as BundledProviderId)?.wireFamilyDefault ?? "chat";
 }
 
 /**
@@ -754,12 +784,12 @@ export function providerDefaultWireFamily(providerId: string): WireFamily {
  * OpenAI-compatible adapter.
  */
 export function providerUsesBespokeWire(providerId: string): boolean {
-  return BUNDLED_PROVIDER_METADATA.find((candidate) => candidate.id === providerId)?.bespokeWire ?? false;
+  return BUNDLED_PROVIDER_BY_ID.get(providerId as BundledProviderId)?.bespokeWire ?? false;
 }
 
 /** Whether a builtin provider requires a persisted account row. */
 export function providerRequiresAccount(providerId: string): boolean {
-  return BUNDLED_PROVIDER_METADATA.find((candidate) => candidate.id === providerId)?.requiresAccount ?? true;
+  return BUNDLED_PROVIDER_BY_ID.get(providerId as BundledProviderId)?.requiresAccount ?? true;
 }
 
 /**
@@ -769,7 +799,7 @@ export function providerRequiresAccount(providerId: string): boolean {
  */
 export function providerJwtVerification(providerId: string): ProviderJwtVerification {
   return (
-    BUNDLED_PROVIDER_METADATA.find((candidate) => candidate.id === providerId)?.jwtVerification ?? {}
+    BUNDLED_PROVIDER_BY_ID.get(providerId as BundledProviderId)?.jwtVerification ?? {}
   );
 }
 

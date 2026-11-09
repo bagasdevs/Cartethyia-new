@@ -56,7 +56,7 @@ import {
   wireContextFrom,
   type ProbeProviderRow,
 } from "./probe-phases";
-import { createProbeFetch } from "../operations/probe-fetch";
+import { createProbeFetch } from "../provider-probe";
 import { authHeaders } from "../adapters/compatible-adapter";
 import {
   byokAuthHeaderShape,
@@ -263,7 +263,20 @@ export class ProviderProbingService {
       ...(preferences.maxOutputTokens === undefined
         ? {}
         : { maxOutputTokens: preferences.maxOutputTokens }),
-      ...(typeof adapter?.systemPrompt === "function"
+      // Freebuff's admission policy gate flags repeated identical probes as
+      // automated farming (`prompt_policy_refused` / "same message sent over
+      // and over"). Its probe must be minimal and always distinct per model —
+      // no worker system template, no shared identity question. `ping` is the
+      // same minimal greeting the fast-probe path already uses; the model id
+      // keeps every probe distinct so the "same message over and over" gate
+      // cannot flag a batch run.
+      ...(providerId === "freebuff"
+        ? {
+            defaultPromptOverride: `ping ${modelId}`,
+            providerSystemPrompt: undefined,
+          }
+        : {}),
+      ...(typeof adapter?.systemPrompt === "function" && providerId !== "freebuff"
         ? { providerSystemPrompt: adapter.systemPrompt() }
         : {}),
     });

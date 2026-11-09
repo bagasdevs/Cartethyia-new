@@ -38,7 +38,7 @@ import {
 import { RUN_IDLE_TTL_MS } from "../../src/providers/integrations/cursor/cursor-shared";
 import { decodeFramePayload, encodeFrame, streamFrames } from "../../src/providers/integrations/cursor/protocol/framing";
 import { decodeMessage, encodeMessage } from "../../src/providers/integrations/cursor/protocol/messages";
-import type { CanonicalEvent, CanonicalRequest } from "../../src/protocol/canonical-model";
+import type { CanonicalEvent, CanonicalMessage, CanonicalRequest } from "../../src/protocol/canonical-model";
 import type {
   AttemptLeaseOwnership,
   ProviderAdapter,
@@ -624,10 +624,133 @@ describe("Cursor cross-request Run continuation", () => {
     // The replayed exchange travels as rebased history: the request submitted
     // a fresh Run turn (not a resume).
     expect(replay.streams[0]?.runRequestCount()).toBe(1);
+    const rebound = replay.streams[0]?.messages().find((message) => message["run_request"] !== undefined);
+    const runRequest = rebound?.["run_request"] as Record<string, unknown> | undefined;
+    const action = runRequest?.["action"] as Record<string, unknown> | undefined;
+    const userAction = action?.["user_message_action"] as Record<string, unknown> | undefined;
+    const userMessage = userAction?.["user_message"] as Record<string, unknown> | undefined;
+    const text = typeof userMessage?.["text"] === "string" ? userMessage["text"] : "";
+    expect(text.match(/what is the weather\?/g)?.length ?? 0).toBe(1);
+    expect(text.match(/\[tool result /g)?.length ?? 0).toBe(1);
     expect(cursorRunSessions.size).toBe(0);
   });
 
-  test("results for two different Runs in one request are refused whole", async () => {
+  test("a partial tool result with no matching tool call anywhere is refused", async () => {
+    const adapter = createCursorAdapter();
+    const { callId, stream } = await openRunAwaitingToolCall(adapter);
+
+    stream.push(turnEndedFrame());
+    const answered = await collect(
+      adapter,
+      continuationRequest(callId),
+      continuationHarness(scopeOf(), stream),
+    );
+    expect(answered.error).toBeUndefined();
+    expect(cursorRunSessions.size).toBe(0);
+
+    // A result whose `toolCall` is absent from the sent conversation is a
+    // partial tail, not a complete replay: there is nothing safe to rebase.
+    const malformedReplay: CanonicalRequest = {
+      ...continuationRequest(callId),
+      messages: [
+        { role: "user", content: [{ kind: "text", text: "older note" }] },
+        { role: "tool", content: [{ kind: "toolResult", call_id: callId, content: [{ kind: "text", text: "stale" }] }] },
+        { role: "assistant", content: [{ kind: "text", text: "thanks" }] },
+        { role: "user", content: [{ kind: "text", text: "continue" }] },
+      ],
+      tools: [LOOKUP_TOOL],
+    };
+    const replay = harnessWith([turnEndedFrame()], scopeOf());
+    const refused = await collect(adapter, malformedReplay, replay);
+    expect(refused.error).toBeDefined();
+    expect(String((refused.error as Error).message)).toContain("no matching tool call");
+    expect(replay.streams.length).toBe(0);
+  });
+
+  test("a complete multi-round replay rebases once the Run is gone", async () => {
+    const adapter = createCursorAdapter();
+    // Round 1 completes and its Run closes.
+    const first = await openRunAwaitingToolCall(adapter, { execId: 1 });
+    first.stream.push(turnEndedFrame());
+    const firstAnswered = await collect(
+      adapter,
+      continuationRequest(first.callId),
+      continuationHarness(scopeOf(), first.stream),
+    );
+    expect(firstAnswered.error).toBeUndefined();
+    expect(cursorRunSessions.size).toBe(0);
+
+    // Round 2 completes and its Run closes too.
+    const second = await openRunAwaitingToolCall(adapter, { execId: 2 });
+    second.stream.push(turnEndedFrame());
+    const secondAnswered = await collect(
+      adapter,
+      continuationRequest(second.callId),
+      continuationHarness(scopeOf(), second.stream),
+    );
+    expect(secondAnswered.error).toBeUndefined();
+    expect(cursorRunSessions.size).toBe(0);
+
+    // The client resends the full transcript: both earlier rounds plus this
+    // tail. Every call_cursor_* result has a matching toolCall in the history
+    // and none is live, so the whole history rebases into a fresh Run instead
+    // of being refused as "no longer pending".
+    const messages: CanonicalMessage[] = [
+      { role: "user", content: [{ kind: "text", text: "what is the weather?" }] },
+    ];
+    for (const id of [first.callId, second.callId]) {
+      messages.push({ role: "assistant", content: [{ kind: "toolCall", call_id: id, name: "lookup", arguments: "{}" }] });
+      messages.push({ role: "tool", content: [{ kind: "toolResult", call_id: id, content: [{ kind: "text", text: "72F and clear" }] }] });
+    }
+    const replay = harnessWith([turnEndedFrame()], scopeOf());
+    const rebased = await collect(
+      adapter,
+      { model: "cursor-model", messages, tools: [LOOKUP_TOOL], stream: true, generation_controls: {}, source_surface: "chat" },
+      replay,
+    );
+    expect(rebased.error).toBeUndefined();
+    expect(replay.streams.length).toBe(1);
+    expect(replay.streams[0]?.runRequestCount()).toBe(1);
+    // The replay's run closes once the turn ends and nothing is left pending.
+    expect(cursorRunSessions.size).toBe(0);
+  });
+
+  test("replaying an older Cursor result beside the live one rebases into a fresh Run", async () => {
+    const adapter = createCursorAdapter();
+    const first = await openRunAwaitingToolCall(adapter, { execId: 1 });
+    first.stream.push(turnEndedFrame());
+    const answered = await collect(
+      adapter,
+      continuationRequest(first.callId),
+      continuationHarness(scopeOf(), first.stream),
+    );
+    expect(answered.error).toBeUndefined();
+
+    const second = await openRunAwaitingToolCall(adapter, { execId: 2 });
+    const mixedReplay: CanonicalRequest = {
+      ...continuationRequest(second.callId),
+      messages: [
+        { role: "user", content: [{ kind: "text", text: "first question" }] },
+        { role: "assistant", content: [{ kind: "toolCall", call_id: first.callId, name: "lookup", arguments: "{}" }] },
+        { role: "tool", content: [{ kind: "toolResult", call_id: first.callId, content: [{ kind: "text", text: "old answer" }] }] },
+        { role: "user", content: [{ kind: "text", text: "second question" }] },
+        { role: "assistant", content: [{ kind: "toolCall", call_id: second.callId, name: "lookup", arguments: "{}" }] },
+        { role: "tool", content: [{ kind: "toolResult", call_id: second.callId, content: [{ kind: "text", text: "new answer" }] }] },
+      ],
+      tools: [LOOKUP_TOOL],
+    };
+
+    const replay = harnessWith([turnEndedFrame()], scopeOf());
+    const rebased = await collect(adapter, mixedReplay, replay);
+    expect(rebased.error).toBeUndefined();
+    // Both live Runs are cancelled and the whole transcript is rebuilt as a
+    // fresh Run turn — never a hard 400.
+    expect(replay.streams.length).toBe(1);
+    expect(replay.streams[0]?.runRequestCount()).toBe(1);
+    expect(cursorRunSessions.size).toBe(0);
+  });
+
+  test("results for two different Runs in one partial request are refused whole", async () => {
     const adapter = createCursorAdapter();
     const first = await openRunAwaitingToolCall(adapter, { execId: 1 });
     const secondStream = new FakeStream([mcpCallFrame(2, "lookup")]);
@@ -654,7 +777,7 @@ describe("Cursor cross-request Run continuation", () => {
     const mixed = continuationHarness(scopeOf(), first.stream);
     const refused = await collect(adapter, mixedRequest, mixed);
     expect(refused.error).toBeDefined();
-    expect(String((refused.error as Error).message)).toContain("different Cursor Runs");
+    expect(String((refused.error as Error).message)).toContain("no matching tool call");
     // Neither Run received a result: a partial write would corrupt both.
     expect(first.stream.mcpResults().length).toBe(0);
     expect(secondStream.mcpResults().length).toBe(0);

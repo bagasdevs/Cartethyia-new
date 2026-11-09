@@ -15,6 +15,7 @@ import {
   type RewriteWalk,
 } from "../codecs";
 import { geminiThinkingOutputFloor } from "../../protocol/reasoning";
+import { reasoningTextForReplay } from "../reasoning-text";
 import { base64DecodedByteLength, clampImage } from "../image-clamp";
 
 export function geminiModelUrl(base: string, model: string, action: string): string {
@@ -151,8 +152,13 @@ function toGeminiPart(
 ): Record<string, unknown>[] {
   if (part.kind === "text") return [{ text: part.text }];
   if (part.kind === "reasoning") {
-    const summary = part.summary ?? (typeof part.payload === "string" ? part.payload : "");
-    return [{ text: summary, thought: true, ...(part.signature ? { thoughtSignature: part.signature } : {}) }];
+    // A `thinking` part must carry a non-empty signature, or Gemini-family
+    // upstreams reject the whole request with `400 ... thinking.signature:
+    // Field required`. Drop unsigned reasoning blocks (missing *or* empty
+    // signature) so the conversation replays cleanly.
+    if (typeof part.signature !== "string" || part.signature.length === 0) return [];
+    const summary = reasoningTextForReplay(part) ?? "";
+    return [{ text: summary, thought: true, thoughtSignature: part.signature }];
   }
   if (part.kind === "image") {
     // Resolution goes through the shared `resolveImageSource` primitive rather
