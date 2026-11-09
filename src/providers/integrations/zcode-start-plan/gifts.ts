@@ -307,6 +307,7 @@ async function claimOne(
   credential: string,
   accountId: string,
   planId: string,
+  captcha?: { verifyParam?: string; verifyRegion?: string },
 ): Promise<"claimed" | "already_claimed" | "captcha" | "failed"> {
   // The Start Plan free tier is provisioned by the client's sequential
   // handshake (marketing touch → incentive summary → billing preview →
@@ -318,9 +319,19 @@ async function claimOne(
     const activated = await startPlanHandshake(fetcher, credential, accountId);
     return activated ? "claimed" : "failed";
   }
+  
+  const reqHeaders = headers(credential, accountId);
+  // Add DeepSeek-V4.1-Flash captcha verification headers if provided
+  if (captcha?.verifyParam) {
+    reqHeaders["X-Aliyun-Captcha-Verify-Param"] = captcha.verifyParam;
+  }
+  if (captcha?.verifyRegion) {
+    reqHeaders["X-Aliyun-Captcha-Verify-Region"] = captcha.verifyRegion;
+  }
+  
   let response = await fetcher(`${BILLING}/claim`, {
     method: "POST",
-    headers: headers(credential, accountId),
+    headers: reqHeaders,
     body: JSON.stringify({ plan_id: planId }),
     signal: AbortSignal.timeout(TIMEOUT_MS),
   });
@@ -328,7 +339,7 @@ async function claimOne(
     await sleep(1_500 * attempt);
     response = await fetcher(`${BILLING}/claim`, {
       method: "POST",
-      headers: headers(credential, accountId),
+      headers: reqHeaders,
       body: JSON.stringify({ plan_id: planId }),
       signal: AbortSignal.timeout(TIMEOUT_MS),
     });
@@ -348,8 +359,9 @@ export async function claimZcodeGifts(args: {
   readonly accountId: string;
   readonly credential: string;
   readonly fetcher: ValidatedFetch;
+  readonly captcha?: { verifyParam?: string; verifyRegion?: string };
 }): Promise<ZcodeGiftResult> {
-  const { accountId, credential, fetcher } = args;
+  const { accountId, credential, fetcher, captcha } = args;
   if (!credential) return { state: "error", claimed: [], detail: "account has no credential" };
   try {
     const { plans: discovered, unread } = await toClaim(fetcher, credential, accountId);
@@ -371,25 +383,25 @@ export async function claimZcodeGifts(args: {
     }
     const claimed: string[] = [];
     const already: string[] = [];
-    const captcha: string[] = [];
+    const captchaRequired: string[] = [];
     const failed: string[] = [];
     for (const plan of plans) {
-      const outcome = await claimOne(fetcher, credential, accountId, plan.planId).catch(() => "failed" as const);
+      const outcome = await claimOne(fetcher, credential, accountId, plan.planId, captcha).catch(() => "failed" as const);
       const name = plan.name ?? plan.planId;
       if (outcome === "claimed") claimed.push(name);
       else if (outcome === "already_claimed") already.push(name);
-      else if (outcome === "captcha") captcha.push(name);
+      else if (outcome === "captcha") captchaRequired.push(name);
       else failed.push(name);
     }
     const detail = [
-      captcha.length ? "CAPTCHA required; claim in the ZCode app" : "",
+      captchaRequired.length ? "CAPTCHA required; claim in the ZCode app" : "",
       failed.length ? `${failed.length} gift claim(s) failed` : "",
       ...unread,
     ].filter(Boolean).join("; ");
-    const outcomes = [claimed.length > 0 || already.length > 0, captcha.length > 0, failed.length > 0 || unread.length > 0];
+    const outcomes = [claimed.length > 0 || already.length > 0, captchaRequired.length > 0, failed.length > 0 || unread.length > 0];
     if (outcomes.filter(Boolean).length > 1) return { state: "partial", claimed, detail: detail || null };
     if (failed.length > 0 || unread.length > 0) return { state: "error", claimed, detail: detail || null };
-    if (captcha.length > 0) return { state: "captcha", claimed, detail: detail || null };
+    if (captchaRequired.length > 0) return { state: "captcha", claimed, detail: detail || null };
     if (claimed.length > 0) return { state: "claimed", claimed, detail: null };
     return { state: "already_claimed", claimed, detail: null };
   } catch {
@@ -436,5 +448,46 @@ export async function previewZcodeGifts(args: {
     return { plans, claimableCount, unread };
   } catch {
     return { plans: [], claimableCount: 0, unread: ["Gift preview request failed"] };
+  }
+}
+
+/** DeepSeek-V4.1-Flash captcha configuration for claim verification. */
+export interface ZcodeCaptchaConfig {
+  readonly enabled: boolean;
+  readonly region?: string;
+  readonly prefix?: string;
+  readonly sceneId?: string;
+}
+
+/**
+ * Fetches the DeepSeek-V4.1-Flash captcha configuration from ZCode API.
+ * The dashboard uses this to render the captcha widget that users solve
+ * before submitting a claim.
+ */
+export async function fetchCaptchaConfig(
+  credential: string,
+  accountId: string,
+  fetcher: ValidatedFetch,
+): Promise<ZcodeCaptchaConfig> {
+  try {
+    const response = await fetcher(`${ZCODE}/api/v1/client/configs?app_version=${APP_VERSION}&platform=${PLATFORM}`, {
+      method: "GET",
+      headers: headers(credential, accountId),
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+    if (!response.ok) return { enabled: false };
+    const payload = asRecord(await response.json().catch(() => null));
+    const data = asRecord(payload?.["data"]);
+    const configs = asRecord(data?.["configs"]);
+    const captcha = asRecord(configs?.["captcha"]);
+    if (!captcha) return { enabled: false };
+    return {
+      enabled: captcha["enabled"] === true,
+      region: asTrimmedString(captcha["region"]),
+      prefix: asTrimmedString(captcha["prefix"]),
+      sceneId: asTrimmedString(captcha["sceneId"]) ?? asTrimmedString(captcha["scene_id"]),
+    };
+  } catch {
+    return { enabled: false };
   }
 }

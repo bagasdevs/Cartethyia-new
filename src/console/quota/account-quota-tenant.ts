@@ -57,7 +57,7 @@ import {
   DrizzleQoderNativeIdentityStore,
   type QoderNativeIdentityStore,
 } from "../../providers/integrations/qoder/qoder-native-identity-store";
-import { claimZcodeGifts, previewZcodeGifts, type ZcodeGiftPreview, type ZcodeGiftResult } from "../../providers/integrations/zcode-start-plan/gifts";
+import { claimZcodeGifts, previewZcodeGifts, fetchCaptchaConfig, type ZcodeGiftPreview, type ZcodeGiftResult } from "../../providers/integrations/zcode-start-plan/gifts";
 import { ZCODE_START_PLAN_PROVIDER_ID } from "../../providers/integrations/zcode-start-plan/provider";
 import {
   supportsAccountReset,
@@ -1060,6 +1060,39 @@ export function registerAccountQuotaTenantRoutes(
         message: checkinStateMessage(result),
       };
     })
+    // DeepSeek-V4.1-Flash captcha configuration for gift claims.
+    // The dashboard loads this to render the captcha widget that the user
+    // solves before submitting the claim POST.
+    .get("/accounts/:id/captcha-config", async ({ request, params, set }) => {
+      const access = requireTenantScope(accessResolver(request), "dashboard:read");
+      const rows = await db
+        .select()
+        .from(providerAccounts)
+        .where(
+          and(eq(providerAccounts.id, params.id), eq(providerAccounts.tenantId, access.tenantId)),
+        )
+        .limit(1);
+      const account = rows[0];
+      if (!account) {
+        set.status = 404;
+        return { error: `Account ${params.id} not found`, code: "not_found" };
+      }
+      if (account.providerId !== ZCODE_START_PLAN_PROVIDER_ID) {
+        set.status = 400;
+        return { error: "Captcha is only relevant for ZCode accounts", code: "captcha_unsupported" };
+      }
+      try {
+        const credential = await refreshDeps.resolveCredential(account.providerId as ProviderId, account.id);
+        const fetcher = networkBindingFactory
+          ? await dailyCheckinEgressForPass({ db, networkBindingFactory })(account.id, access.tenantId)
+          : globalThis.fetch;
+        const config = await fetchCaptchaConfig(credential, account.id, fetcher);
+        return { ok: true, data: config };
+      } catch {
+        set.status = 502;
+        return { ok: false, error: "Failed to fetch captcha config" };
+      }
+    })
     // Gift grants are an explicit action, not a side effect of a quota read.
     // GET previews what the upstream currently offers (marketing banners,
     // billing preview, incentive rewards) without claiming anything; POST
@@ -1134,13 +1167,27 @@ export function registerAccountQuotaTenantRoutes(
           code: "gifts_unsupported",
         };
       }
+      // Parse optional DeepSeek-V4.1-Flash captcha verification from request body
+      let captcha: { verifyParam?: string; verifyRegion?: string } | undefined;
+      try {
+        const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+        if (body && typeof body === "object") {
+          const verifyParam = typeof body["captchaVerifyParam"] === "string" ? body["captchaVerifyParam"] : undefined;
+          const verifyRegion = typeof body["captchaVerifyRegion"] === "string" ? body["captchaVerifyRegion"] : undefined;
+          if (verifyParam || verifyRegion) {
+            captcha = { verifyParam, verifyRegion };
+          }
+        }
+      } catch {
+        // Body parse failure is non-fatal; proceed without captcha
+      }
       let result: ZcodeGiftResult;
       try {
         const credential = await refreshDeps.resolveCredential(account.providerId as ProviderId, account.id);
         const fetcher = networkBindingFactory
           ? await dailyCheckinEgressForPass({ db, networkBindingFactory })(account.id, access.tenantId)
           : globalThis.fetch;
-        result = await claimZcodeGifts({ accountId: account.id, credential, fetcher });
+        result = await claimZcodeGifts({ accountId: account.id, credential, fetcher, captcha });
       } catch {
         set.status = 502;
         return {
