@@ -19,6 +19,7 @@ import {
   acceptedBaselineSchemaMarkers,
   migrationFiles,
   resolveMigrationsFolder,
+  wasAppliedUnderPreviousName,
 } from "./migrate";
 import { basename } from "node:path";
 import { readFileSync } from "node:fs";
@@ -229,6 +230,18 @@ export async function applySqlMigrations(
     for (const file of files) {
       const migrationId = basename(file);
       if (applied.has(migrationId)) continue;
+      // A renamed predecessor already in the ledger means this file's SQL has
+      // already been applied. Re-running it fails on the existing column and
+      // takes the process down at boot, so it is recorded under the new id
+      // without executing the statement again.
+      if (wasAppliedUnderPreviousName(applied, migrationId)) {
+        await client.query(
+          `INSERT INTO ${MIGRATION_LEDGER_TABLE} (migration_id) VALUES ($1)`,
+          [migrationId],
+        );
+        applied.add(migrationId);
+        continue;
+      }
       const sql = readFileSync(file, "utf8");
       await client.query("BEGIN");
       try {

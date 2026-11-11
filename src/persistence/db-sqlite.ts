@@ -546,8 +546,15 @@ export async function applySqliteMigrations(
     const migrationId = migrationIdFor(file);
     if (applied.has(migrationId)) continue;
     // A renamed predecessor already in the ledger means this file's SQL has
-    // already run; re-running it would fail on an existing column.
-    if (wasAppliedUnderPreviousName(applied, migrationId)) continue;
+    // already run; re-running it would fail on an existing column. Record the
+    // new id so the readiness check stops reporting it as pending.
+    if (wasAppliedUnderPreviousName(applied, migrationId)) {
+      sqlite.prepare(
+        `INSERT INTO ${MIGRATION_LEDGER_TABLE} (migration_id) VALUES (?)`,
+      ).run(migrationId);
+      applied.add(migrationId);
+      continue;
+    }
     const source = readFileSync(file, "utf8");
     const record = sqlite.prepare(
       `INSERT INTO ${MIGRATION_LEDGER_TABLE} (migration_id) VALUES (?)`,
