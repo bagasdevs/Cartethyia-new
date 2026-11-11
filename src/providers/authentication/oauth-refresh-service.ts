@@ -36,6 +36,7 @@ import {
 } from "../operations/provider-credential-service";
 import { refreshLeadMs } from "../operations/oauth-refresh-lead";
 import { classifyAccessTokenUsability } from "./static-token-detection";
+import type { OAuthAccountIdentity } from "./oauth-flow-store";
 import { pushStructuredConsoleLog } from "../../observability/log-ring";
 
 /**
@@ -50,7 +51,7 @@ import { pushStructuredConsoleLog } from "../../observability/log-ring";
  */
 
 const DEFINITIVE_PATTERN =
-  /invalid_grant|invalid_token|unauthorized_client|revoked|refresh_token.*expired/i;
+  /invalid_grant|invalid_token|unauthorized_client|revoked|refresh_token.*expired|github_copilot_profile_mismatch/i;
 
 interface OAuthRefreshFailure {
   readonly status?: number | undefined;
@@ -83,7 +84,7 @@ const LEASE_TTL_MS = 15_000;
  */
 const REFRESH_HTTP_TIMEOUT_MS = 30_000;
 
-export interface OAuthTokenRefreshResult {
+export interface OAuthTokenRefreshResult extends OAuthAccountIdentity {
   readonly access: string;
   /** Omitted when the provider keeps the existing refresh token valid. */
   readonly refresh?: string;
@@ -217,20 +218,32 @@ async function persistRefreshed(
       )
       .returning({ id: providerOauthStates.providerAccountId });
     if (leaseRows.length === 0) return false;
+    const learnedLabel = result.accountLabel ?? result.accountEmail ?? result.accountName;
     const accountSet = {
       credentialCiphertext: encryptCredential(result.access),
       // Only what the refresh reported: a refresher that learned nothing new
       // leaves the stored configuration alone rather than blanking it.
-      // A learned identity only replaces a default label — an operator's
+      // A learned identity only replaces a default label � an operator's
       // custom rename is never overwritten. The CASE keeps the read and the
       // write in one statement, so a concurrent rename cannot lose to the
       // refresh's learned identity.
-      ...(result.accountLabel === undefined
+      ...(learnedLabel === undefined
         ? {}
         : {
-          label: sql`CASE WHEN lower(trim(${providerAccounts.label})) = lower(trim(${providerAccounts.providerId})) THEN ${result.accountLabel} ELSE ${providerAccounts.label} END`,
+          label: sql`CASE WHEN lower(trim(${providerAccounts.label})) = lower(trim(${providerAccounts.providerId})) OR lower(trim(${providerAccounts.label})) = lower(trim(${learnedLabel})) THEN ${learnedLabel} ELSE ${providerAccounts.label} END`,
         }),
-      ...(result.auth_state === undefined ? {} : { authState: result.auth_state }),
+      ...(result.auth_state === undefined && result.accountName === undefined
+        ? {}
+        : {
+          authState: {
+            ...(result.auth_state ?? {}),
+            ...(result.accountName === undefined ? {} : { accountName: result.accountName }),
+          },
+        }),
+      ...(result.accountEmail === undefined ? {} : { accountEmail: result.accountEmail }),
+      ...(result.accountEmail !== undefined || result.accountName !== undefined
+        ? { identityCheckedAt: new Date() }
+        : {}),
     };
     // The second half of the D21 invariant: the credential write must never
     // touch the account's health state either.
@@ -590,6 +603,20 @@ export class OAuthRefreshService {
   ): Promise<string | null> {
     const account = await loadAccountWithFreshness(this.#db, accountId, skewMs);
     if (!account || account.row.credentialKind !== "oauth") return null;
+    const health = await loadAccountWithOauthState(this.#db, accountId, {
+      includeStatus: true,
+      includeLastErrorCategory: true,
+    });
+    if (health?.status === "disabled" && health.lastErrorCategory === "auth_invalidated") {
+      pushStructuredConsoleLog("info", "OAuth token refresh skipped: account auth invalidated", {
+        event: "token_refresh",
+        accountId,
+        providerId: account.row.providerId,
+        errorCode: "auth_invalidated",
+        details: { origin },
+      });
+      return null;
+    }
     const { row, dueAt } = account;
     // A static token is used exactly as issued and never refreshed. There is
     // nothing to re-mint, so return null — the same "cannot refresh" signal a

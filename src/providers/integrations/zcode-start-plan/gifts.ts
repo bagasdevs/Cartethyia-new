@@ -481,11 +481,14 @@ export async function fetchCaptchaConfig(
     const configs = asRecord(data?.["configs"]);
     const captcha = asRecord(configs?.["captcha"]);
     if (!captcha) return { enabled: false };
+    const region = asTrimmedString(captcha["region"]);
+    const prefix = asTrimmedString(captcha["prefix"]);
+    const sceneId = asTrimmedString(captcha["sceneId"]) ?? asTrimmedString(captcha["scene_id"]);
     return {
       enabled: captcha["enabled"] === true,
-      region: asTrimmedString(captcha["region"]),
-      prefix: asTrimmedString(captcha["prefix"]),
-      sceneId: asTrimmedString(captcha["sceneId"]) ?? asTrimmedString(captcha["scene_id"]),
+      ...(region === undefined ? {} : { region }),
+      ...(prefix === undefined ? {} : { prefix }),
+      ...(sceneId === undefined ? {} : { sceneId }),
     };
   } catch {
     return { enabled: false };

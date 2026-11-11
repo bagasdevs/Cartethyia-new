@@ -102,12 +102,30 @@ function hashStatements(source: string): string {
 
 /**
  * Migrations that were renamed during a fork merge. The SQL is byte-for-byte
- * identical; only the filename changed (conflicting `0044` numbering). Treat
- * the old id as supported so existing databases boot instead of crashing.
+ * identical; only the filename changed (conflicting numbering against the
+ * upstream `0044` release, then against the upstream `0046` release). Treat
+ * the old ids as supported so existing databases boot instead of crashing,
+ * and so an already-applied file is never executed twice.
  */
 const KNOWN_RENAMED_MIGRATIONS: Record<string, string> = {
-  "0044_add_telemetry_cache_write_tokens.sql": "0046_add_telemetry_cache_write_tokens.sql",
+  "0044_add_telemetry_cache_write_tokens.sql": "0047_add_telemetry_cache_write_tokens.sql",
+  "0046_add_telemetry_cache_write_tokens.sql": "0047_add_telemetry_cache_write_tokens.sql",
 };
+
+/**
+ * True when `migrationId` was already applied under a name it used to have.
+ * A ledger written before the rename keeps the old id, so the runner must
+ * neither re-execute the SQL nor report the new id as pending.
+ */
+export function wasAppliedUnderPreviousName(
+  applied: ReadonlySet<string>,
+  migrationId: string,
+): boolean {
+  for (const [oldId, newId] of Object.entries(KNOWN_RENAMED_MIGRATIONS)) {
+    if (newId === migrationId && applied.has(oldId)) return true;
+  }
+  return false;
+}
 
 /**
  * Rejects databases whose schema was created by retired migration files or
@@ -193,11 +211,7 @@ export async function readMigrationLedgerStatus(
   const applied = new Set(result.rows.map((row) => row.migration_id));
   const pending = expected.filter((migrationId) => {
     if (applied.has(migrationId)) return false;
-    // If this migration was renamed and the old id is in the ledger, treat as applied.
-    for (const [oldId, newId] of Object.entries(KNOWN_RENAMED_MIGRATIONS)) {
-      if (migrationId === newId && applied.has(oldId)) return false;
-    }
-    return true;
+    return !wasAppliedUnderPreviousName(applied, migrationId);
   });
   return { expected, pending, applied: pending.length === 0 };
 }

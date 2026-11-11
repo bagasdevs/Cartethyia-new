@@ -16,6 +16,7 @@ import {
   MIGRATION_LEDGER_TABLE,
   migrationFiles,
   migrationIdFor,
+  wasAppliedUnderPreviousName,
   splitStatements,
 } from "./migrate";
 
@@ -544,7 +545,9 @@ export async function applySqliteMigrations(
   for (const file of files) {
     const migrationId = migrationIdFor(file);
     if (applied.has(migrationId)) continue;
-    if (applied.has("0044_add_telemetry_cache_write_tokens.sql") && migrationId === "0046_add_telemetry_cache_write_tokens.sql") continue;
+    // A renamed predecessor already in the ledger means this file's SQL has
+    // already run; re-running it would fail on an existing column.
+    if (wasAppliedUnderPreviousName(applied, migrationId)) continue;
     const source = readFileSync(file, "utf8");
     const record = sqlite.prepare(
       `INSERT INTO ${MIGRATION_LEDGER_TABLE} (migration_id) VALUES (?)`,

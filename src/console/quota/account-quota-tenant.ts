@@ -1175,7 +1175,10 @@ export function registerAccountQuotaTenantRoutes(
           const verifyParam = typeof body["captchaVerifyParam"] === "string" ? body["captchaVerifyParam"] : undefined;
           const verifyRegion = typeof body["captchaVerifyRegion"] === "string" ? body["captchaVerifyRegion"] : undefined;
           if (verifyParam || verifyRegion) {
-            captcha = { verifyParam, verifyRegion };
+            captcha = {
+              ...(verifyParam === undefined ? {} : { verifyParam }),
+              ...(verifyRegion === undefined ? {} : { verifyRegion }),
+            };
           }
         }
       } catch {
@@ -1187,7 +1190,12 @@ export function registerAccountQuotaTenantRoutes(
         const fetcher = networkBindingFactory
           ? await dailyCheckinEgressForPass({ db, networkBindingFactory })(account.id, access.tenantId)
           : globalThis.fetch;
-        result = await claimZcodeGifts({ accountId: account.id, credential, fetcher, captcha });
+        result = await claimZcodeGifts({
+          accountId: account.id,
+          credential,
+          fetcher,
+          ...(captcha === undefined ? {} : { captcha }),
+        });
       } catch {
         set.status = 502;
         return {
